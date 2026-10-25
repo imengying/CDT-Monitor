@@ -1,0 +1,48 @@
+[package]
+name = "cdt-monitor-worker"
+version = "0.1.0"
+edition = "2024"
+description = "阿里云 CDT 流量监控与 ECS 自动化控制（Cloudflare Workers + Rust/Wasm）"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Cloudflare Workers Rust SDK（d1 特性用于 D1 数据库绑定）
+worker = { version = "0.8", features = ["d1"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 凭据加密：XChaCha20Poly1305（24 字节随机 Nonce）
+# 关闭默认特性以避开 aead 自带 getrandom，随机数统一由本项目 getrandom 提供
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+
+# 无状态 Token 签名 / PBKDF2 口令派生
+hmac = "0.12"
+sha2 = "0.10"
+# 阿里云 RPC V1 签名（HMAC-SHA1）
+sha1 = "0.10"
+blake3 = { version = "1.5", default-features = false }
+
+# 时间计算（不启用 clock：Workers 内使用 worker::Date 取当前时间）
+chrono = { version = "0.4", default-features = false, features = ["alloc", "std", "serde"] }
+
+url = "2"
+hex = "0.4"
+base64 = "0.22"
+
+# Workers 运行时的 Web Crypto 随机源
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+# 注意：不能写成 `strip = true` / `strip = "symbols"`。
+# 那样会连同自定义段 `target_features` 一并剥离，wasm-bindgen 无法读取目标特性，
+# 生成 catch wrapper 时报 "externref table required"。
+# 用 "debuginfo" 可在保留该段的前提下剥离调试信息，最终体积由 wasm-opt 决定。
+strip = "debuginfo"

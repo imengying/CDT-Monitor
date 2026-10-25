@@ -1,0 +1,321 @@
+@import 'tailwindcss';
+
+/*
+ * 主题令牌
+ * ----------------------------------------------------------------------------
+ * 原版 CDT-Monitor 的风格是「浅色卡片 + 深色可切换」，因此这里用 CSS 变量
+ * 定义语义色，并通过 `prefers-color-scheme` 自动切换，不依赖 JS。
+ *
+ * 使用 `@theme` 把变量暴露给 Tailwind 的 utility（如 `bg-surface`）
+ * 以及自定义的语义类（如 `.card`）。
+ */
+@theme {
+  --color-surface: light-dark(#ffffff, #111827);
+  --color-surface-muted: light-dark(#f8fafc, #0f172a);
+  --color-surface-raised: light-dark(#ffffff, #1a2332);
+  --color-line: light-dark(#e2e8f0, #253044);
+  --color-ink: light-dark(#0f172a, #e6edf7);
+  --color-ink-muted: light-dark(#64748b, #93a4bd);
+  --color-ink-subtle: light-dark(#94a3b8, #6b7f9b);
+  --color-brand: light-dark(#2563eb, #60a5fa);
+  --color-brand-soft: light-dark(#eff6ff, #172554);
+  --color-ok: light-dark(#059669, #34d399);
+  --color-ok-soft: light-dark(#ecfdf5, #052e26);
+  --color-warn: light-dark(#d97706, #fbbf24);
+  --color-warn-soft: light-dark(#fffbeb, #422006);
+  --color-danger: light-dark(#dc2626, #f87171);
+  --color-danger-soft: light-dark(#fef2f2, #450a0a);
+  --font-sans:
+    'Inter', 'Noto Sans SC', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', 'JetBrains Mono', Menlo, monospace;
+}
+
+/* 让 light-dark() 生效 */
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-surface-muted);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 组件级语义类                                                               */
+/* ------------------------------------------------------------------------- */
+
+@layer components {
+  /* 卡片：原版控制台的核心视觉单元 */
+  .card {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: 0.875rem;
+    box-shadow:
+      0 1px 2px light-dark(rgb(15 23 42 / 0.04), rgb(0 0 0 / 0.3)),
+      0 8px 24px -12px light-dark(rgb(15 23 42 / 0.1), rgb(0 0 0 / 0.5));
+  }
+
+  /* 徽章 */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.125rem 0.5rem;
+    border-radius: 9999px;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    line-height: 1.4;
+    white-space: nowrap;
+  }
+
+  .badge-ok {
+    background-color: var(--color-ok-soft);
+    color: var(--color-ok);
+  }
+
+  .badge-warn {
+    background-color: var(--color-warn-soft);
+    color: var(--color-warn);
+  }
+
+  .badge-danger {
+    background-color: var(--color-danger-soft);
+    color: var(--color-danger);
+  }
+
+  .badge-brand {
+    background-color: var(--color-brand-soft);
+    color: var(--color-brand);
+  }
+
+  .badge-muted {
+    background-color: var(--color-surface-muted);
+    color: var(--color-ink-muted);
+  }
+
+  /* 按钮 */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.375rem;
+    padding: 0.4375rem 0.75rem;
+    border-radius: 0.5rem;
+    border: 1px solid transparent;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    line-height: 1.25rem;
+    cursor: pointer;
+    transition:
+      background-color 120ms ease,
+      border-color 120ms ease,
+      color 120ms ease,
+      opacity 120ms ease;
+    user-select: none;
+  }
+
+  .btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background-color: var(--color-brand);
+    color: light-dark(#ffffff, #06121f);
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.08);
+  }
+
+  .btn-ghost {
+    background-color: transparent;
+    border-color: var(--color-line);
+    color: var(--color-ink-muted);
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    background-color: var(--color-surface-muted);
+    color: var(--color-ink);
+  }
+
+  .btn-danger {
+    background-color: transparent;
+    border-color: color-mix(in oklab, var(--color-danger) 40%, transparent);
+    color: var(--color-danger);
+  }
+
+  .btn-danger:hover:not(:disabled) {
+    background-color: var(--color-danger-soft);
+  }
+
+  .btn-sm {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.75rem;
+    border-radius: 0.375rem;
+  }
+
+  /* 输入框 */
+  .input {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+    border: 1px solid var(--color-line);
+    background-color: var(--color-surface);
+    color: var(--color-ink);
+    font-size: 0.875rem;
+    transition: border-color 120ms ease;
+  }
+
+  .input:focus {
+    outline: none;
+    border-color: var(--color-brand);
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-brand) 18%, transparent);
+  }
+
+  .input::placeholder {
+    color: var(--color-ink-subtle);
+  }
+
+  .label {
+    display: block;
+    margin-bottom: 0.375rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--color-ink-muted);
+    letter-spacing: 0.01em;
+  }
+
+  /* 进度条 */
+  .progress-track {
+    position: relative;
+    height: 0.375rem;
+    width: 100%;
+    overflow: hidden;
+    border-radius: 9999px;
+    background-color: var(--color-surface-muted);
+  }
+
+  .progress-fill {
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 400ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* 开关 */
+  .switch {
+    position: relative;
+    display: inline-flex;
+    width: 2.25rem;
+    height: 1.25rem;
+    flex-shrink: 0;
+    align-items: center;
+    border-radius: 9999px;
+    border: 1px solid var(--color-line);
+    background-color: var(--color-surface-muted);
+    cursor: pointer;
+    transition: background-color 150ms ease;
+  }
+
+  .switch[data-on='true'] {
+    background-color: var(--color-brand);
+    border-color: transparent;
+  }
+
+  .switch-knob {
+    display: block;
+    height: 0.875rem;
+    width: 0.875rem;
+    border-radius: 9999px;
+    background-color: light-dark(#ffffff, #94a3b8);
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+    transition: transform 150ms ease;
+    transform: translateX(0.1875rem);
+  }
+
+  .switch[data-on='true'] .switch-knob {
+    transform: translateX(1.0625rem);
+    background-color: #ffffff;
+  }
+
+  /* 弹窗遮罩 */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background-color: light-dark(rgb(15 23 42 / 0.45), rgb(0 0 0 / 0.7));
+    backdrop-filter: blur(3px);
+  }
+
+  /* 细滚动条 */
+  .scroll-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line) transparent;
+  }
+
+  .scroll-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background-color: var(--color-line);
+    border-radius: 9999px;
+  }
+}
+
+/* ------------------------------------------------------------------------- */
+/* 过渡动画                                                                   */
+/* ------------------------------------------------------------------------- */
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 160ms ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.pop-enter-active,
+.pop-leave-active {
+  transition:
+    opacity 160ms ease,
+    transform 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.pop-enter-from,
+.pop-leave-to {
+  opacity: 0;
+  transform: scale(0.97) translateY(4px);
+}
+
+/* 骨架屏 */
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.skeleton {
+  border-radius: 0.375rem;
+  background-color: var(--color-surface-muted);
+  animation: pulse-soft 1.6s ease-in-out infinite;
+}

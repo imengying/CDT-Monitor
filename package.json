@@ -1,0 +1,30 @@
+{
+  "name": "cdt-monitor-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "engines": {
+    "node": ">=20.19",
+    "bun": ">=1.2"
+  },
+  "scripts": {
+    "build": "bash scripts/build-ci.sh",
+    "build:worker": "worker-build --release",
+    "build:web": "bun run --cwd web build",
+    "install:web": "bun install --cwd web",
+    "dev": "bun run build:web && bunx wrangler dev",
+    "dev:web": "bun run --cwd web dev",
+    "deploy": "bun run scripts/deploy.ts",
+    "db:migrate:local": "bunx wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "bunx wrangler d1 migrations apply DB --remote",
+    "db:console:local": "bunx wrangler d1 execute DB --local --command",
+    "typecheck:web": "bun run --cwd web typecheck",
+    "lint": "cargo clippy --target wasm32-unknown-unknown -- -D warnings",
+    "check": "cargo check --target wasm32-unknown-unknown",
+    "check:config": "bun run scripts/check-config.ts"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  }
+}

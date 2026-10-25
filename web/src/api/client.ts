@@ -1,0 +1,622 @@
+/**
+ * API 客户端
+ * ============================================================================
+ * 统一处理三件事：
+ *
+ * 1. **Cookie 凭证**：会话是 `HttpOnly; Secure; SameSite=Strict` Cookie，
+ *    JS 读不到也不需要读；只要每个请求带 `credentials: 'same-origin'`。
+ * 2. **202 Job 轮询**：所有写接口都返回 `{ job_id, status, job_type }`，
+ *    这里把它包装成「提交 → 轮询 → 拿到终态」的一次 Promise。
+ * 3. **错误归一化**：后端错误体是 `{ error, code? }`，401 时额外带
+ *    `X-Auth-Required: 1` 响应头。这里统一抛 `ApiError`，并把 401 广播给
+ *    上层（`onUnauthorized`）以便立刻切回登录页。
+ * ============================================================================
+ */
+
+/** 后端错误码（与 src/lib.rs 保持一致）。 */
+export type ApiErrorCode =
+  | 'unauthenticated'
+  | 'invalid_credentials'
+  | 'turnstile_failed'
+  | 'turnstile_unavailable'
+  | 'turnstile_not_configured'
+  | 'cross_origin'
+  | 'job_locked'
+  | 'job_conflict'
+  | 'credentials_not_configured'
+  | 'internal_error'
+  | 'init_failed'
+  | (string & {})
+
+/** 统一的 API 错误。 */
+export class ApiError extends Error {
+  readonly status: number
+  readonly code?: ApiErrorCode
+
+  constructor(message: string, status: number, code?: ApiErrorCode) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+  }
+
+  /** 会话失效。 */
+  get isUnauthorized(): boolean {
+    return this.status === 401
+  }
+
+  /** 需要一次性人机校验（Turnstile token 已被消费）。 */
+  get isTurnstileIssue(): boolean {
+    return (
+      this.code === 'turnstile_failed' ||
+      this.code === 'turnstile_unavailable' ||
+      this.code === 'turnstile_not_configured'
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 类型定义（与 src/models.rs 的 DTO 对齐）
+// ---------------------------------------------------------------------------
+
+export type SiteType = 'china' | 'intl'
+export type OverLimitAction = 'stop_and_notify' | 'notify_only'
+export type StopMode = 'StopCharging' | 'KeepCharging'
+export type JobStatus = 'pending' | 'running' | 'success' | 'failed' | 'unknown'
+export type JobType =
+  | 'refresh_all'
+  | 'refresh_account'
+  | 'start_instance'
+  | 'stop_instance'
+  | 'notify_test'
+  | 'daily_report'
+  | 'unknown'
+export type PushLevel = 'active' | 'timeSensitive' | 'critical'
+export type NotifyChannel = 'telegram' | 'bark'
+export type HistoryBucket = 'hour' | 'day'
+
+export interface SessionResponse {
+  authenticated: boolean
+  turnstile_site_key: string
+  expires_at?: number
+}
+
+export interface InstanceInfo {
+  instance_id: string
+  instance_name: string
+  instance_type: string
+  region_id: string
+  zone_id: string
+  status: string
+  public_ip: string | null
+  private_ip: string | null
+  instance_charge_type: string | null
+  spot_strategy: string | null
+  stopped_mode: string | null
+  os_name: string | null
+  creation_time: string | null
+  expired_time: string | null
+  spot: boolean
+  keep_alive: boolean
+}
+
+export interface AccountOverview {
+  id: number
+  name: string
+  site_type: SiteType
+  site_label: string
+  access_key_id_masked: string
+  traffic_limit_gb: number
+  over_limit_action: OverLimitAction
+  over_limit_action_label: string
+  stop_mode: StopMode
+  stop_mode_label: string
+  schedule_start_time: string | null
+  schedule_stop_time: string | null
+  spot_keep_alive: boolean
+  enabled: boolean
+  balance_amount: number | null
+  balance_currency: string | null
+  cdt_domestic_bytes: number
+  cdt_overseas_bytes: number
+  cdt_total_bytes: number
+  domestic_percent: number
+  overseas_percent: number
+  total_percent: number
+  billing_month: string
+  threshold_triggered: boolean
+  snapshot_updated_at: number | null
+  instances: InstanceInfo[]
+}
+
+export interface OverviewResponse {
+  accounts: AccountOverview[]
+  timezone: string
+  billing_month: string
+  generated_at: number
+}
+
+export interface TrafficPoint {
+  recorded_at: number
+  domestic_bytes: number
+  overseas_bytes: number
+  total_bytes: number
+}
+
+export interface TrafficHistoryResponse {
+  account_id: number
+  bucket: HistoryBucket
+  traffic_limit_gb: number
+  billing_month: string
+  threshold_triggered: boolean
+  points: TrafficPoint[]
+}
+
+export interface ActionLog {
+  id: number
+  account_id: number | null
+  account_name: string | null
+  action_type: string
+  instance_id: string | null
+  detail: string
+  created_at: number
+}
+
+export interface JobDto {
+  id: string
+  account_id: number | null
+  job_type: JobType
+  status: JobStatus
+  error_msg: string | null
+  created_at: number
+  finished_at: number | null
+}
+
+export interface AcceptedJob {
+  job_id: string
+  status: JobStatus
+  job_type: JobType
+}
+
+export interface AccountDto {
+  id: number
+  name: string
+  site_type: SiteType
+  site_label: string
+  access_key_id: string
+  access_key_id_masked: string
+  regions: string[]
+  traffic_limit_gb: number
+  over_limit_action: OverLimitAction
+  over_limit_action_label: string
+  stop_mode: StopMode
+  stop_mode_label: string
+  schedule_start_time: string | null
+  schedule_stop_time: string | null
+  spot_keep_alive: boolean
+  enabled: boolean
+  last_schedule_start_date: string | null
+  last_schedule_stop_date: string | null
+  created_at: number
+  updated_at: number
+}
+
+export interface AccountInput {
+  name: string
+  site_type: SiteType
+  access_key_id: string
+  /** 编辑时留空表示沿用原密钥 */
+  access_key_secret?: string
+  regions: string[]
+  traffic_limit_gb: number
+  over_limit_action: OverLimitAction
+  stop_mode: StopMode
+  schedule_start_time: string | null
+  schedule_stop_time: string | null
+  spot_keep_alive: boolean
+  enabled: boolean
+}
+
+export interface TelegramSettings {
+  enabled: boolean
+  chat_id: string | null
+  api_host: string | null
+  token_configured: boolean
+}
+
+export interface BarkSettings {
+  enabled: boolean
+  server_url: string
+  device_key_configured: boolean
+  normal_level: PushLevel
+  alert_level: PushLevel
+}
+
+export interface DailyReportSettings {
+  enabled: boolean
+  time: string
+  timezone: string
+}
+
+export interface SettingsResponse {
+  timezone: string
+  turnstile_site_key: string
+  telegram: TelegramSettings
+  bark: BarkSettings
+  daily_report: DailyReportSettings
+  accounts: AccountDto[]
+}
+
+export interface TelegramUpdate {
+  enabled: boolean
+  chat_id: string | null
+  api_host: string | null
+  token?: string
+  clear_token?: boolean
+}
+
+export interface BarkUpdate {
+  enabled: boolean
+  server_url: string
+  device_key?: string
+  clear_device_key?: boolean
+  normal_level: PushLevel
+  alert_level: PushLevel
+}
+
+// ---------------------------------------------------------------------------
+// 底层请求
+// ---------------------------------------------------------------------------
+
+interface RequestOptions {
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
+  body?: unknown
+  /** 覆盖默认的 401 处理（登录接口自己处理） */
+  skipAuthRedirect?: boolean
+}
+
+/** 会话失效时的回调（由 App.vue 注册）。 */
+let unauthorizedHandler: (() => void) | null = null
+
+/** 注册会话失效回调。 */
+export function onUnauthorized(handler: () => void): void {
+  unauthorizedHandler = handler
+}
+
+async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const { method = 'GET', body, skipAuthRedirect = false } = options
+
+  const init: RequestInit = {
+    method,
+    // SameSite=Strict Cookie 需要同源凭证
+    credentials: 'same-origin',
+    headers: {
+      Accept: 'application/json',
+    },
+    // 禁用缓存，确保拿到最新快照
+    cache: 'no-store',
+  }
+
+  if (body !== undefined) {
+    init.headers = { ...init.headers, 'Content-Type': 'application/json' }
+    init.body = JSON.stringify(body)
+  }
+
+  let response: Response
+  try {
+    response = await fetch(path, init)
+  } catch {
+    throw new ApiError('网络异常，请检查连接后重试', 0)
+  }
+
+  const isJson = (response.headers.get('content-type') ?? '').includes('application/json')
+  const text = await response.text()
+
+  if (!response.ok) {
+    let message = `请求失败（HTTP ${response.status}）`
+    let code: ApiErrorCode | undefined
+    if (isJson && text) {
+      try {
+        const parsed = JSON.parse(text) as { error?: string; code?: string }
+        if (parsed.error) message = parsed.error
+        code = parsed.code
+      } catch {
+        message = text.slice(0, 300) || message
+      }
+    }
+
+    // 登录接口的 401 由调用方处理，避免在登录页反复触发跳转
+    if (response.status === 401 && !skipAuthRedirect) {
+      unauthorizedHandler?.()
+    }
+
+    throw new ApiError(message, response.status, code)
+  }
+
+  if (!text) {
+    return undefined as T
+  }
+  if (!isJson) {
+    return text as unknown as T
+  }
+  return JSON.parse(text) as T
+}
+
+// ---------------------------------------------------------------------------
+// Job 轮询
+// ---------------------------------------------------------------------------
+
+export interface PollOptions {
+  /** 轮询间隔（毫秒），默认 1200 */
+  intervalMs?: number
+  /** 超时（毫秒），默认 180 秒（Worker 的 wait_until 上限远大于此） */
+  timeoutMs?: number
+  /** 每次拿到新状态时回调 */
+  onUpdate?: (job: JobDto) => void
+  /** 轮询被取消时使用的信号 */
+  signal?: AbortSignal
+}
+
+/** 轮询直到任务终态；失败时抛 `ApiError`。 */
+export async function waitForJob(jobId: string, options: PollOptions = {}): Promise<JobDto> {
+  const { intervalMs = 1200, timeoutMs = 180_000, onUpdate, signal } = options
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    if (signal?.aborted) {
+      throw new ApiError('操作已取消', 0, 'aborted')
+    }
+
+    const job = await request<JobDto>(`/api/v1/jobs/${encodeURIComponent(jobId)}`)
+    onUpdate?.(job)
+
+    if (job.status === 'success') {
+      return job
+    }
+    if (job.status === 'failed') {
+      throw new ApiError(job.error_msg ?? '任务执行失败', 200, 'job_failed')
+    }
+
+    await new Promise<void>((resolve) => {
+      const timer = window.setTimeout(resolve, intervalMs)
+      signal?.addEventListener(
+        'abort',
+        () => {
+          window.clearTimeout(timer)
+          resolve()
+        },
+        { once: true },
+      )
+    })
+  }
+
+  throw new ApiError('任务执行超时，请稍后在日志中查看结果', 0, 'job_timeout')
+}
+
+/** 提交异步任务并等到终态。 */
+async function runJob(
+  path: string,
+  body: unknown,
+  options: PollOptions = {},
+): Promise<JobDto> {
+  const accepted = await request<AcceptedJob>(path, {
+    method: 'POST',
+    body,
+  })
+  return waitForJob(accepted.job_id, options)
+}
+
+// ---------------------------------------------------------------------------
+// 对外 API
+// ---------------------------------------------------------------------------
+
+export const api = {
+  // ---------------------------------------------------------------- 认证
+  session(): Promise<SessionResponse> {
+    return request<SessionResponse>('/api/v1/auth/session')
+  },
+
+  async login(
+    username: string,
+    password: string,
+    turnstileToken: string,
+  ): Promise<SessionResponse> {
+    return request<SessionResponse>('/api/v1/auth/login', {
+      method: 'POST',
+      body: {
+        // 服务端未配置 ADMIN_USERNAME 时会忽略该字段
+        username,
+        password,
+        turnstile_token: turnstileToken,
+      },
+      skipAuthRedirect: true,
+    })
+  },
+
+  async logout(): Promise<void> {
+    await request<unknown>('/api/v1/auth/logout', {
+      method: 'POST',
+      skipAuthRedirect: true,
+    })
+  },
+
+  // ---------------------------------------------------------------- 概览
+  overview(): Promise<OverviewResponse> {
+    return request<OverviewResponse>('/api/v1/overview')
+  },
+
+  history(accountId: number, bucket: HistoryBucket, limit?: number): Promise<TrafficHistoryResponse> {
+    const params = new URLSearchParams({
+      account_id: String(accountId),
+      bucket,
+    })
+    if (limit !== undefined) {
+      params.set('limit', String(limit))
+    }
+    return request<TrafficHistoryResponse>(`/api/v1/history?${params.toString()}`)
+  },
+
+  logs(limit = 80, accountId?: number): Promise<ActionLog[]> {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (accountId !== undefined) {
+      params.set('account_id', String(accountId))
+    }
+    return request<ActionLog[]>(`/api/v1/logs?${params.toString()}`)
+  },
+
+  // ---------------------------------------------------------------- 任务
+  job(jobId: string): Promise<JobDto> {
+    return request<JobDto>(`/api/v1/jobs/${encodeURIComponent(jobId)}`)
+  },
+
+  jobs(limit = 20): Promise<JobDto[]> {
+    return request<JobDto[]>(`/api/v1/jobs?limit=${limit}`)
+  },
+
+  /** 刷新全部账号（异步）。 */
+  refreshAll(options: PollOptions = {}): Promise<JobDto> {
+    return runJob('/api/v1/refresh', undefined, options)
+  },
+
+  /** 刷新单个账号（异步）。 */
+  refreshAccount(accountId: number, options: PollOptions = {}): Promise<JobDto> {
+    return runJob(`/api/v1/accounts/${accountId}/refresh`, undefined, options)
+  },
+
+  // ---------------------------------------------------------------- 实例
+  startInstance(accountId: number, instanceId: string, options: PollOptions = {}): Promise<JobDto> {
+    return runJob(
+      `/api/v1/accounts/${accountId}/instances/${encodeURIComponent(instanceId)}/start`,
+      undefined,
+      options,
+    )
+  },
+
+  stopInstance(accountId: number, instanceId: string, options: PollOptions = {}): Promise<JobDto> {
+    return runJob(
+      `/api/v1/accounts/${accountId}/instances/${encodeURIComponent(instanceId)}/stop`,
+      undefined,
+      options,
+    )
+  },
+
+  setKeepAlive(accountId: number, instanceId: string, enabled: boolean): Promise<unknown> {
+    return request<unknown>(
+      `/api/v1/accounts/${accountId}/instances/${encodeURIComponent(instanceId)}/keep-alive`,
+      { method: 'PUT', body: { enabled } },
+    )
+  },
+
+  // ---------------------------------------------------------------- 账号
+  createAccount(input: AccountInput): Promise<AccountDto> {
+    return request<AccountDto>('/api/v1/accounts', { method: 'POST', body: input })
+  },
+
+  updateAccount(id: number, input: AccountInput): Promise<AccountDto> {
+    return request<AccountDto>(`/api/v1/accounts/${id}`, { method: 'PUT', body: input })
+  },
+
+  deleteAccount(id: number): Promise<unknown> {
+    return request<unknown>(`/api/v1/accounts/${id}`, { method: 'DELETE' })
+  },
+
+  // ---------------------------------------------------------------- 设置
+  settings(): Promise<SettingsResponse> {
+    return request<SettingsResponse>('/api/v1/settings')
+  },
+
+  updateTelegram(input: TelegramUpdate): Promise<SettingsResponse> {
+    return request<SettingsResponse>('/api/v1/settings/telegram', { method: 'PUT', body: input })
+  },
+
+  updateBark(input: BarkUpdate): Promise<SettingsResponse> {
+    return request<SettingsResponse>('/api/v1/settings/bark', { method: 'PUT', body: input })
+  },
+
+  updateDailyReport(enabled: boolean, time: string): Promise<SettingsResponse> {
+    return request<SettingsResponse>('/api/v1/settings/daily-report', {
+      method: 'PUT',
+      body: { enabled, time, timezone: '' },
+    })
+  },
+
+  updateTimezone(timezone: string): Promise<SettingsResponse> {
+    return request<SettingsResponse>('/api/v1/settings/timezone', {
+      method: 'PUT',
+      body: { timezone },
+    })
+  },
+
+  /** 测试通知渠道（异步，返回每个渠道的送达结果摘要）。 */
+  testNotify(channel?: NotifyChannel, options: PollOptions = {}): Promise<JobDto> {
+    return runJob('/api/v1/settings/notify-test', channel ? { channel } : {}, options)
+  },
+
+  /** 立即推送日报（异步）。 */
+  pushDailyReport(options: PollOptions = {}): Promise<JobDto> {
+    return runJob('/api/v1/reports/daily', undefined, options)
+  },
+}
+
+// ---------------------------------------------------------------------------
+// 展示工具
+// ---------------------------------------------------------------------------
+
+const GIB = 1024 ** 3
+
+/** 字节 -> 人类可读（与后端 models::human_bytes 规则一致）。 */
+export function humanBytes(bytes: number): string {
+  const value = Math.max(0, bytes)
+  if (value < 1024) return `${value.toFixed(0)} B`
+  const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB']
+  let scaled = value / 1024
+  let index = 0
+  while (scaled >= 1024 && index + 1 < units.length) {
+    scaled /= 1024
+    index += 1
+  }
+  return `${scaled.toFixed(2)} ${units[index]}`
+}
+
+/** 字节 -> GB 数值（保留两位）。 */
+export function bytesToGb(bytes: number): number {
+  return Math.max(0, bytes) / GIB
+}
+
+/** 金额格式化。 */
+export function humanAmount(amount: number | null, currency: string | null): string {
+  if (amount === null || !Number.isFinite(amount)) return '—'
+  const symbol = currency === 'USD' ? '$' : currency === 'CNY' ? '¥' : (currency ?? '')
+  return `${symbol} ${amount.toFixed(2)}`
+}
+
+/** 时间戳 -> 本地时间文本。 */
+export function formatTime(ms: number | null, withDate = true): string {
+  if (!ms) return '—'
+  const date = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  if (!withDate) return time
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`
+}
+
+/** 相对时间（"3 分钟前"）。 */
+export function relativeTime(ms: number | null): string {
+  if (!ms) return '—'
+  const diff = Date.now() - ms
+  if (diff < 0) return '刚刚'
+  const seconds = Math.floor(diff / 1000)
+  if (seconds < 60) return `${seconds} 秒前`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} 分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} 小时前`
+  return `${Math.floor(hours / 24)} 天前`
+}
+
+/** 进度条配色：按占用比例升级危险等级。 */
+export function percentTone(percent: number): 'ok' | 'warn' | 'danger' {
+  if (percent >= 100) return 'danger'
+  if (percent >= 80) return 'warn'
+  return 'ok'
+}

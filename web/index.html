@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN" class="h-full">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>CDT Monitor · 阿里云流量监控</title>
+    <!-- Turnstile：登录卡片内嵌小组件所需 -->
+    <script
+      src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+      async
+      defer
+    ></script>
+    <style>
+      /* 首屏防闪烁：在 Vue 挂载前先按系统主题铺底色 */
+      html {
+        background-color: #f8fafc;
+      }
+      @media (prefers-color-scheme: dark) {
+        html {
+          background-color: #0b1120;
+        }
+      }
+      /* Turnstile 小组件在暗色下的边框更协调 */
+      .cf-turnstile {
+        border-radius: 0.5rem;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body class="h-full">
+    <div id="app" class="h-full"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

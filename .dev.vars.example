@@ -1,0 +1,32 @@
+# 复制为 .dev.vars 后用于 `bun run dev`（.dev.vars 已被 .gitignore 忽略）
+# 生产环境请用 Cloudflare 控制台 Settings → Variables and Secrets 配置同名变量。
+
+# --- 必需 ---------------------------------------------------------------
+
+# 32 字节主密钥：64 字符 Hex 或 32 字节 Base64。
+# 用于加密 AccessKey Secret / TG Token / Bark Key，同时充当会话 Token 的 HMAC 密钥。
+# 轮换会导致所有已存密文无法解密。生成：openssl rand -hex 32
+# ⚠️ 下面这个是**示例值，仅供本地调试**。生产务必换成自己生成的：
+MASTER_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+
+# 管理员账号：两者都必需，缺任一项登录会返回 500 credentials_not_configured
+ADMIN_USERNAME=admin
+# 生产环境用 16 位以上强密码
+ADMIN_PASSWORD=local-dev-password
+
+# Turnstile（Cloudflare Dashboard → Turnstile → Add site）
+# 官方测试密钥：site key 1x00000000000000000000AA / secret 1x0000000000000000000000000000000AA
+TURNSTILE_SITE_KEY=1x00000000000000000000AA
+TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+
+# --- 可选 ---------------------------------------------------------------
+
+# 日志级别：error（默认）| warn | info | debug
+# 默认只输出错误，正常巡检不产生任何日志。排障时改成 info。
+LOG_LEVEL=error
+
+# 仅本地调试：设为 true 会跳过 Turnstile 校验。生产环境务必删除此行。
+# TURNSTILE_DISABLED=true
+
+# 显式指定已有 D1 的 database_id（一般不需要：wrangler 会按名字自动绑定）
+# CLOUDFLARE_DATABASE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx

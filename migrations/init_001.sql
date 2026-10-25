@@ -1,0 +1,146 @@
+-- ============================================================================
+-- CDT-Monitor Worker · D1 初始化脚本
+-- 所有时间戳均为「Unix 毫秒」INTEGER；布尔值以 INTEGER(0/1) 存储
+-- （D1 返回值经 serde-wasm-bindgen 反序列化，0/1 无法直接映射为 bool，
+--   因此 Rust 侧一律用 i64 读取后转换，见 src/models.rs）
+-- ============================================================================
+
+PRAGMA foreign_keys = ON;
+
+-- ---------------------------------------------------------------------------
+-- 系统级配置：key/value 文本存储
+-- 约定的 key：
+--   schema_version        数据库版本
+--   timezone              全局时区（UTC+8 形式）
+--   daily_report          日报配置 JSON：{enabled,time,timezone}
+--   telegram              Telegram 配置 JSON：{enabled,token_enc,chat_id,api_host}
+--   bark                  Bark 配置 JSON：{enabled,server_url,device_key_enc,normal_level,alert_level}
+--
+-- 注意：管理员账号与密码**不在**本表，它们只来自 Worker 环境变量
+-- （ADMIN_USERNAME / ADMIN_PASSWORD），数据库里没有任何密码材料。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
+-- 阿里云账号
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS accounts (
+  id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name                        TEXT    NOT NULL,
+  site_type                   TEXT    NOT NULL DEFAULT 'china'
+                              CHECK (site_type IN ('china', 'intl')),
+  access_key_id               TEXT    NOT NULL,
+  -- Base64(24 字节 Nonce + XChaCha20Poly1305 密文)
+  encrypted_access_key_secret TEXT    NOT NULL,
+  regions_json                TEXT    NOT NULL DEFAULT '[]',
+  traffic_limit_gb            REAL    NOT NULL DEFAULT 20,
+  over_limit_action           TEXT    NOT NULL DEFAULT 'stop_and_notify'
+                              CHECK (over_limit_action IN ('stop_and_notify', 'notify_only')),
+  stop_mode                   TEXT    NOT NULL DEFAULT 'StopCharging'
+                              CHECK (stop_mode IN ('StopCharging', 'KeepCharging')),
+  schedule_start_time         TEXT,
+  schedule_stop_time          TEXT,
+  spot_keep_alive             INTEGER NOT NULL DEFAULT 0,
+  enabled                     INTEGER NOT NULL DEFAULT 1,
+  last_schedule_start_date    TEXT,
+  last_schedule_stop_date     TEXT,
+  created_at                  INTEGER NOT NULL,
+  updated_at                  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_enabled ON accounts (enabled);
+CREATE INDEX IF NOT EXISTS idx_accounts_site ON accounts (site_type);
+
+-- ---------------------------------------------------------------------------
+-- 账号 / 实例最新状态快照（首页只读此表，避免每次请求都打阿里云）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS account_snapshots (
+  account_id               INTEGER PRIMARY KEY
+                           REFERENCES accounts (id) ON DELETE CASCADE,
+  balance_amount           REAL,
+  balance_currency         TEXT,
+  cdt_domestic_bytes       INTEGER NOT NULL DEFAULT 0,
+  cdt_overseas_bytes       INTEGER NOT NULL DEFAULT 0,
+  billing_month            TEXT    NOT NULL DEFAULT '',
+  instances_json           TEXT    NOT NULL DEFAULT '[]',
+  -- 已触发熔断的账期（YYYY-MM）；与当前账期相同表示本月已触发过，禁止再次拉起实例
+  threshold_triggered_month TEXT,
+  updated_at               INTEGER NOT NULL
+);
+
+-- ---------------------------------------------------------------------------
+-- 流量历史采样（CDT 为账期累计值，图表按小时/天取桶内最大值）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS traffic_history (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id     INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+  recorded_at    INTEGER NOT NULL,
+  domestic_bytes INTEGER NOT NULL DEFAULT 0,
+  overseas_bytes INTEGER NOT NULL DEFAULT 0,
+  total_bytes    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_traffic_history_account_time
+  ON traffic_history (account_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_traffic_history_time
+  ON traffic_history (recorded_at);
+
+-- ---------------------------------------------------------------------------
+-- 异步任务（手动刷新 / 开关机 / 通知测试 / 日报）
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS jobs (
+  id          TEXT PRIMARY KEY,
+  account_id  INTEGER REFERENCES accounts (id) ON DELETE SET NULL,
+  job_type    TEXT    NOT NULL,
+  status      TEXT    NOT NULL DEFAULT 'pending'
+              CHECK (status IN ('pending', 'running', 'success', 'failed')),
+  error_msg   TEXT,
+  created_at  INTEGER NOT NULL,
+  finished_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_account_created ON jobs (account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs (created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- 自动化操作 / 告警日志
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS action_logs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id  INTEGER REFERENCES accounts (id) ON DELETE SET NULL,
+  action_type TEXT    NOT NULL,
+  instance_id TEXT,
+  detail      TEXT    NOT NULL DEFAULT '',
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_logs_account_created
+  ON action_logs (account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_action_logs_created
+  ON action_logs (created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- 幂等锁：保证同一账号的同类自动化动作在 TTL 内只执行一次
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS locks (
+  name       TEXT PRIMARY KEY,
+  owner      TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_locks_expires ON locks (expires_at);
+
+-- ---------------------------------------------------------------------------
+-- 预置配置
+-- ---------------------------------------------------------------------------
+INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES
+  ('schema_version', '1', CAST(strftime('%s', 'now') AS INTEGER) * 1000),
+  ('timezone', 'UTC+8', CAST(strftime('%s', 'now') AS INTEGER) * 1000),
+  ('daily_report', '{"enabled":false,"time":"09:00","timezone":"UTC+8"}', CAST(strftime('%s', 'now') AS INTEGER) * 1000),
+  ('telegram', '{"enabled":false,"token_enc":null,"chat_id":null,"api_host":null}', CAST(strftime('%s', 'now') AS INTEGER) * 1000),
+  ('bark', '{"enabled":false,"server_url":"https://api.day.app","device_key_enc":null,"normal_level":"active","alert_level":"critical"}', CAST(strftime('%s', 'now') AS INTEGER) * 1000);

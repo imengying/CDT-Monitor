@@ -1,0 +1,29 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Worker 构建产物（worker-build 输出）
+/build/
+
+# 前端构建产物
+/web/dist/
+/web/node_modules/
+/web/.vite/
+
+# Wrangler 本地状态（含本地 D1 数据，切勿提交）
+/.wrangler/
+
+# 依赖
+/node_modules/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# 本地开发变量（含密钥）
+.dev.vars
+
+# 示例文件保留
+!.dev.vars.example
