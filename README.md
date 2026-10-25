@@ -85,12 +85,7 @@ cdt-monitor-worker/
 全部在 Cloudflare 网页完成，**不需要本地装 Rust 或 wrangler**。
 建库、建表、上传全部自动化。
 
-### 1. 建 Turnstile 站点
-
-Dashboard → **Turnstile → Add site**，域名填你的 Worker 域名（可先用
-`*.workers.dev`），拿到 **Site Key**（公开）与 **Secret Key**（机密）。
-
-### 2. 连接 GitHub 仓库
+### 1. 连接 GitHub 仓库
 
 **Workers & Pages → Create → Workers → Connect to Git**，选中本仓库，根目录 `/`。
 
@@ -114,7 +109,7 @@ Dashboard → **Turnstile → Add site**，域名填你的 Worker 域名（可�
 `wrangler.toml` 里刻意**不写 `database_id`** —— wrangler 按 `database_name`
 （`cdt-monitor`）自动发现并绑定。
 
-### 3. 配 4 个 Secret
+### 2. 配 3 个 Secret
 
 **Settings → Variables and Secrets**（运行时，**不是** Build variables），
 全部选 **Secret**：
@@ -122,17 +117,18 @@ Dashboard → **Turnstile → Add site**，域名填你的 Worker 域名（可�
 | 名称 | 必需 | 说明 |
 |---|---|---|
 | `MASTER_KEY` | ✅ | `openssl rand -hex 32`，**生成后不要再改**（改了已存密文全部失效） |
-| `TURNSTILE_SECRET_KEY` | ✅ | 第 1 步拿到的私钥 |
 | `ADMIN_USERNAME` | ✅ | 管理员用户名，例如 `admin` |
 | `ADMIN_PASSWORD` | ✅ | 管理员密码，建议 16 位以上 |
 
-`TURNSTILE_SITE_KEY` 是公钥，可以直接写进 `wrangler.toml` 的 `[vars]`。
+**Turnstile 不再需要环境变量。** 默认不启用；想开就到 设置 → 人机校验
+填 Site Key / Secret Key，私钥加密后存 D1。
 
-**只有这四项在环境变量里。** 其余全部在网页「设置」里改：
+**只有这三项在环境变量里。** 其余全部在网页「设置」里改：
 
 | 配置 | 位置 |
 |---|---|
 | 阿里云账号（AccessKey、阈值、停机策略、定时、保活） | 设置 → 阿里云账号 |
+| 人机校验（Turnstile Site Key / Secret Key，默认关闭） | 设置 → 人机校验 |
 | Telegram（Bot Token / Chat ID / 反代） | 设置 → Telegram |
 | Bark（Server / Device Key / 推送级别） | 设置 → Bark |
 | 日报推送时间 | 设置 → 日报 |
@@ -140,9 +136,9 @@ Dashboard → **Turnstile → Add site**，域名填你的 Worker 域名（可�
 
 这些全部存 D1，改完即时生效，**不需要重新部署**。
 
-### 4. 首次登录
+### 3. 首次登录
 
-打开 Worker 域名 → 输入第 3 步的 `ADMIN_USERNAME` + `ADMIN_PASSWORD`。
+打开 Worker 域名 → 输入第 2 步的 `ADMIN_USERNAME` + `ADMIN_PASSWORD`。
 
 > 凭证**只来自环境变量**，数据库里没有任何密码材料。想换用户名或密码，
 > 直接改这两个 Secret 再重新部署即可；**不支持**在后台改（后台系统页只显示
@@ -183,7 +179,7 @@ cargo install worker-build --version 0.8.7 --locked
 bun install
 bun run install:web
 
-cp .dev.vars.example .dev.vars   # 已预填 Turnstile 官方测试密钥
+cp .dev.vars.example .dev.vars   # 已预填本地调试用的示例值
 bun run db:migrate:local
 bun run dev                      # 构建前端 + wrangler dev（:8787）
 ```
@@ -205,7 +201,7 @@ bun run dev:web                  # :5173
 | 名称 | 类型 | 必需 | 说明 |
 |---|---|---|---|
 | `MASTER_KEY` | Secret | ✅ | 32 字节主密钥。加密 AK Secret / TG Token / Bark Key，同时作会话 Token 的 HMAC 密钥。轮换会导致已存密文全部失效 |
-| `TURNSTILE_SECRET_KEY` | Secret | ✅ | Turnstile 私钥。缺失时登录返回 503（宁可不登录也不绕过人机校验） |
+| `TURNSTILE_SECRET_KEY` | — | ❌ | **已改到后台**：设置 → 人机校验，加密存 D1 |
 | `ADMIN_USERNAME` | Secret | ✅ | 管理员用户名，登录时使用 |
 | `ADMIN_PASSWORD` | Secret | ✅ | 管理员密码。每次登录都对照此变量校验，**不落库** |
 
@@ -213,11 +209,11 @@ bun run dev:web                  # :5173
 
 | 名称 | 默认 | 说明 |
 |---|---|---|
-| `TURNSTILE_SITE_KEY` | 空 | 公钥，建议写进 `wrangler.toml` 的 `[vars]` |
+| `TURNSTILE_SITE_KEY` | — | ❌ | **已改到后台**，不再读环境变量 |
 | `LOG_LEVEL` | `error` | `error` / `warn` / `info` / `debug` |
 | `JOB_LOCK_TTL_MS` | `600000` | 刷新任务跨实例互斥窗口 |
 | `SESSION_TTL_MS` | `604800000` | 会话有效期（7 天） |
-| `TURNSTILE_DISABLED` | 未设 | 仅本地调试：`true` 跳过人机校验。**生产环境绝不要设** |
+| `TURNSTILE_DISABLED` | — | ❌ | **已移除**：Turnstile 本身就是默认关闭的 |
 | `ALIYUN_CDT_ENDPOINT` 等 | 官方默认 | 端点覆盖（私有网关 / 排障） |
 
 **构建期**变量（与运行时是两处配置，别放错）：
@@ -244,7 +240,8 @@ bun run dev:web                  # :5173
 
 | 环节 | 实现 |
 |---|---|
-| 人机校验 | Turnstile `siteverify`，携带 `CF-Connecting-IP` 作为 `remoteip`；前端用 `appearance: 'interaction-only'`，静默通过时不显示任何可见元素 |
+| 人机校验 | Turnstile `siteverify`，携带 `CF-Connecting-IP` 作为 `remoteip`；前端用 `appearance: 'interaction-only'`，静默通过时不显示任何可见元素。**默认关闭**，未配置两个 key 即不校验 |
+| 失败不降级 | 已启用但私钥解不出（如换过 `MASTER_KEY`）时**拒绝登录**（`turnstile_broken`），绝不静默退化成「未启用」 |
 | 用户名 | 环境变量 `ADMIN_USERNAME`，**唯一来源** |
 | 密码 | 环境变量 `ADMIN_PASSWORD`，**唯一来源**；不哈希入库，数据库里没有任何密码材料 |
 | 比较方式 | 用户名与密码都用常量时间比较，且不短路（避免通过响应时间差推断） |
@@ -315,8 +312,8 @@ bun run dev:web                  # :5173
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/v1/auth/session` | 会话探测（公开，返回 Turnstile site key） |
-| POST | `/api/v1/auth/login` | 登录（Turnstile + 密码） |
+| GET | `/api/v1/auth/session` | 会话探测（公开，返回 Turnstile site key，未启用时为空串） |
+| POST | `/api/v1/auth/login` | 登录（用户名 + 密码，可选 Turnstile） |
 | POST | `/api/v1/auth/logout` | 退出（清 Cookie） |
 | GET | `/api/v1/overview` | 首页数据（读快照表） |
 | GET | `/api/v1/history?account_id&bucket=hour\|day&limit` | 流量历史 |
@@ -329,7 +326,7 @@ bun run dev:web                  # :5173
 | POST | `/api/v1/accounts/{id}/instances/{iid}/start\|stop` | 开机 / 关机 → 202 |
 | PUT | `/api/v1/accounts/{id}/instances/{iid}/keep-alive` | 逐实例保活开关 |
 | GET | `/api/v1/settings` | 全部设置（脱敏） |
-| PUT | `/api/v1/settings/telegram\|bark\|daily-report\|timezone` | 更新设置 |
+| PUT | `/api/v1/settings/turnstile\|telegram\|bark\|daily-report\|timezone` | 更新设置 |
 | POST | `/api/v1/settings/notify-test` | 测试通知 → 202 |
 | POST | `/api/v1/reports/daily` | 立即推送日报 → 202 |
 
@@ -402,7 +399,7 @@ curl http://localhost:8787/cdn-cgi/local/scheduled
 | 运行时 | PHP 常驻 + MySQL + Cron | Cloudflare Workers + D1 + Cron Triggers |
 | 凭据加密 | `master.key` + AES-GCM | `MASTER_KEY` + XChaCha20-Poly1305 |
 | 管理员认证 | Argon2id + Session 表 | 环境变量凭证 + HMAC 无状态 Token |
-| 登录防护 | — | Turnstile（含 `remoteip`） |
+| 登录防护 | — | Turnstile（含 `remoteip`），默认关闭，后台可开 |
 | 通知 | SMTP / 通用 Webhook / TG / Bark | 仅 Telegram（支持反代）+ Bark（三级推送） |
 | API Key / Scope | 有 | 已移除 |
 | 桌面小组件接口 | `/api/v1/widget/*` | 已移除 |

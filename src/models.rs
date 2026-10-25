@@ -794,6 +794,40 @@ impl Default for BarkConfig {
     }
 }
 
+/// Turnstile 配置。`secret_enc` 为 XChaCha20Poly1305 密文，**永不出库**。
+///
+/// 未配置（`Secret` 为空）时人机校验整体关闭：登录只校验用户名 + 密码。
+/// 这是刻意的默认值 —— 自建部署先能登进去，再决定要不要开人机校验。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnstileConfig {
+    /// 是否启用。只有 site_key 与 secret 都填了才可能为 true。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 站点公钥，明文存储（本来就会下发到浏览器）。
+    #[serde(default)]
+    pub site_key: Option<String>,
+    /// 私钥密文。
+    #[serde(default)]
+    pub secret_enc: Option<String>,
+}
+
+impl TurnstileConfig {
+    /// 公钥与私钥是否都已填写（非空、去空白后）。
+    pub fn is_complete(&self) -> bool {
+        let has_site = self
+            .site_key
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty());
+        let has_secret = self
+            .secret_enc
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty());
+        has_site && has_secret
+    }
+}
+
 /// 日报配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyReportConfig {
@@ -1124,6 +1158,29 @@ pub struct BarkSettingsUpdate {
     pub alert_level: PushLevel,
 }
 
+/// Turnstile 设置（脱敏：私钥只回 `secret_configured`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnstileSettingsDto {
+    pub enabled: bool,
+    pub site_key: String,
+    pub secret_configured: bool,
+}
+
+/// Turnstile 设置更新请求。
+///
+/// `site_key` / `secret_key` 留空表示**保持原值**；`clear_secret` 显式清除。
+/// 想彻底关闭人机校验，传 `enabled: false` 即可，无需清空密钥。
+#[derive(Debug, Clone, Deserialize)]
+pub struct TurnstileSettingsUpdate {
+    pub enabled: bool,
+    #[serde(default)]
+    pub site_key: Option<String>,
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    #[serde(default)]
+    pub clear_secret: bool,
+}
+
 /// 日报设置 DTO / 更新请求共用（`enabled` + `HH:MM`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyReportDto {
@@ -1136,7 +1193,7 @@ pub struct DailyReportDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsDto {
     pub timezone: String,
-    pub turnstile_site_key: String,
+    pub turnstile: TurnstileSettingsDto,
     pub telegram: TelegramSettingsDto,
     pub bark: BarkSettingsDto,
     pub daily_report: DailyReportDto,

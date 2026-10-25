@@ -19,7 +19,7 @@ export type ApiErrorCode =
   | 'invalid_credentials'
   | 'turnstile_failed'
   | 'turnstile_unavailable'
-  | 'turnstile_not_configured'
+  | 'turnstile_broken'
   | 'cross_origin'
   | 'job_locked'
   | 'job_conflict'
@@ -50,7 +50,7 @@ export class ApiError extends Error {
     return (
       this.code === 'turnstile_failed' ||
       this.code === 'turnstile_unavailable' ||
-      this.code === 'turnstile_not_configured'
+      this.code === 'turnstile_broken'
     )
   }
 }
@@ -238,9 +238,22 @@ export interface DailyReportSettings {
   timezone: string
 }
 
+export interface TurnstileSettings {
+  enabled: boolean
+  site_key: string
+  secret_configured: boolean
+}
+
+export interface TurnstileUpdate {
+  enabled: boolean
+  site_key?: string
+  secret_key?: string
+  clear_secret?: boolean
+}
+
 export interface SettingsResponse {
   timezone: string
-  turnstile_site_key: string
+  turnstile: TurnstileSettings
   telegram: TelegramSettings
   bark: BarkSettings
   daily_report: DailyReportSettings
@@ -523,6 +536,10 @@ export const api = {
   // ---------------------------------------------------------------- 设置
   settings(): Promise<SettingsResponse> {
     return request<SettingsResponse>('/api/v1/settings')
+  },
+
+  updateTurnstile(input: TurnstileUpdate): Promise<SettingsResponse> {
+    return request<SettingsResponse>('/api/v1/settings/turnstile', { method: 'PUT', body: input })
   },
 
   updateTelegram(input: TelegramUpdate): Promise<SettingsResponse> {

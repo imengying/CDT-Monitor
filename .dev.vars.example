@@ -14,19 +14,17 @@ ADMIN_USERNAME=admin
 # 生产环境用 16 位以上强密码
 ADMIN_PASSWORD=local-dev-password
 
-# Turnstile（Cloudflare Dashboard → Turnstile → Add site）
-# 官方测试密钥：site key 1x00000000000000000000AA / secret 1x0000000000000000000000000000000AA
-TURNSTILE_SITE_KEY=1x00000000000000000000AA
-TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
+# Turnstile 默认不启用，这里不需要配置。
+# 需要人机校验时：登录后到 设置 → 人机校验 填两个 key（存 D1，加密保存私钥）。
+# 本地调试想启用，用官方测试密钥：
+#   Site Key   : 1x00000000000000000000AA
+#   Secret Key : 1x0000000000000000000000000000000AA
 
 # --- 可选 ---------------------------------------------------------------
 
 # 日志级别：error（默认）| warn | info | debug
 # 默认只输出错误，正常巡检不产生任何日志。排障时改成 info。
 LOG_LEVEL=error
-
-# 仅本地调试：设为 true 会跳过 Turnstile 校验。生产环境务必删除此行。
-# TURNSTILE_DISABLED=true
 
 # 显式指定已有 D1 的 database_id（一般不需要：wrangler 会按名字自动绑定）
 # CLOUDFLARE_DATABASE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx

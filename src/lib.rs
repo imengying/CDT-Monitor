@@ -58,8 +58,9 @@ use crate::models::{
     AcceptedJob, AccountInput, ApiErrorBody, BarkConfig, BarkSettingsDto, BarkSettingsUpdate,
     DailyReportConfig, DailyReportDto, HistoryBucket, HistoryQuery, JobDto, JobStatus, JobType,
     LoginRequest, NotifyChannel, NotifyTestRequest, SessionResponse, SettingsDto, TelegramConfig,
-    TelegramSettingsDto, TelegramSettingsUpdate, TrafficHistoryResponse, build_overview, now_ms,
-    setting_key, utc_offset_minutes,
+    TelegramSettingsDto, TelegramSettingsUpdate, TrafficHistoryResponse, TurnstileConfig,
+    TurnstileSettingsDto, TurnstileSettingsUpdate, build_overview, now_ms, setting_key,
+    utc_offset_minutes,
 };
 use crate::notify::NotifyLevel;
 use crate::scheduler::Scheduler;
@@ -248,6 +249,16 @@ fn same_origin_ok(req: &Request) -> bool {
 // 应用上下文
 // ===========================================================================
 
+/// 人机校验的三种状态。
+enum TurnstileGate {
+    /// 后台未启用（默认）：跳过人机校验。
+    Disabled,
+    /// 已启用且私钥可用：必须校验。
+    Required(String),
+    /// 已启用但私钥取不出来：拒绝登录，不能当成「未启用」放行。
+    Broken,
+}
+
 /// 一次请求期间共享的上下文。
 struct AppCtx {
     env: Env,
@@ -278,48 +289,56 @@ impl AppCtx {
         })
     }
 
-    fn turnstile_site_key(&self) -> String {
-        self.env
-            .var("TURNSTILE_SITE_KEY")
-            .ok()
-            .map(|v| v.to_string())
-            .or_else(|| {
-                self.env
-                    .secret("TURNSTILE_SITE_KEY")
-                    .ok()
-                    .map(|v| v.to_string())
-            })
-            .unwrap_or_default()
+    /// 读取 Turnstile 配置（来自 D1 的 `settings` 表）。
+    ///
+    /// **未配置即关闭**：`enabled` 为 false 或密钥不全时一律不校验，
+    /// 登录只比对用户名 + 密码。这样自部署可以先跑起来，
+    /// 需要人机校验时再去后台填两个 key。
+    async fn turnstile_config(&self) -> TurnstileConfig {
+        let mut config: TurnstileConfig = self
+            .db
+            .get_json_setting(setting_key::TURNSTILE)
+            .await
+            .unwrap_or_default();
+        // 密钥不全时强制视为关闭，避免出现「前端不渲染组件、后端仍要求 token」
+        config.enabled = config.enabled && config.is_complete();
+        config
     }
 
-    /// Turnstile 私钥（优先 secret，其次 var）。
-    fn turnstile_secret(&self) -> Option<String> {
-        self.env
-            .secret("TURNSTILE_SECRET_KEY")
-            .ok()
-            .map(|v| v.to_string())
-            .or_else(|| {
-                self.env
-                    .var("TURNSTILE_SECRET_KEY")
-                    .ok()
-                    .map(|v| v.to_string())
-            })
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
+    /// 下发给浏览器的 site key。未启用时为空字符串，前端据此不加载脚本。
+    async fn turnstile_site_key(&self) -> String {
+        let config = self.turnstile_config().await;
+        if config.enabled {
+            config.site_key.unwrap_or_default()
+        } else {
+            String::new()
+        }
     }
 
-    /// 显式关闭 Turnstile（仅限本地调试；生产环境绝不要设置）。
-    fn turnstile_disabled(&self) -> bool {
-        self.env
-            .var("TURNSTILE_DISABLED")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.to_string().trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes"
-                )
-            })
-            .unwrap_or(false)
+    /// 人机校验闸门。
+    ///
+    /// 刻意把「没启用」和「启用了但用不了」区分开：前者正常放行，
+    /// 后者必须**拒绝登录**。若两者都返回 `None`，那么一旦私钥解密失败
+    /// （例如 `MASTER_KEY` 被换过）校验就会被静默跳过 —— 等于谁都不知道
+    /// 人机校验已经失效了。
+    async fn turnstile_gate(&self) -> TurnstileGate {
+        let config: TurnstileConfig = self
+            .db
+            .get_json_setting(setting_key::TURNSTILE)
+            .await
+            .unwrap_or_default();
+
+        if !config.enabled || !config.is_complete() {
+            return TurnstileGate::Disabled;
+        }
+
+        let enc = config.secret_enc.as_deref().unwrap_or_default();
+        match self.crypto.try_decrypt(enc) {
+            Some(secret) if !secret.trim().is_empty() => {
+                TurnstileGate::Required(secret.trim().to_string())
+            }
+            _ => TurnstileGate::Broken,
+        }
     }
 
     /// Job 锁 TTL。
@@ -488,11 +507,11 @@ fn verify_credentials(app: &AppCtx, username: &str, password: &str) -> bool {
 // ===========================================================================
 
 /// `GET /api/v1/auth/session`（公开）
-fn handle_session(app: &AppCtx, req: &Request) -> worker::Result<Response> {
+async fn handle_session(app: &AppCtx, req: &Request) -> worker::Result<Response> {
     let expires_at = app.session_from_request(req);
     ok(&SessionResponse {
         authenticated: expires_at.is_some(),
-        turnstile_site_key: app.turnstile_site_key(),
+        turnstile_site_key: app.turnstile_site_key().await,
         expires_at,
     })
 }
@@ -508,40 +527,42 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
         return error_response(400, "密码不能为空");
     }
 
-    // 1) Turnstile
-    if app.turnstile_disabled() {
-        log_warn!("TURNSTILE_DISABLED 已开启，跳过人机校验（仅限本地调试）");
-    } else {
-        let Some(secret) = app.turnstile_secret() else {
+    // 1) Turnstile —— 后台没配就整体跳过（默认关闭）
+    match app.turnstile_gate().await {
+        TurnstileGate::Disabled => {}
+        TurnstileGate::Broken => {
+            log_error!("Turnstile 已启用但私钥无法解密，拒绝登录（请检查 MASTER_KEY）");
             return error_response_with_code(
-                503,
-                "服务端未配置 TURNSTILE_SECRET_KEY，无法完成登录校验",
-                "turnstile_not_configured",
+                500,
+                "人机校验配置异常，请联系管理员检查私钥与 MASTER_KEY",
+                "turnstile_broken",
             );
-        };
-        let ip = client_ip(&req);
-        match verify_turnstile(&secret, &payload.turnstile_token, ip.as_deref()).await {
-            Ok(true) => {}
-            Ok(false) => {
-                sleep_ms(LOGIN_FAILURE_DELAY_MS).await;
-                app.db
-                    .add_log(
-                        None,
-                        "login_turnstile_failed",
-                        None,
-                        "Turnstile 校验未通过",
-                        now_ms(),
-                    )
-                    .await
-                    .ok();
-                return error_response_with_code(
-                    403,
-                    "人机校验未通过，请刷新页面后重试",
-                    "turnstile_failed",
-                );
-            }
-            Err(err) => {
-                return error_response_with_code(502, err, "turnstile_unavailable");
+        }
+        TurnstileGate::Required(secret) => {
+            let ip = client_ip(&req);
+            match verify_turnstile(&secret, &payload.turnstile_token, ip.as_deref()).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    sleep_ms(LOGIN_FAILURE_DELAY_MS).await;
+                    app.db
+                        .add_log(
+                            None,
+                            "login_turnstile_failed",
+                            None,
+                            "Turnstile 校验未通过",
+                            now_ms(),
+                        )
+                        .await
+                        .ok();
+                    return error_response_with_code(
+                        403,
+                        "人机校验未通过，请刷新页面后重试",
+                        "turnstile_failed",
+                    );
+                }
+                Err(err) => {
+                    return error_response_with_code(502, err, "turnstile_unavailable");
+                }
             }
         }
     }
@@ -601,7 +622,7 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
     json_response(
         &SessionResponse {
             authenticated: true,
-            turnstile_site_key: app.turnstile_site_key(),
+            turnstile_site_key: app.turnstile_site_key().await,
             expires_at: Some(now_ms() + ttl),
         },
         200,
@@ -896,9 +917,19 @@ async fn handle_get_settings(app: &AppCtx) -> worker::Result<Response> {
         .map(|account| account.to_dto())
         .collect();
 
+    let turnstile = app.turnstile_config().await;
+
     ok(&SettingsDto {
         timezone: timezone.clone(),
-        turnstile_site_key: app.turnstile_site_key(),
+        turnstile: TurnstileSettingsDto {
+            enabled: turnstile.enabled,
+            site_key: turnstile.site_key.clone().unwrap_or_default(),
+            secret_configured: turnstile
+                .secret_enc
+                .as_deref()
+                .map(|enc| app.crypto.try_decrypt(enc).is_some())
+                .unwrap_or(false),
+        },
         telegram: TelegramSettingsDto {
             enabled: telegram.enabled,
             chat_id: telegram.chat_id.clone(),
@@ -1048,6 +1079,67 @@ async fn handle_update_bark(app: &AppCtx, mut req: Request) -> worker::Result<Re
                 "Bark 通知已启用"
             } else {
                 "Bark 通知已关闭"
+            },
+            now_ms(),
+        )
+        .await?;
+
+    handle_get_settings(app).await
+}
+
+/// `PUT /api/v1/settings/turnstile`
+///
+/// 未配置即关闭：只要后台没填全两个 key，登录就不做人机校验。
+async fn handle_update_turnstile(app: &AppCtx, mut req: Request) -> worker::Result<Response> {
+    let payload: TurnstileSettingsUpdate = match read_json(&mut req).await {
+        Ok(payload) => payload,
+        Err(err) => return error_response(400, err),
+    };
+
+    let mut config: TurnstileConfig = app.db.get_json_setting(setting_key::TURNSTILE).await?;
+
+    if payload.clear_secret {
+        config.secret_enc = None;
+    } else if let Some(secret) = payload
+        .secret_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        config.secret_enc = Some(
+            app.crypto
+                .encrypt(secret)
+                .map_err(|err| worker::Error::RustError(err.to_string()))?,
+        );
+    }
+
+    if let Some(site_key) = payload.site_key.as_deref().map(str::trim) {
+        // 留空 = 保持原值；想清除请用 enabled: false
+        if !site_key.is_empty() {
+            config.site_key = Some(site_key.to_string());
+        }
+    }
+
+    // 要启用就必须两个 key 都在，否则前端不渲染组件、后端却要求 token，
+    // 会陷入「怎么登都失败」的死锁。
+    if payload.enabled && !config.is_complete() {
+        return error_response(400, "启用 Turnstile 前请先填写站点公钥与私钥");
+    }
+
+    config.enabled = payload.enabled;
+
+    app.db
+        .set_json_setting(setting_key::TURNSTILE, &config, now_ms())
+        .await?;
+    app.db
+        .add_log(
+            None,
+            "settings_turnstile",
+            None,
+            if config.enabled {
+                "人机校验已启用"
+            } else {
+                "人机校验已关闭"
             },
             now_ms(),
         )
@@ -1409,7 +1501,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
 
     // ---------------------------------------------------------------- public
     match (method.clone(), rest.as_slice()) {
-        (Method::Get, ["auth", "session"]) => return handle_session(&app, &req),
+        (Method::Get, ["auth", "session"]) => return handle_session(&app, &req).await,
         (Method::Post, ["auth", "login"]) => return handle_login(&app, req).await,
         (Method::Post, ["auth", "logout"]) => return handle_logout(),
         _ => {}
@@ -1521,6 +1613,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
 
         // ------------------------------------------------------------ 设置
         (Method::Get, ["settings"]) => handle_get_settings(&app).await,
+        (Method::Put, ["settings", "turnstile"]) => handle_update_turnstile(&app, req).await,
         (Method::Put, ["settings", "telegram"]) => handle_update_telegram(&app, req).await,
         (Method::Put, ["settings", "bark"]) => handle_update_bark(&app, req).await,
         (Method::Put, ["settings", "daily-report"]) => handle_update_report(&app, req).await,
@@ -1678,6 +1771,91 @@ mod tests {
         assert_eq!(value["job_id"], "abc");
         assert_eq!(value["status"], "pending");
         assert_eq!(value["job_type"], "start_instance");
+    }
+
+    #[test]
+    fn turnstile_disabled_by_default() {
+        // 全新部署：settings 表里没有 turnstile 配置
+        let config = TurnstileConfig::default();
+        assert!(!config.enabled, "默认必须是关闭");
+        assert!(!config.is_complete());
+    }
+
+    #[test]
+    fn turnstile_requires_both_keys_to_be_complete() {
+        let mut config = TurnstileConfig {
+            enabled: true,
+            site_key: Some("0x4AAAAAAA".to_string()),
+            secret_enc: Some("cipher".to_string()),
+        };
+        assert!(config.is_complete());
+
+        // 只填公钥
+        config.secret_enc = None;
+        assert!(!config.is_complete(), "缺私钥不算配置完整");
+
+        // 只填私钥
+        config.secret_enc = Some("cipher".to_string());
+        config.site_key = None;
+        assert!(!config.is_complete(), "缺公钥不算配置完整");
+
+        // 空白字符串等同于没填
+        config.site_key = Some("   ".to_string());
+        assert!(!config.is_complete());
+    }
+
+    #[test]
+    fn turnstile_blank_keys_are_not_complete() {
+        let config = TurnstileConfig {
+            enabled: true,
+            site_key: Some(String::new()),
+            secret_enc: Some(String::new()),
+        };
+        assert!(!config.is_complete());
+    }
+
+    #[test]
+    fn turnstile_config_roundtrips_through_json() {
+        // 存进 D1 的是 JSON；确认密文不会意外变成明文
+        let config = TurnstileConfig {
+            enabled: true,
+            site_key: Some("site".to_string()),
+            secret_enc: Some("enc-value".to_string()),
+        };
+        let raw = serde_json::to_string(&config).expect("序列化");
+        assert!(!raw.contains("\"secret_enc\":null"));
+        let back: TurnstileConfig = serde_json::from_str(&raw).expect("反序列化");
+        assert!(back.is_complete());
+    }
+
+    #[test]
+    fn turnstile_broken_secret_is_not_treated_as_disabled() {
+        // 关键安全属性：启用了但私钥取不出来（MASTER_KEY 被换）时，
+        // 绝不能退化为「未启用」而放行登录。
+        let mut config = TurnstileConfig {
+            enabled: true,
+            site_key: Some("site".to_string()),
+            secret_enc: Some("ciphertext".to_string()),
+        };
+        assert!(config.is_complete());
+
+        // 模拟解密失败：密文存在但解不出明文
+        let crypto = crate::crypto::Crypto::new(
+            crate::crypto::MasterKey::parse(
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            )
+            .expect("主密钥"),
+        );
+        assert!(
+            crypto
+                .try_decrypt(&config.secret_enc.clone().unwrap())
+                .is_none(),
+            "换过 MASTER_KEY 的密文应当解不出来"
+        );
+
+        // 配置仍然是 enabled + complete，说明闸门会判定为 Broken 而非 Disabled
+        config.enabled = true;
+        assert!(config.enabled && config.is_complete());
     }
 
     #[test]

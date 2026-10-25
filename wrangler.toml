@@ -6,20 +6,20 @@
 # 建库、建表、上传全部自动化，不需要本地装 Rust，也不需要去控制台粘 SQL。
 #
 # 一次性准备（全部在网页完成）：
-#   1. 建 Turnstile 站点：Dashboard → Turnstile → Add site
-#        拿到 Site Key（公开）与 Secret Key（机密）
-#   2. 连接 GitHub：Workers & Pages → Create → Workers → Connect to Git
+#   1. 连接 GitHub：Workers & Pages → Create → Workers → Connect to Git
 #        Build command : bun run build
 #        Deploy command: bun run deploy      ← 自动建库 + 迁移 + 发布
 #        Build variable: BUN_VERSION=1.4.4
-#   3. 配运行时 Secret：Settings → Variables and Secrets
-#        MASTER_KEY            openssl rand -hex 32
-#        TURNSTILE_SECRET_KEY  Turnstile 私钥
-#        ADMIN_PASSWORD        首次登录口令（登录后自动转为哈希入库）
-#        TURNSTILE_SITE_KEY    也可以只写在本文件 [vars] 里
+#   2. 配运行时 Secret：Settings → Variables and Secrets
+#        MASTER_KEY      openssl rand -hex 32
+#        ADMIN_USERNAME  管理员用户名
+#        ADMIN_PASSWORD  管理员密码
 #
-# 之后所有业务配置（阿里云账号、Telegram、Bark、日报、时区）都在
-# **网页「设置」里改**，存 D1，即时生效，不需要重新部署。
+# 之后所有业务配置（阿里云账号、Turnstile、Telegram、Bark、日报、时区）
+# 都在**网页「设置」里改**，存 D1，即时生效，不需要重新部署。
+#
+# Turnstile 默认**不启用**：不填就是不校验，登录只看用户名 + 密码。
+# 需要人机校验时到 设置 → 人机校验 填 Site Key / Secret Key 即可。
 #
 # ⚠️ 构建期变量（BUN_VERSION）与运行时变量是两处配置，别放错：
 #      Settings → Build → Build variables   → BUN_VERSION
@@ -95,10 +95,6 @@ crons = ["*/5 * * * *"]
 enabled = false
 
 [vars]
-# Turnstile 站点公钥（可公开）。私钥请配成 Secret，不要写在这里。
-# 留空时前端会提示「服务端未配置 TURNSTILE_SITE_KEY」。
-TURNSTILE_SITE_KEY = ""
-
 # 日志级别：error（默认，只输出错误）| warn | info | debug
 # 默认安静：正常巡检不产生任何日志；失败才有输出。
 LOG_LEVEL = "error"

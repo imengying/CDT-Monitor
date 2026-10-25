@@ -26,13 +26,14 @@ import {
   type SiteType,
   type StopMode,
   type TelegramUpdate,
+  type TurnstileUpdate,
 } from '@/api/client'
 import { el, iconSvg, onEscape, replaceChildren } from '@/lib/dom'
 import { icons, type IconNode } from '@/lib/icons'
 import { afterSettingsChanged, pushDailyReport, testNotification } from '@/lib/actions'
 import { toast } from '@/lib/store'
 
-type Tab = 'accounts' | 'telegram' | 'bark' | 'report' | 'system'
+type Tab = 'accounts' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'system'
 
 /** 账号表单。 */
 interface AccountForm {
@@ -105,6 +106,13 @@ export class SettingsModal {
   private confirmDeleteId: number | null = null
   private saving = false
   private testing: NotifyChannel | 'report' | null = null
+
+  private turnstileDraft = {
+    enabled: false,
+    siteKey: '',
+    secretKey: '',
+    clearSecret: false,
+  }
 
   private telegramDraft = {
     enabled: false,
@@ -215,6 +223,13 @@ export class SettingsModal {
     const settings = this.settings
     if (!settings) return
 
+    this.turnstileDraft = {
+      enabled: settings.turnstile.enabled,
+      siteKey: settings.turnstile.site_key,
+      secretKey: '',
+      clearSecret: false,
+    }
+
     this.telegramDraft = {
       enabled: settings.telegram.enabled,
       chatId: settings.telegram.chat_id ?? '',
@@ -273,6 +288,7 @@ export class SettingsModal {
 
     const tabs: { key: Tab; label: string; icon: IconNode }[] = [
       { key: 'accounts', label: '阿里云账号', icon: icons.server },
+      { key: 'turnstile', label: '人机校验', icon: icons.shield },
       { key: 'telegram', label: 'Telegram', icon: icons.send },
       { key: 'bark', label: 'Bark', icon: icons.phone },
       { key: 'report', label: '日报', icon: icons.bell },
@@ -523,6 +539,9 @@ export class SettingsModal {
         break
       case 'report':
         this.renderReport()
+        break
+      case 'turnstile':
+        this.renderTurnstile()
         break
       case 'system':
         this.renderSystem()
@@ -975,6 +994,166 @@ export class SettingsModal {
       this.renderContent()
     } catch (error) {
       this.showNotice(error instanceof ApiError ? error.message : '删除账号失败', 'danger')
+    } finally {
+      this.saving = false
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 人机校验（Turnstile）
+  // -------------------------------------------------------------------------
+
+  private renderTurnstile(): void {
+    const configured = this.settings?.turnstile.secret_configured ?? false
+    const active = this.settings?.turnstile.enabled ?? false
+
+    const siteInput = this.textInput(
+      this.turnstileDraft.siteKey,
+      (value) => {
+        this.turnstileDraft.siteKey = value
+      },
+      { placeholder: '0x4AAAAAAAA...' },
+    )
+
+    const secretInput = this.textInput(
+      this.turnstileDraft.secretKey,
+      (value) => {
+        this.turnstileDraft.secretKey = value
+      },
+      {
+        type: 'password',
+        placeholder: configured ? '留空表示不修改' : '0x4AAAAAAAA...',
+      },
+    )
+
+    const children: HTMLElement[] = [
+      el(
+        'div',
+        {},
+        el('h3', { class: 'text-xs font-semibold', text: 'Cloudflare Turnstile' }),
+        el('p', {
+          class: 'mt-0.5 text-[11px] leading-relaxed',
+          style: { color: 'var(--color-ink-subtle)' },
+          text: '登录时的人机校验。不填就是不启用 —— 只校验用户名与密码。',
+        }),
+      ),
+      el(
+        'div',
+        {
+          class: 'flex items-start gap-2 rounded-lg px-3 py-2 text-[11px]',
+          style: {
+            backgroundColor: active ? 'var(--color-ok-soft)' : 'var(--color-surface-muted)',
+            color: active ? 'var(--color-ok)' : 'var(--color-ink-subtle)',
+          },
+        },
+        iconSvg(active ? icons.shield : icons.info, 13),
+        el('span', {
+          class: 'leading-relaxed',
+          text: active
+            ? '已启用：登录时浏览器会静默完成校验，判定可疑时才弹出复选框。'
+            : '未启用：登录只校验用户名 + 密码，建议仅在完全可信的网络环境下保持关闭。',
+        }),
+      ),
+      el(
+        'div',
+        {},
+        el(
+          'label',
+          { class: 'label' },
+          el('span', { text: '站点公钥 Site Key' }),
+        ),
+        siteInput,
+      ),
+      el(
+        'div',
+        {},
+        el(
+          'label',
+          { class: 'label' },
+          el('span', { text: '私钥 Secret Key' }),
+          ...(configured ? [el('span', { class: 'badge badge-ok ml-1', text: '已配置' })] : []),
+        ),
+        secretInput,
+      ),
+      this.switchControl(
+        '启用人机校验',
+        () => this.turnstileDraft.enabled,
+        (value) => {
+          this.turnstileDraft.enabled = value
+        },
+      ),
+    ]
+
+    if (configured) {
+      children.push(
+        this.checkboxRow('清除已保存的私钥', (checked) => {
+          this.turnstileDraft.clearSecret = checked
+        }),
+      )
+    }
+
+    children.push(
+      el(
+        'p',
+        {
+          class: 'text-[11px] leading-relaxed',
+          style: { color: 'var(--color-ink-subtle)' },
+          text: '密钥在 Cloudflare 控制台 → Turnstile → 添加站点 获取。私钥以 XChaCha20-Poly1305 加密后存入 D1，不再以明文下发。',
+        },
+      ),
+      el(
+        'div',
+        {
+          class: 'flex flex-wrap justify-end gap-2 border-t pt-3',
+          style: { borderColor: 'var(--color-line)' },
+        },
+        this.submitButton('保存'),
+      ),
+    )
+
+    replaceChildren(
+      this.content,
+      el(
+        'form',
+        {
+          class: 'space-y-4',
+          on: {
+            submit: (event) => {
+              event.preventDefault()
+              void this.saveTurnstile()
+            },
+          },
+        },
+        ...children,
+      ),
+    )
+  }
+
+  private async saveTurnstile(): Promise<void> {
+    if (this.saving) return
+
+    const payload: TurnstileUpdate = {
+      enabled: this.turnstileDraft.enabled,
+      clear_secret: this.turnstileDraft.clearSecret,
+    }
+    const siteKey = this.turnstileDraft.siteKey.trim()
+    if (siteKey) payload.site_key = siteKey
+    const secretKey = this.turnstileDraft.secretKey.trim()
+    if (secretKey) payload.secret_key = secretKey
+
+    this.saving = true
+    try {
+      const settings = await api.updateTurnstile(payload)
+      this.settings = settings
+      this.showNotice('人机校验设置已保存', 'ok')
+      await afterSettingsChanged()
+      this.syncDrafts()
+      this.renderContent()
+    } catch (error) {
+      this.showNotice(
+        error instanceof ApiError ? error.message : '保存人机校验设置失败',
+        'danger',
+      )
     } finally {
       this.saving = false
     }

@@ -193,18 +193,9 @@ export class LoginModal {
     const available = this.siteKey.trim().length > 0
 
     if (!available) {
-      return el(
-        'div',
-        { class: 'mb-5' },
-        el('p', {
-          class: 'rounded-lg px-3 py-2 text-xs',
-          style: {
-            backgroundColor: 'var(--color-warn-soft)',
-            color: 'var(--color-warn)',
-          },
-          text: '服务端未配置 TURNSTILE_SITE_KEY，登录请求可能被拒绝。',
-        }),
-      )
+      // 后台没启用 Turnstile（默认状态）：什么都不渲染，卡片保持干净。
+      // 不显示"未配置"告警 —— 这是正常配置，不是故障。
+      return el('div', { class: 'hidden', dataset: { role: 'turnstile-off' } })
     }
 
     // 不给容器加固定高度：静默通过时它自然塌陷为 0，不影响卡片布局。
