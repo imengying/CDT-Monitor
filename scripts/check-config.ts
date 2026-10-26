@@ -87,8 +87,8 @@ function main(): void {
 
   // --- Cron ---
   checks.push({
-    name: "[triggers] 含 */5 定时",
-    ok: /crons\s*=\s*\[[^\]]*"\*\/5 \* \* \* \*"/.test(raw),
+    name: "[triggers] 含 */30 定时",
+    ok: /crons\s*=\s*\[[^\]]*"\*\/30 \* \* \* \*"/.test(raw),
     hint: "巡检依赖 Cron，缺失则不会自动采集/熔断",
   });
 

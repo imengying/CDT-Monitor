@@ -1,6 +1,6 @@
 //! # 调度器：采样、熔断、定时开关机、抢占式保活、日报
 //!
-//! 每次 Cron（`*/5 * * * *`）走一遍 [`Scheduler::run_cron`]：
+//! 每次 Cron（`*/30 * * * *`）走一遍 [`Scheduler::run_cron`]：
 //!
 //! ```text
 //! 1. 清理过期锁 / 旧任务 / 旧日志（每天一次）
@@ -45,11 +45,11 @@ use crate::notify::{
     BarkChannel, Channels, Message, NotifyLevel, NotifyOutcome, TelegramChannel, dispatch,
 };
 
-/// 定时开关机的补偿窗口（分钟）。Cron 每 5 分钟一次，20 分钟窗口意味着
-/// 最多 4 次重试机会，足以吞掉一次网络抖动。
-pub const SCHEDULE_WINDOW_MINUTES: u32 = 20;
-/// 日报的补偿窗口（分钟）。
-pub const REPORT_WINDOW_MINUTES: u32 = 40;
+/// 定时开关机的补偿窗口（分钟）。Cron 每 30 分钟一次，60 分钟窗口意味着
+/// 命中目标时刻后还有 1 次重试机会，足以吞掉一次网络抖动。
+pub const SCHEDULE_WINDOW_MINUTES: u32 = 60;
+/// 日报的补偿窗口（分钟）。同样按两个 Cron 周期取值。
+pub const REPORT_WINDOW_MINUTES: u32 = 60;
 /// 流量采样去重心跳：数值连续不变时，至少每 30 分钟落一个点，
 /// 保证小时粒度图表不断线。
 pub const HISTORY_HEARTBEAT_MS: i64 = 30 * 60 * 1000;
@@ -316,7 +316,7 @@ impl Scheduler {
 
     /// 同一「去重键」在窗口内只发送一次的通知。
     ///
-    /// 用于周期性巡检产生的告警：Cron 每 5 分钟一轮，若不加抑制，
+    /// 用于周期性巡检产生的告警：Cron 每 30 分钟一轮，若不加抑制，
     /// 一次持续异常会连续轰炸。去重键应包含「异常主体 + 时间片」，
     /// 例如 `spike:3:4850000`。
     pub async fn notify_once(
@@ -619,7 +619,7 @@ impl Scheduler {
         ])
         .with_group("CDT-Spike");
 
-        // 同一账号同一小时内只告警一次：Cron 每 5 分钟一轮，
+        // 同一账号同一小时内只告警一次：Cron 每 30 分钟一轮，
         // 一次持续的大流量会连续触发几十条通知。
         let hour_key = self.now / (60 * 60 * 1000);
         let dedup_key = format!("spike:{}:{}", account.id, hour_key);

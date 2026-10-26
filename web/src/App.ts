@@ -34,8 +34,13 @@ import { LogDrawer } from '@/components/LogDrawer'
 import { SettingsModal } from '@/components/SettingsModal'
 import { renderToasts } from '@/components/ToastStack'
 
-/** 概览静默轮询间隔（毫秒）。 */
-const OVERVIEW_POLL_MS = 60_000
+/**
+ * 概览静默轮询间隔（毫秒）。
+ *
+ * 数据实际由 Cron 每 30 分钟写一次，轮询比它更勤只会白烧请求，
+ * 因此取 5 分钟，保证刷新后能较快看到新数据即可。
+ */
+const OVERVIEW_POLL_MS = 5 * 60_000
 
 /** 控制台外壳。 */
 export class App {

@@ -206,7 +206,7 @@ export class TrafficChart {
         iconSvg(icons.chart, 22),
         el('span', { text: '暂无历史采样数据' }),
         el('span', {
-          text: '等待下一次 Cron 巡检（每 5 分钟一次）后即可看到趋势',
+          text: '等待下一次 Cron 巡检（每 30 分钟一次）后即可看到趋势',
           style: { fontSize: '10px', opacity: '0.75' },
         }),
       )
