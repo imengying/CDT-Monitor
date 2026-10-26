@@ -523,11 +523,22 @@ export class SettingsModal {
   }
 
   /** 数值输入。 */
-  private numberInput(initial: number, onInput: (value: number) => void): HTMLInputElement {
+  /**
+   * 数字输入。
+   *
+   * `min` 默认 0.1（时长、天数这类不该为 0 的字段），
+   * 但「填 0 表示用默认值」的字段必须传 `min: 0`，
+   * 否则浏览器的 min 校验会把 0 判为非法输入。
+   */
+  private numberInput(
+    initial: number,
+    onInput: (value: number) => void,
+    min = '0.1',
+  ): HTMLInputElement {
     const input = el('input', {
       class: 'input',
       type: 'number',
-      min: '0.1',
+      min,
       step: '0.1',
     }) as HTMLInputElement
     input.value = String(initial)
@@ -1110,39 +1121,18 @@ export class SettingsModal {
         ),
       ),
 
-      this.field(
-        '免费额度',
-        el(
-          'div',
-          {
-            class: 'flex items-center gap-2 rounded-lg border px-3 py-2 text-sm',
-            style: {
-              borderColor: 'var(--color-line)',
-              backgroundColor: 'var(--color-surface-muted)',
-              color: 'var(--color-ink-muted)',
-            },
-          },
-          el('span', { text: '中国内地' }),
-          el('b', { class: 'font-mono tabular-nums', text: `${CDT_DOMESTIC_QUOTA_GB} GB` }),
-          el('span', { class: 'mx-1', style: { color: 'var(--color-ink-subtle)' }, text: '·' }),
-          el('span', { text: '非中国内地' }),
-          el('b', { class: 'font-mono tabular-nums', text: `${CDT_OVERSEAS_QUOTA_GB} GB` }),
-          el('span', {
-            class: 'ml-auto text-xs',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '每月，两池独立判定',
-          }),
-        ),
-      ),
-
       el(
         'div',
-        { class: 'grid gap-3 sm:grid-cols-3' },
+        { class: 'grid gap-3 sm:grid-cols-2' },
         this.field(
           '突变告警阈值（GB）',
-          this.numberInput(form.spikeThresholdGb ?? 0, (value) => {
-            this.form.spikeThresholdGb = value > 0 ? value : null
-          }),
+          this.numberInput(
+            form.spikeThresholdGb ?? 0,
+            (value) => {
+              this.form.spikeThresholdGb = value > 0 ? value : null
+            },
+            '0',
+          ),
           '单次采样增长超过此值即告警，填 0 使用默认值',
         ),
         this.field(
