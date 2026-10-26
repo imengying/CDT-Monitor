@@ -137,7 +137,6 @@ export class SettingsModal {
   private activeTab: Tab = 'accounts'
 
   private readonly content: HTMLDivElement
-  private readonly notice: HTMLDivElement
   private readonly tabButtons = new Map<Tab, HTMLButtonElement>()
 
   private form: AccountForm = blankAccountForm()
@@ -150,7 +149,6 @@ export class SettingsModal {
     enabled: false,
     siteKey: '',
     secretKey: '',
-    clearSecret: false,
   }
 
   private telegramDraft = {
@@ -186,10 +184,6 @@ export class SettingsModal {
 
   constructor() {
     this.content = el('div', { class: 'scroll-thin min-h-0 flex-1 overflow-y-auto p-6' })
-    this.notice = el('div', {
-      class: 'hidden items-start gap-2 border-b px-5 py-2 text-xs',
-      style: { borderColor: 'var(--color-line)' },
-    })
 
     this.element = el(
       'div',
@@ -210,7 +204,6 @@ export class SettingsModal {
           'aria-label': '系统设置',
         },
         this.buildHeader(),
-        this.notice,
         el(
           'div',
           { class: 'flex min-h-0 flex-1 flex-col md:flex-row' },
@@ -247,7 +240,6 @@ export class SettingsModal {
       if (target) this.form = formFromAccount(target)
     }
     this.confirmDeleteId = null
-    this.hideNotice()
     this.devices = []
     this.devicesLoaded = false
     this.element.classList.remove('hidden')
@@ -293,7 +285,6 @@ export class SettingsModal {
       enabled: settings.turnstile.enabled,
       siteKey: settings.turnstile.site_key,
       secretKey: '',
-      clearSecret: false,
     }
 
     this.telegramDraft = {
@@ -398,34 +389,6 @@ export class SettingsModal {
           : 'btn btn-ghost btn-sm justify-start whitespace-nowrap'
       button.style.borderColor = 'transparent'
     }
-  }
-
-  private showNotice(text: string, tone: 'ok' | 'danger' | 'warn' = 'ok'): void {
-    this.notice.classList.remove('hidden')
-    this.notice.classList.add('flex')
-    this.notice.style.backgroundColor =
-      tone === 'danger'
-        ? 'var(--color-danger-soft)'
-        : tone === 'warn'
-          ? 'var(--color-warn-soft)'
-          : 'var(--color-ok-soft)'
-    this.notice.style.color =
-      tone === 'danger'
-        ? 'var(--color-danger)'
-        : tone === 'warn'
-          ? 'var(--color-warn)'
-          : 'var(--color-ok)'
-    replaceChildren(
-      this.notice,
-      iconSvg(tone === 'ok' ? icons.check : icons.alert, 13),
-      el('span', { class: 'leading-relaxed', text }),
-    )
-  }
-
-  private hideNotice(): void {
-    this.notice.classList.add('hidden')
-    this.notice.classList.remove('flex')
-    this.notice.replaceChildren()
   }
 
   // -------------------------------------------------------------------------
@@ -1008,15 +971,15 @@ export class SettingsModal {
     const form = this.form
 
     if (!form.name.trim()) {
-      this.showNotice('请填写账号名称', 'warn')
+      toast('请填写账号名称', 'warn')
       return
     }
     if (!form.accessKeyId.trim()) {
-      this.showNotice('请填写 AccessKey ID', 'warn')
+      toast('请填写 AccessKey ID', 'warn')
       return
     }
     if (form.id === null && !form.accessKeySecret.trim()) {
-      this.showNotice('新增账号必须填写 AccessKey Secret', 'warn')
+      toast('新增账号必须填写 AccessKey Secret', 'warn')
       return
     }
 
@@ -1042,11 +1005,10 @@ export class SettingsModal {
     try {
       if (form.id === null) {
         await api.createAccount(payload)
-        this.showNotice('账号已添加', 'ok')
-        toast('账号已添加', 'ok')
+        toast('账号已添加')
       } else {
         await api.updateAccount(form.id, payload)
-        this.showNotice('账号已更新', 'ok')
+        toast('账号已更新')
       }
       this.formOpen = false
       this.form = blankAccountForm()
@@ -1054,7 +1016,7 @@ export class SettingsModal {
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      this.showNotice(error instanceof ApiError ? error.message : '保存账号失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '保存账号失败', 'danger')
     } finally {
       this.saving = false
     }
@@ -1066,12 +1028,12 @@ export class SettingsModal {
     try {
       await api.deleteAccount(id)
       this.confirmDeleteId = null
-      this.showNotice('账号已删除', 'ok')
+      toast('账号已删除')
       await afterSettingsChanged()
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      this.showNotice(error instanceof ApiError ? error.message : '删除账号失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '删除账号失败', 'danger')
     } finally {
       this.saving = false
     }
@@ -1165,14 +1127,6 @@ export class SettingsModal {
       ),
     ]
 
-    if (configured) {
-      children.push(
-        this.checkboxRow('清除已保存的私钥', (checked) => {
-          this.turnstileDraft.clearSecret = checked
-        }),
-      )
-    }
-
     children.push(
       el(
         'p',
@@ -1215,7 +1169,6 @@ export class SettingsModal {
 
     const payload: TurnstileUpdate = {
       enabled: this.turnstileDraft.enabled,
-      clear_secret: this.turnstileDraft.clearSecret,
     }
     const siteKey = this.turnstileDraft.siteKey.trim()
     if (siteKey) payload.site_key = siteKey
@@ -1226,15 +1179,12 @@ export class SettingsModal {
     try {
       const settings = await api.updateTurnstile(payload)
       this.settings = settings
-      this.showNotice('人机校验设置已保存', 'ok')
+      toast('人机校验设置已保存')
       await afterSettingsChanged()
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      this.showNotice(
-        error instanceof ApiError ? error.message : '保存人机校验设置失败',
-        'danger',
-      )
+      toast(error instanceof ApiError ? error.message : '保存人机校验设置失败', 'danger')
     } finally {
       this.saving = false
     }
@@ -1347,16 +1297,13 @@ export class SettingsModal {
     this.saving = true
     try {
       await api.updateTelegram(payload)
-      this.showNotice('Telegram 配置已保存', 'ok')
+      toast('Telegram 配置已保存')
       await afterSettingsChanged()
       // 已保存的 Token 不再回显：用服务端最新状态重置草稿
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      this.showNotice(
-        error instanceof ApiError ? error.message : '保存 Telegram 配置失败',
-        'danger',
-      )
+      toast(error instanceof ApiError ? error.message : '保存 Telegram 配置失败', 'danger')
     } finally {
       this.saving = false
     }
@@ -1493,12 +1440,12 @@ export class SettingsModal {
     this.saving = true
     try {
       await api.updateBark(payload)
-      this.showNotice('Bark 配置已保存', 'ok')
+      toast('Bark 配置已保存')
       await afterSettingsChanged()
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      this.showNotice(error instanceof ApiError ? error.message : '保存 Bark 配置失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '保存 Bark 配置失败', 'danger')
     } finally {
       this.saving = false
     }
@@ -1560,19 +1507,19 @@ export class SettingsModal {
   private async saveReport(): Promise<void> {
     if (this.saving) return
     if (!/^\d{1,2}:\d{2}$/.test(this.reportDraft.time.trim())) {
-      this.showNotice('日报时间格式应为 HH:MM', 'warn')
+      toast('日报时间格式应为 HH:MM', 'warn')
       return
     }
 
     this.saving = true
     try {
       await api.updateDailyReport(this.reportDraft.enabled, this.reportDraft.time.trim())
-      this.showNotice('日报设置已保存', 'ok')
+      toast('日报设置已保存')
       await afterSettingsChanged()
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      this.showNotice(error instanceof ApiError ? error.message : '保存日报设置失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '保存日报设置失败', 'danger')
     } finally {
       this.saving = false
     }
@@ -1734,12 +1681,12 @@ export class SettingsModal {
         job_lock_ttl_ms: Math.round(this.advancedDraft.jobLockMinutes * 60_000),
         session_ttl_ms: Math.round(this.advancedDraft.sessionDays * 24 * 60 * 60 * 1000),
       })
-      this.showNotice('高级配置已保存', 'ok')
+      toast('高级配置已保存')
       await afterSettingsChanged()
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      this.showNotice(error instanceof ApiError ? error.message : '保存高级配置失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '保存高级配置失败', 'danger')
     } finally {
       this.saving = false
     }
@@ -1870,11 +1817,11 @@ export class SettingsModal {
       this.devices = data.sessions
       this.devicesLoaded = true
       this.refreshDeviceList()
-      if (notify) this.showNotice('设备列表已刷新', 'ok')
+      if (notify) toast('设备列表已刷新')
     } catch (error) {
       this.devicesLoaded = true
       this.refreshDeviceList()
-      this.showNotice(error instanceof ApiError ? error.message : '读取登录设备失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '读取登录设备失败', 'danger')
     }
   }
 
@@ -1884,9 +1831,9 @@ export class SettingsModal {
     try {
       const data = await api.revokeSession(sid)
       this.devices = data.sessions
-      this.showNotice('该设备已下线', 'ok')
+      toast('该设备已下线')
     } catch (error) {
-      this.showNotice(error instanceof ApiError ? error.message : '下线失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '下线失败', 'danger')
     } finally {
       this.kicking = null
       this.refreshDeviceList()
@@ -1899,9 +1846,9 @@ export class SettingsModal {
     try {
       const data = await api.revokeOtherSessions()
       this.devices = data.sessions
-      this.showNotice('其它设备已全部下线', 'ok')
+      toast('其它设备已全部下线')
     } catch (error) {
-      this.showNotice(error instanceof ApiError ? error.message : '下线失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '下线失败', 'danger')
     } finally {
       this.kicking = null
       this.refreshDeviceList()
@@ -1913,12 +1860,12 @@ export class SettingsModal {
     this.saving = true
     try {
       await api.updateTimezone(this.timezoneDraft.trim())
-      this.showNotice('时区已保存', 'ok')
+      toast('时区已保存')
       await afterSettingsChanged()
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      this.showNotice(error instanceof ApiError ? error.message : '保存时区失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '保存时区失败', 'danger')
     } finally {
       this.saving = false
     }

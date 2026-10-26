@@ -265,7 +265,6 @@ export interface TurnstileUpdate {
   enabled: boolean
   site_key?: string
   secret_key?: string
-  clear_secret?: boolean
 }
 
 export interface TimeZoneOption {

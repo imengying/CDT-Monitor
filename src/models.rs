@@ -1386,8 +1386,8 @@ pub struct TurnstileSettingsDto {
 
 /// Turnstile 设置更新请求。
 ///
-/// `site_key` / `secret_key` 留空表示**保持原值**；`clear_secret` 显式清除。
-/// 想彻底关闭人机校验，传 `enabled: false` 即可，无需清空密钥。
+/// `site_key` / `secret_key` 留空表示**保持原值**。
+/// 想关闭人机校验，传 `enabled: false` 即可，无需清空密钥。
 #[derive(Debug, Clone, Deserialize)]
 pub struct TurnstileSettingsUpdate {
     pub enabled: bool,
@@ -1395,8 +1395,6 @@ pub struct TurnstileSettingsUpdate {
     pub site_key: Option<String>,
     #[serde(default)]
     pub secret_key: Option<String>,
-    #[serde(default)]
-    pub clear_secret: bool,
 }
 
 /// 日报设置 DTO / 更新请求共用（`enabled` + `HH:MM`）。

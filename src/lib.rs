@@ -1125,9 +1125,7 @@ async fn handle_update_turnstile(app: &AppCtx, mut req: Request) -> worker::Resu
 
     let mut config: TurnstileConfig = app.db.get_json_setting(setting_key::TURNSTILE).await?;
 
-    if payload.clear_secret {
-        config.secret_enc = None;
-    } else if let Some(secret) = payload
+    if let Some(secret) = payload
         .secret_key
         .as_deref()
         .map(str::trim)
