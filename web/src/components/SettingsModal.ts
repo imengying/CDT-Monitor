@@ -53,6 +53,15 @@ interface RegionOption {
   group: string
 }
 
+/**
+ * CDT 免费额度（GB/月）。
+ *
+ * 阿里云定的固定值，不是用户可配项，因此只展示不可输入。
+ * 与后端 `DEFAULT_DOMESTIC_LIMIT_GB` / `DEFAULT_OVERSEAS_LIMIT_GB` 一致。
+ */
+const CDT_DOMESTIC_QUOTA_GB = 20
+const CDT_OVERSEAS_QUOTA_GB = 200
+
 /** 「地区」下拉的选项；决定「地域」列出哪一批城市。 */
 const REGION_GROUPS = ['中国', '亚太', '北美', '中欧'] as const
 
@@ -98,9 +107,6 @@ const REGION_OPTIONS: RegionOption[] = [
   { value: 'me-east-1', label: '阿联酋（迪拜）', group: '中欧' },
 ]
 
-/** 默认勾选的地域（与后端 `DEFAULT_REGIONS` 保持一致）。 */
-const DEFAULT_REGIONS = ['cn-hangzhou', 'cn-shanghai', 'cn-beijing', 'cn-shenzhen']
-
 /** 地域 → 显示名；不在清单里的原样显示（账号里可能存着已下线的地域）。 */
 function regionLabel(region: string): string {
   return REGION_OPTIONS.find((item) => item.value === region)?.label ?? region
@@ -121,10 +127,6 @@ interface AccountForm {
   regions: string[]
   /** 「地区」下拉的当前选择，仅用于筛选地域清单，不提交。 */
   regionGroup: string
-  /** 中国内地流量阈值（GB）。 */
-  domesticLimitGb: number
-  /** 非中国内地流量阈值（GB）。 */
-  overseasLimitGb: number
   /** 突变告警阈值（GB）；null 表示使用默认值，0 表示关闭 */
   spikeThresholdGb: number | null
   overLimitAction: OverLimitAction
@@ -143,10 +145,10 @@ function blankAccountForm(): AccountForm {
     siteType: 'china',
     accessKeyId: '',
     accessKeySecret: '',
-    regions: [...DEFAULT_REGIONS],
+    // 默认一个都不勾：勾多少地域就要发多少次 DescribeInstances，
+    // 预先勾上四个会让新建账号的首次刷新变慢，也让用户以为这是必填。
+    regions: [],
     regionGroup: REGION_GROUPS[0],
-    domesticLimitGb: 20,
-    overseasLimitGb: 200,
     spikeThresholdGb: null,
     overLimitAction: 'stop_and_notify',
     stopMode: 'StopCharging',
@@ -199,8 +201,6 @@ function formFromAccount(account: AccountDto): AccountForm {
     accessKeySecret: '',
     regions: [...account.regions],
     regionGroup: groupOfRegion(account.regions[0] ?? ''),
-    domesticLimitGb: account.domestic_limit_gb,
-    overseasLimitGb: account.overseas_limit_gb,
     spikeThresholdGb: account.spike_threshold_gb,
     overLimitAction: account.over_limit_action,
     stopMode: account.stop_mode,
@@ -261,6 +261,8 @@ export class SettingsModal {
   private deviceListHost: HTMLDivElement | null = null
   /** 地域多选浮层（挂在 body 上，需手动清理）。 */
   private regionPanel: HTMLDivElement | null = null
+  /** 浮层的滚动跟随解绑函数；随面板一起清理。 */
+  private regionPanelCleanup: (() => void) | null = null
 
   private removeEscListener: (() => void) | null = null
 
@@ -340,10 +342,17 @@ export class SettingsModal {
     this.element.classList.add('hidden')
     this.element.style.display = 'none'
     document.body.style.overflow = ''
-    this.regionPanel?.remove()
-    this.regionPanel = null
+    this.closeRegionPanel()
     this.removeEscListener?.()
     this.removeEscListener = null
+  }
+
+  /** 关闭地域浮层并解绑滚动跟随（幂等）。 */
+  private closeRegionPanel(): void {
+    this.regionPanel?.remove()
+    this.regionPanel = null
+    this.regionPanelCleanup?.()
+    this.regionPanelCleanup = null
   }
 
   /**
@@ -572,24 +581,37 @@ export class SettingsModal {
     ) as HTMLButtonElement
 
     const close = (): void => {
-      this.regionPanel?.remove()
-      this.regionPanel = null
+      this.closeRegionPanel()
       trigger.setAttribute('aria-expanded', 'false')
     }
 
     trigger.addEventListener('click', () => {
       close()
-      const rect = trigger.getBoundingClientRect()
+
       const panel = el('div', {
-        class: 'card absolute z-[70] max-h-80 overflow-y-auto p-2 scroll-thin',
-        style: {
-          left: `${rect.left}px`,
-          top: `${rect.bottom + 4}px`,
-          width: `${rect.width}px`,
-        },
+        class: 'card fixed z-[70] max-h-80 overflow-y-auto p-2 scroll-thin',
         role: 'group',
         'aria-label': '选择地域',
       })
+
+      // 面板挂 body 上用 fixed 定位，必须自己跟随触发器位置。
+      // 设置页内容在 `this.content` 里独立滚动，用 absolute 会钉在页面原始
+      // 位置 —— 表现为滚轮滚动后勾选框留在原地、与触发器脱节。
+      const reposition = (): void => {
+        const rect = trigger.getBoundingClientRect()
+        panel.style.left = `${rect.left}px`
+        panel.style.width = `${rect.width}px`
+        // 下方空间不够时向上翻转，避免面板被视口裁掉
+        const spaceBelow = window.innerHeight - rect.bottom
+        if (spaceBelow < 200 && rect.top > spaceBelow) {
+          panel.style.top = ''
+          panel.style.bottom = `${window.innerHeight - rect.top + 4}px`
+        } else {
+          panel.style.bottom = ''
+          panel.style.top = `${rect.bottom + 4}px`
+        }
+      }
+      reposition()
 
       for (const option of REGION_OPTIONS) {
         if (option.group !== group) continue
@@ -635,6 +657,9 @@ export class SettingsModal {
       this.regionPanel = panel
       trigger.setAttribute('aria-expanded', 'true')
 
+      this.content.addEventListener('scroll', reposition, { passive: true })
+      window.addEventListener('resize', reposition, { passive: true })
+
       // 点空白处关闭：延迟注册，避免这次点击立刻把自己关掉
       window.setTimeout(() => {
         const onDocClick = (event: MouseEvent): void => {
@@ -645,6 +670,11 @@ export class SettingsModal {
         }
         document.addEventListener('click', onDocClick, true)
       }, 0)
+
+      this.regionPanelCleanup = (): void => {
+        this.content.removeEventListener('scroll', reposition)
+        window.removeEventListener('resize', reposition)
+      }
     })
 
     return el('div', { class: 'relative' }, trigger)
@@ -1047,7 +1077,6 @@ export class SettingsModal {
       el(
         'div',
         { class: 'grid gap-3 sm:grid-cols-3' },
-        this.field('地域', regionsHost),
         this.field(
           '地区',
           this.selectInput(
@@ -1065,6 +1094,7 @@ export class SettingsModal {
             },
           ),
         ),
+        this.field('地域', regionsHost),
         this.field(
           '停机模式',
           this.selectInput(
@@ -1080,23 +1110,34 @@ export class SettingsModal {
         ),
       ),
 
+      this.field(
+        '免费额度',
+        el(
+          'div',
+          {
+            class: 'flex items-center gap-2 rounded-lg border px-3 py-2 text-sm',
+            style: {
+              borderColor: 'var(--color-line)',
+              backgroundColor: 'var(--color-surface-muted)',
+              color: 'var(--color-ink-muted)',
+            },
+          },
+          el('span', { text: '中国内地' }),
+          el('b', { class: 'font-mono tabular-nums', text: `${CDT_DOMESTIC_QUOTA_GB} GB` }),
+          el('span', { class: 'mx-1', style: { color: 'var(--color-ink-subtle)' }, text: '·' }),
+          el('span', { text: '非中国内地' }),
+          el('b', { class: 'font-mono tabular-nums', text: `${CDT_OVERSEAS_QUOTA_GB} GB` }),
+          el('span', {
+            class: 'ml-auto text-xs',
+            style: { color: 'var(--color-ink-subtle)' },
+            text: '每月，两池独立判定',
+          }),
+        ),
+      ),
+
       el(
         'div',
         { class: 'grid gap-3 sm:grid-cols-3' },
-        this.field(
-          '中国内地额度（GB）',
-          this.numberInput(form.domesticLimitGb, (value) => {
-            this.form.domesticLimitGb = value
-          }),
-          '默认 20，两个池子分别判定',
-        ),
-        this.field(
-          '非中国内地额度（GB）',
-          this.numberInput(form.overseasLimitGb, (value) => {
-            this.form.overseasLimitGb = value
-          }),
-          '默认 200',
-        ),
         this.field(
           '突变告警阈值（GB）',
           this.numberInput(form.spikeThresholdGb ?? 0, (value) => {
@@ -1201,8 +1242,9 @@ export class SettingsModal {
       site_type: form.siteType,
       access_key_id: form.accessKeyId.trim(),
       regions: [...form.regions],
-      domestic_limit_gb: Number(form.domesticLimitGb),
-      overseas_limit_gb: Number(form.overseasLimitGb),
+      // 额度是阿里云固定值，不作为可编辑项提交
+      domestic_limit_gb: CDT_DOMESTIC_QUOTA_GB,
+      overseas_limit_gb: CDT_OVERSEAS_QUOTA_GB,
       spike_threshold_gb: form.spikeThresholdGb,
       over_limit_action: form.overLimitAction,
       stop_mode: form.stopMode,

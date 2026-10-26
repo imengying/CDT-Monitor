@@ -254,6 +254,7 @@ bun run dev:web                  # :5173
 * CDT 查询失败 → 沿用上次快照流量值，不写 0
 * 余额查询失败 → 沿用上次快照
 * 某地域实例查询失败 → 仅保留该地域旧实例
+* 未勾选任何地域 → 只采集 CDT 流量与余额，不查询实例（不会回退到默认地域）
 * 逐实例保活开关 → 按 `instance_id` 从旧快照继承
 
 ### 异步 Job
@@ -345,7 +346,10 @@ CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、
 
 任一池超出即触发熔断。两个池子分别判定，不使用合计阈值 —— 用合计判断会
 同时造成漏停（内地已超额但合计没到）和误停（合计到了但两池都还在额度内）。
-账号的 `domestic_limit_gb` / `overseas_limit_gb` 就是这两条线，默认 20 / 200。
+
+额度是阿里云定的固定值，**界面上只展示不可编辑**；数据库仍保留
+`domestic_limit_gb` / `overseas_limit_gb` 两列，便于阿里云调整额度的
+那一天只改常量而不动表结构。
 
 ### RAM 最小权限
 
@@ -400,7 +404,7 @@ assert_eq!(sign("testsecret", &to_sign), "OLeaidS1JvxuMvnyHOwuJ+uX5qY=");
 ## 开发与校验
 
 ```bash
-cargo test                                                    # 89 个单元测试
+cargo test                                                    # 92 个单元测试
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 bun run typecheck:web
 bun run check:config

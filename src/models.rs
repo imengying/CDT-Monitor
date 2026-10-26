@@ -20,9 +20,6 @@ use serde::{Deserialize, Serialize};
 /// 1 GiB 的字节数。阿里云 CDT 流量配额按 1 GB = 1024³ 字节计。
 pub const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
-/// 未在账号里配置地域时使用的默认地域列表。
-pub const DEFAULT_REGIONS: &[&str] = &["cn-hangzhou", "cn-shanghai", "cn-beijing", "cn-shenzhen"];
-
 /// 系统设置表的固定 key。
 pub mod setting_key {
     pub const SCHEMA_VERSION: &str = "schema_version";
@@ -664,19 +661,18 @@ impl AccountRow {
         self.spot_keep_alive != 0
     }
 
-    /// 账号配置的地域列表；为空时回退到默认地域。
+    /// 账号配置的地域列表。
+    ///
+    /// 为空表示「不采集实例」—— CDT 流量与余额不依赖地域，照常查询。
+    /// 此前空列表会回退到内置的四个默认地域，导致用户明明没勾任何地域，
+    /// 却在后台悄悄查了四个，与界面呈现不符。
     pub fn regions(&self) -> Vec<String> {
         let parsed: Vec<String> = serde_json::from_str(&self.regions_json).unwrap_or_default();
-        let cleaned: Vec<String> = parsed
+        parsed
             .into_iter()
             .map(|r| r.trim().to_string())
             .filter(|r| !r.is_empty())
-            .collect();
-        if cleaned.is_empty() {
-            DEFAULT_REGIONS.iter().map(|r| r.to_string()).collect()
-        } else {
-            cleaned
-        }
+            .collect()
     }
 
     pub fn schedule_start_minutes(&self) -> Option<u32> {
@@ -1756,6 +1752,53 @@ mod tests {
     fn mask() {
         assert_eq!(mask_secret("LTAI5tAbCdEfGhIj"), "LTAI****GhIj");
         assert_eq!(mask_secret("short"), "****");
+    }
+
+    // -----------------------------------------------------------------------
+    // 地域列表
+    // -----------------------------------------------------------------------
+
+    fn account_row_with_regions(json: &str) -> AccountRow {
+        AccountRow {
+            id: 1,
+            name: "t".to_string(),
+            site_type: "china".to_string(),
+            access_key_id: "LTAI5tTestKey".to_string(),
+            encrypted_access_key_secret: "x".to_string(),
+            regions_json: json.to_string(),
+            domestic_limit_gb: DEFAULT_DOMESTIC_LIMIT_GB,
+            overseas_limit_gb: DEFAULT_OVERSEAS_LIMIT_GB,
+            spike_threshold_gb: None,
+            over_limit_action: "stop_and_notify".to_string(),
+            stop_mode: "StopCharging".to_string(),
+            schedule_start_time: None,
+            schedule_stop_time: None,
+            spot_keep_alive: 0,
+            enabled: 1,
+            last_schedule_start_date: None,
+            last_schedule_stop_date: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn empty_regions_mean_no_instance_scan() {
+        // 用户界面默认不勾任何地域，此时不应偷偷去查默认的四个。
+        let row = account_row_with_regions("[]");
+        assert!(row.regions().is_empty());
+    }
+
+    #[test]
+    fn regions_are_trimmed_and_blank_removed() {
+        let row = account_row_with_regions(r#"[" cn-hongkong ", "", "  ", "ap-southeast-1"]"#);
+        assert_eq!(row.regions(), vec!["cn-hongkong", "ap-southeast-1"]);
+    }
+
+    #[test]
+    fn malformed_regions_json_yields_empty() {
+        let row = account_row_with_regions("not-json");
+        assert!(row.regions().is_empty());
     }
 
     // -----------------------------------------------------------------------
