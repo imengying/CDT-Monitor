@@ -23,15 +23,6 @@ import { icons, type IconNode } from '@/lib/icons'
 import { afterAccountChanged, reportError } from '@/lib/actions'
 import { toast } from '@/lib/store'
 
-/** 实例状态 -> 徽章配色。 */
-function instanceTone(status: string): 'ok' | 'warn' | 'danger' | 'muted' {
-  const lower = status.toLowerCase()
-  if (lower === 'running') return 'ok'
-  if (lower === 'stopped') return 'muted'
-  if (lower.startsWith('start') || lower.startsWith('stop') || lower === 'pending') return 'warn'
-  return 'danger'
-}
-
 /** 实例状态中文名。 */
 function instanceStatusLabel(status: string): string {
   const map: Record<string, string> = {
@@ -72,9 +63,6 @@ function signatureOf(account: AccountOverview): string {
     total: account.cdt_total_bytes,
     month: account.billing_month,
     triggered: account.threshold_triggered,
-    forecast: account.forecast
-      ? `${account.forecast.projected_bytes}:${account.forecast.exceed_date ?? ''}`
-      : '',
     instances: account.instances.map((instance) => ({
       id: instance.instance_id,
       name: instance.instance_name,
@@ -87,14 +75,6 @@ function signatureOf(account: AccountOverview): string {
       spot: instance.spot,
       keep: instance.keep_alive,
     })),
-  })
-}
-
-/** 小圆点。 */
-function dot(color: string): HTMLSpanElement {
-  return el('span', {
-    class: 'h-1.5 w-1.5 rounded-full',
-    style: { backgroundColor: color },
   })
 }
 
@@ -208,9 +188,9 @@ export class AccountCard {
       },
       this.buildHeader(),
       this.buildTrafficBlock(),
+      this.buildPrimaryInstanceRow(),
       this.buildFooterRow(),
       ...(this.account.threshold_triggered ? [this.buildThresholdBanner()] : []),
-      this.buildInstanceSection(),
     )
   }
 
@@ -419,18 +399,57 @@ export class AccountCard {
         },
         el('span', { text: `国内 ${humanBytes(account.cdt_domestic_bytes)}` }),
         el('span', { text: `非内地 ${humanBytes(account.cdt_overseas_bytes)}` }),
-        ...(account.forecast
-          ? [
-              el('span', {
-                style:
-                  account.forecast.exceed_date !== null
-                    ? { color: 'var(--color-warn)', fontWeight: '600' }
-                    : {},
-                text: `预计月末 ${(account.forecast.projected_bytes / 1024 ** 3).toFixed(1)} GB`,
-              }),
-            ]
-          : []),
       ),
+    )
+  }
+
+  /**
+   * 主实例信息行。
+   *
+   * 只展示第一台实例：该项目的典型用法是一个账号一台轻量机，
+   * 上游也只显示单实例状态。多实例时其余实例不再列出。
+   */
+  private buildPrimaryInstanceRow(): HTMLElement {
+    const primary = this.account.instances[0]
+    if (!primary) return el('div', { class: 'hidden' })
+
+    const meta: HTMLElement[] = [
+      el(
+        'span',
+        { class: 'inline-flex items-center gap-1' },
+        iconSvg(icons.cpu, 10),
+        el('span', { text: primary.instance_type || '—' }),
+      ),
+    ]
+    if (primary.public_ip) {
+      meta.push(el('span', { text: primary.public_ip }))
+    }
+    if (primary.spot) {
+      meta.push(
+        el(
+          'span',
+          { class: 'inline-flex items-center gap-1' },
+          iconSvg(icons.zap, 10),
+          el('span', { text: '抢占式' }),
+        ),
+      )
+    }
+
+    return el(
+      'div',
+      {
+        class: 'mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl px-3 py-2',
+        style: { backgroundColor: 'var(--color-surface-raised)' },
+      },
+      el(
+        'div',
+        {
+          class: 'flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-xs',
+          style: { color: 'var(--color-ink-subtle)' },
+        },
+        ...meta,
+      ),
+      ...(primary.spot ? [this.buildKeepAliveSwitch(primary)] : []),
     )
   }
 
@@ -497,168 +516,6 @@ export class AccountCard {
         }),
       ),
       el('div', { class: 'flex gap-2' }, ...buttons),
-    )
-  }
-
-  private buildInstanceSection(): HTMLElement {
-    const account = this.account
-    const running = account.instances.filter((i) => i.status.toLowerCase() === 'running').length
-    const stopped = account.instances.filter((i) => i.status.toLowerCase() === 'stopped').length
-
-    const header = el(
-      'div',
-      { class: 'flex items-center justify-between px-5 py-2.5' },
-      el(
-        'div',
-        { class: 'flex items-center gap-2' },
-        iconSvg(icons.serverCog, 14),
-        el('span', { class: 'text-xs font-semibold', text: '实例控制' }),
-        el('span', { class: 'badge badge-muted', text: String(account.instances.length) }),
-      ),
-      account.instances.length === 0
-        ? el('span')
-        : el(
-            'div',
-            { class: 'flex items-center gap-3' },
-            el(
-              'div',
-              {
-                class: 'hidden items-center gap-2 text-[0.8125rem] sm:flex',
-                style: { color: 'var(--color-ink-subtle)' },
-              },
-              el(
-                'span',
-                { class: 'inline-flex items-center gap-1' },
-                dot('var(--color-ok)'),
-                el('span', { text: `${running} 运行` }),
-              ),
-              el(
-                'span',
-                { class: 'inline-flex items-center gap-1' },
-                dot('var(--color-ink-subtle)'),
-                el('span', { text: `${stopped} 停止` }),
-              ),
-            ),
-            el(
-              'div',
-              { class: 'flex items-center gap-1.5' },
-              this.batchButton('全部开机', 'batch-start', true, running === account.instances.length),
-              this.batchButton('全部关机', 'batch-stop', false, stopped === account.instances.length),
-            ),
-          ),
-    )
-
-    const body =
-      account.instances.length === 0
-        ? el('div', {
-            class: 'px-5 pb-5 text-center text-[0.8125rem]',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '暂无实例数据。',
-          })
-        : el(
-            'ul',
-            { class: 'divide-y', style: { borderColor: 'var(--color-line)' } },
-            ...account.instances.map((instance) => this.buildInstanceRow(instance)),
-          )
-
-    return el(
-      'div',
-      { class: 'border-t', style: { borderColor: 'var(--color-line)' } },
-      header,
-      body,
-    )
-  }
-
-  private buildInstanceRow(instance: InstanceInfo): HTMLElement {
-    const tone = instanceTone(instance.status)
-    const badgeClass = `badge badge-${tone}`
-
-    const titleRow = el(
-      'div',
-      { class: 'flex flex-wrap items-center gap-2' },
-      el('span', {
-        class: 'truncate text-xs font-semibold',
-        text: instance.instance_name || instance.instance_id,
-      }),
-      el('span', { class: badgeClass, text: instanceStatusLabel(instance.status) }),
-      ...(instance.spot
-        ? [
-            el(
-              'span',
-              { class: 'badge badge-warn' },
-              iconSvg(icons.zap, 10),
-              el('span', { text: '抢占式' }),
-            ),
-          ]
-        : []),
-      ...(instance.instance_charge_type
-        ? [
-            el('span', {
-              class: 'badge badge-muted',
-              text: instance.instance_charge_type === 'PrePaid' ? '包年包月' : '按量付费',
-            }),
-          ]
-        : []),
-    )
-
-    const metaParts: HTMLElement[] = [
-      el(
-        'span',
-        { class: 'inline-flex items-center gap-1' },
-        iconSvg(icons.cpu, 10),
-        el('span', { text: instance.instance_type || '—' }),
-      ),
-      el(
-        'span',
-        { class: 'inline-flex items-center gap-1' },
-        iconSvg(icons.globe, 10),
-        el('span', { text: instance.region_id }),
-      ),
-    ]
-    if (instance.public_ip) metaParts.push(el('span', { text: `公网 ${instance.public_ip}` }))
-    if (instance.private_ip) metaParts.push(el('span', { text: `内网 ${instance.private_ip}` }))
-    metaParts.push(el('span', { class: 'opacity-70', text: instance.instance_id }))
-
-    const metaRow = el(
-      'div',
-      {
-        class: 'mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[0.8125rem]',
-        style: { color: 'var(--color-ink-subtle)' },
-      },
-      ...metaParts,
-    )
-
-    const controls = el(
-      'div',
-      { class: 'flex flex-wrap items-center gap-2' },
-      ...(instance.spot ? [this.buildKeepAliveSwitch(instance)] : []),
-      this.actionButton({
-        key: `${instance.instance_id}:start`,
-        label: '开机',
-        icon: icons.play,
-        className: 'btn-ghost btn-sm',
-        disabled: instance.status.toLowerCase() === 'running',
-        onClick: () => this.toggleInstance(instance, true),
-      }),
-      this.actionButton({
-        key: `${instance.instance_id}:stop`,
-        label: '关机',
-        icon: icons.power,
-        className: 'btn-danger btn-sm',
-        disabled: instance.status.toLowerCase() === 'stopped',
-        onClick: () => this.toggleInstance(instance, false),
-      }),
-    )
-
-    return el(
-      'li',
-      { class: 'px-5 py-3' },
-      el(
-        'div',
-        { class: 'flex flex-wrap items-start justify-between gap-3' },
-        el('div', { class: 'min-w-0 flex-1' }, titleRow, metaRow),
-        controls,
-      ),
     )
   }
 
@@ -775,43 +632,6 @@ export class AccountCard {
       reportError(error, '刷新失败')
     } finally {
       this.markBusy('refresh', false)
-    }
-  }
-
-  /** 批量开关机按钮。无可用实例时禁用，避免点了没反应。 */
-  private batchButton(
-    label: string,
-    key: string,
-    start: boolean,
-    disabled: boolean,
-  ): HTMLButtonElement {
-    const busy = this.busy.has(key)
-    return el(
-      'button',
-      {
-        class: 'btn btn-ghost btn-sm',
-        type: 'button',
-        disabled: disabled || busy,
-        title: disabled ? '没有需要操作的实例' : label,
-        on: { click: () => void this.batchInstances(start, key) },
-      },
-      ...(busy
-        ? [iconSvg(icons.spinner, 12, 'animate-spin')]
-        : [el('span', { text: label })]),
-    ) as HTMLButtonElement
-  }
-
-  private async batchInstances(start: boolean, key: string): Promise<void> {
-    if (this.busy.has(key)) return
-    this.markBusy(key, true)
-    try {
-      const job = await api.batchInstances(this.account.id, start)
-      toast(job.error_msg || (start ? '已提交批量开机' : '已提交批量关机'), 'ok')
-      await afterAccountChanged()
-    } catch (error) {
-      reportError(error, start ? '批量开机失败' : '批量关机失败')
-    } finally {
-      this.markBusy(key, false)
     }
   }
 

@@ -242,96 +242,8 @@ pub fn human_bytes(bytes: i64) -> String {
 }
 
 // ===========================================================================
-// 用量预测
+// 突变检测
 // ===========================================================================
-
-/// 用量预测结果。
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct UsageForecast {
-    /// 已用量（字节）。
-    pub used_bytes: i64,
-    /// 预计本账期结束时的总量（字节）。
-    pub projected_bytes: i64,
-    /// 相对配额的预计占比（百分比）。
-    pub projected_percent: f64,
-    /// 按当前速率，预计在哪一天超过配额；未超或无法计算时为 `None`。
-    pub exceed_date: Option<String>,
-    /// 距离账期结束的天数（向上取整，至少 0）。
-    pub days_remaining: i64,
-    /// 本账期已过去的天数（至少 1，避免除以 0）。
-    pub days_elapsed: i64,
-}
-
-/// 按线性速率外推本账期总用量。
-///
-/// `elapsed_ms` 为本账期已过去的时长，`total_ms` 为整月时长。
-/// 采样时间过短（不足一天）时不做外推 —— 几个小时的波动会把结果放大到
-/// 荒谬的程度，反而误导判断。
-pub fn forecast_usage(
-    used_bytes: i64,
-    limit_gb: f64,
-    elapsed_ms: i64,
-    total_ms: i64,
-    month_end_date: &str,
-) -> Option<UsageForecast> {
-    if used_bytes <= 0 || elapsed_ms <= 0 || total_ms <= 0 {
-        return None;
-    }
-    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-    let days_elapsed = ((elapsed_ms + DAY_MS - 1) / DAY_MS).max(1);
-    let days_remaining = ((total_ms - elapsed_ms).max(0) + DAY_MS - 1) / DAY_MS;
-
-    // 不足一天不预测
-    if elapsed_ms < DAY_MS {
-        return None;
-    }
-
-    let per_day = used_bytes as f64 / days_elapsed as f64;
-    let projected = (per_day * (total_ms as f64 / DAY_MS as f64)).round() as i64;
-
-    let limit_bytes = gb_to_bytes(limit_gb);
-    let exceed_date = if limit_bytes > 0 && per_day > 0.0 && used_bytes < limit_bytes {
-        let days_to_limit = (limit_bytes - used_bytes) as f64 / per_day;
-        let offset = days_to_limit.ceil() as i64;
-        if offset <= days_remaining {
-            Some(shift_date(month_end_date, -(days_remaining - offset)))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    Some(UsageForecast {
-        used_bytes,
-        projected_bytes: projected,
-        projected_percent: percent_of_limit(projected, limit_gb),
-        exceed_date,
-        days_remaining,
-        days_elapsed,
-    })
-}
-
-/// 在 `YYYY-MM-DD` 上加减天数（仅用于展示，不处理时区）。
-fn shift_date(date: &str, days: i64) -> String {
-    let parts: Vec<&str> = date.split('-').collect();
-    if parts.len() != 3 {
-        return date.to_string();
-    }
-    let (Ok(y), Ok(m), Ok(d)) = (
-        parts[0].parse::<i32>(),
-        parts[1].parse::<u32>(),
-        parts[2].parse::<u32>(),
-    ) else {
-        return date.to_string();
-    };
-    let Some(base) = chrono::NaiveDate::from_ymd_opt(y, m, d) else {
-        return date.to_string();
-    };
-    base.checked_add_signed(chrono::Duration::days(days))
-        .map(|v| v.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| date.to_string())
-}
 
 /// 判断单次采样是否为异常突变。
 ///
@@ -1325,8 +1237,6 @@ pub struct AccountOverview {
     pub threshold_triggered: bool,
     pub snapshot_updated_at: Option<i64>,
     pub instances: Vec<InstanceInfo>,
-    /// 本账期用量预测；样本不足时为 `None`。
-    pub forecast: Option<UsageForecast>,
 }
 
 /// 首页整体响应。
@@ -1565,16 +1475,6 @@ pub fn build_overview(
         None => (0, 0, 0, None, None, None, false, Vec::new()),
     };
 
-    // 用量预测：样本不足一天时不外推
-    let (month_start, month_end) = month_bounds_ms(now, timezone);
-    let forecast = forecast_usage(
-        total,
-        account.traffic_limit_gb,
-        (now - month_start).max(0),
-        (month_end - month_start).max(0),
-        &local_date(month_end - 1, timezone),
-    );
-
     AccountOverview {
         id: account.id,
         name: account.name.clone(),
@@ -1602,7 +1502,6 @@ pub fn build_overview(
         threshold_triggered: triggered,
         snapshot_updated_at: updated_at,
         instances,
-        forecast,
     }
 }
 
@@ -1649,46 +1548,6 @@ mod tests {
         assert!(!is_supported_timezone("UTC+8:15"), "非白名单取值应被拒绝");
         assert!(!is_supported_timezone("Asia/Shanghai"), "不支持 IANA 名称");
         assert!(!is_supported_timezone(""));
-    }
-
-    #[test]
-    fn forecast_skips_short_window() {
-        // 不足一天不预测：样本太少，外推没有意义
-        let day = 24 * 60 * 60 * 1000i64;
-        assert!(forecast_usage(1_000_000, 20.0, day / 2, day * 30, "2026-10-31").is_none());
-        assert!(forecast_usage(0, 20.0, day * 5, day * 30, "2026-10-31").is_none());
-    }
-
-    #[test]
-    fn forecast_extrapolates_linearly() {
-        let day = 24 * 60 * 60 * 1000i64;
-        // 10 天用了 10 GiB，整月 30 天 → 预计 30 GiB
-        let used = gb_to_bytes(10.0);
-        let f = forecast_usage(used, 100.0, day * 10, day * 30, "2026-10-31").expect("应能预测");
-        assert_eq!(f.days_elapsed, 10);
-        assert_eq!(f.days_remaining, 20);
-        // 预计 30 GiB，允许舍入误差
-        let projected_gb = bytes_to_gb(f.projected_bytes);
-        assert!((projected_gb - 30.0).abs() < 0.01, "实际 {projected_gb}");
-        assert!((f.projected_percent - 30.0).abs() < 0.5);
-    }
-
-    #[test]
-    fn forecast_predicts_exceed_date() {
-        let day = 24 * 60 * 60 * 1000i64;
-        // 10 天用 50 GiB，配额 100 GiB → 第 20 天用完
-        let used = gb_to_bytes(50.0);
-        let f = forecast_usage(used, 100.0, day * 10, day * 30, "2026-10-31").expect("应能预测");
-        assert_eq!(f.exceed_date.as_deref(), Some("2026-10-21"));
-    }
-
-    #[test]
-    fn forecast_no_exceed_date_when_under_limit() {
-        let day = 24 * 60 * 60 * 1000i64;
-        // 10 天用 1 GiB，配额 100 GiB → 月底用量远低于配额
-        let used = gb_to_bytes(1.0);
-        let f = forecast_usage(used, 100.0, day * 10, day * 30, "2026-10-31").expect("应能预测");
-        assert!(f.exceed_date.is_none());
     }
 
     #[test]

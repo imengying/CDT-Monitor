@@ -101,15 +101,6 @@ export interface InstanceInfo {
   keep_alive: boolean
 }
 
-export interface UsageForecast {
-  used_bytes: number
-  projected_bytes: number
-  projected_percent: number
-  exceed_date: string | null
-  days_remaining: number
-  days_elapsed: number
-}
-
 export interface AccountOverview {
   id: number
   name: string
@@ -138,7 +129,6 @@ export interface AccountOverview {
   threshold_triggered: boolean
   snapshot_updated_at: number | null
   instances: InstanceInfo[]
-  forecast: UsageForecast | null
 }
 
 export interface OverviewResponse {
