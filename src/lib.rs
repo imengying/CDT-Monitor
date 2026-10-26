@@ -961,7 +961,6 @@ async fn handle_get_settings(app: &AppCtx) -> worker::Result<Response> {
         telegram: TelegramSettingsDto {
             enabled: telegram.enabled,
             chat_id: telegram.chat_id.clone(),
-            api_host: telegram.api_host.clone(),
             token_configured: telegram
                 .token_enc
                 .as_deref()
@@ -1026,12 +1025,6 @@ async fn handle_update_telegram(app: &AppCtx, mut req: Request) -> worker::Resul
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string());
-    config.api_host = payload
-        .api_host
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| v.trim_end_matches('/').to_string());
     config.enabled = payload.enabled;
 
     if config.enabled && (config.token_enc.is_none() || config.chat_id.is_none()) {

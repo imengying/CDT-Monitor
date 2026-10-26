@@ -234,7 +234,6 @@ export interface AccountInput {
 export interface TelegramSettings {
   enabled: boolean
   chat_id: string | null
-  api_host: string | null
   token_configured: boolean
 }
 
@@ -304,7 +303,6 @@ export interface SettingsResponse {
 export interface TelegramUpdate {
   enabled: boolean
   chat_id: string | null
-  api_host: string | null
   token?: string
   clear_token?: boolean
 }

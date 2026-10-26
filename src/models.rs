@@ -955,9 +955,6 @@ pub struct TelegramConfig {
     pub token_enc: Option<String>,
     #[serde(default)]
     pub chat_id: Option<String>,
-    /// 可选自定义反代域名，例如 `https://tg.example.com`。
-    #[serde(default)]
-    pub api_host: Option<String>,
 }
 
 /// Bark 配置。`device_key_enc` 为 XChaCha20Poly1305 密文。
@@ -1380,7 +1377,6 @@ pub struct HistoryQuery {
 pub struct TelegramSettingsDto {
     pub enabled: bool,
     pub chat_id: Option<String>,
-    pub api_host: Option<String>,
     pub token_configured: bool,
 }
 
@@ -1390,8 +1386,6 @@ pub struct TelegramSettingsUpdate {
     pub enabled: bool,
     #[serde(default)]
     pub chat_id: Option<String>,
-    #[serde(default)]
-    pub api_host: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
     /// 显式清除已保存的 Token。

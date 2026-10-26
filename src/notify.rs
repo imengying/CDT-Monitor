@@ -2,10 +2,8 @@
 //!
 //! 只保留这两条通道（原项目的 SMTP / 通用 Webhook / SOCKS5 代理均已移除）。
 //!
-//! * **Telegram**：Worker 运行在海外边缘节点，可直连 `api.telegram.org`；
-//!   若所在网络环境需要反代，可在设置里填 `api_host`（例如
-//!   `https://tg.example.com`），本模块会自动拼成
-//!   `{api_host}/bot{token}/sendMessage`。消息用 HTML 解析模式，正文做转义。
+//! * **Telegram**：直连 `https://api.telegram.org`，请求发往
+//!   `/bot{token}/sendMessage`。消息用 HTML 解析模式，正文做转义。
 //! * **Bark**：`POST {server_url}/push`，JSON 载荷。按消息级别在
 //!   `active` / `timeSensitive` / `critical` 之间切换——普通通知用
 //!   `normal_level`，熔断告警用 `alert_level`，`critical` 可穿透静音。
@@ -165,30 +163,15 @@ pub fn escape_html(input: &str) -> String {
 pub struct TelegramChannel {
     pub token: String,
     pub chat_id: String,
-    /// 可选反代域名，`None` 表示直连官方 API。
-    pub api_host: Option<String>,
 }
 
 impl TelegramChannel {
-    /// 规范化 API 基址：去掉尾部 `/`，缺协议时补 `https://`。
-    pub fn api_base(&self) -> String {
-        let raw = self
-            .api_host
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or("https://api.telegram.org");
-        let with_scheme = if raw.starts_with("http://") || raw.starts_with("https://") {
-            raw.to_string()
-        } else {
-            format!("https://{raw}")
-        };
-        with_scheme.trim_end_matches('/').to_string()
-    }
+    /// 官方 API 基址。
+    pub const API_BASE: &'static str = "https://api.telegram.org";
 
     /// 完整的 sendMessage 地址。
     pub fn send_message_url(&self) -> String {
-        format!("{}/bot{}/sendMessage", self.api_base(), self.token)
+        format!("{}/bot{}/sendMessage", Self::API_BASE, self.token)
     }
 }
 
@@ -692,7 +675,6 @@ mod tests {
         TelegramChannel {
             token: "123:ABC".to_string(),
             chat_id: "-1001234567890".to_string(),
-            api_host: None,
         }
     }
 
@@ -706,28 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn telegram_url_default_and_custom_host() {
+    fn telegram_url_is_official() {
         assert_eq!(
             telegram().send_message_url(),
             "https://api.telegram.org/bot123:ABC/sendMessage"
-        );
-
-        let custom = TelegramChannel {
-            api_host: Some("https://tg.example.com/".to_string()),
-            ..telegram()
-        };
-        assert_eq!(
-            custom.send_message_url(),
-            "https://tg.example.com/bot123:ABC/sendMessage"
-        );
-
-        let scheme_less = TelegramChannel {
-            api_host: Some("tg.example.com".to_string()),
-            ..telegram()
-        };
-        assert_eq!(
-            scheme_less.send_message_url(),
-            "https://tg.example.com/bot123:ABC/sendMessage"
         );
     }
 

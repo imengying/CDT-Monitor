@@ -278,12 +278,6 @@ impl Scheduler {
                 channels.telegram = Some(TelegramChannel {
                     token,
                     chat_id: chat_id.to_string(),
-                    api_host: telegram
-                        .api_host
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string()),
                 });
             }
         }

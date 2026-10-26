@@ -156,7 +156,6 @@ export class SettingsModal {
   private telegramDraft = {
     enabled: false,
     chatId: '',
-    apiHost: '',
     token: '',
     clearToken: false,
   }
@@ -291,7 +290,6 @@ export class SettingsModal {
     this.telegramDraft = {
       enabled: settings.telegram.enabled,
       chatId: settings.telegram.chat_id ?? '',
-      apiHost: settings.telegram.api_host ?? '',
       token: '',
       clearToken: false,
     }
@@ -1255,10 +1253,6 @@ export class SettingsModal {
       this.telegramDraft.chatId = value
     }, { placeholder: '-1001234567890' })
 
-    const hostInput = this.textInput(this.telegramDraft.apiHost, (value) => {
-      this.telegramDraft.apiHost = value
-    }, { placeholder: 'https://tg.example.com' })
-
     const children: HTMLElement[] = [
       el(
         'div',
@@ -1267,7 +1261,7 @@ export class SettingsModal {
         el('p', {
           class: 'mt-0.5 text-[0.8125rem]',
           style: { color: 'var(--color-ink-subtle)' },
-          text: '可填写自定义 API Host 作为反代。',
+          text: '直连 api.telegram.org。',
         }),
       ),
       el(
@@ -1282,7 +1276,6 @@ export class SettingsModal {
         tokenInput,
       ),
       this.field('Chat ID', chatInput),
-      this.field('自定义 API Host（可选）', hostInput),
       this.switchControl(
         '启用 Telegram 通知',
         () => this.telegramDraft.enabled,
@@ -1336,7 +1329,6 @@ export class SettingsModal {
     const payload: TelegramUpdate = {
       enabled: this.telegramDraft.enabled,
       chat_id: this.telegramDraft.chatId.trim() || null,
-      api_host: this.telegramDraft.apiHost.trim() || null,
       clear_token: this.telegramDraft.clearToken,
     }
     if (this.telegramDraft.token.trim()) {
