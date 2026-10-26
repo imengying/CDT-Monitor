@@ -1148,7 +1148,7 @@ export class SettingsModal {
       el('p', {
         class: 'text-xs leading-relaxed',
         style: { color: 'var(--color-ink-subtle)' },
-        text: '抢占式保活会把处于停止状态的抢占实例重新启动。阿里云不区分实例是被系统收回还是手动停机，因此手动停机前请先关闭保活。',
+        text: '仅在允许运行时段内、且当日未执行定时关机时，才会把处于停止状态的抢占实例重新启动。阿里云不区分实例是被系统收回还是手动停机，手动停机前请先关闭保活。',
       }),
 
       el(

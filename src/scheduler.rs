@@ -1030,14 +1030,35 @@ impl Scheduler {
     // 抢占式保活
     // -----------------------------------------------------------------------
 
+    /// 今天是否已经执行过定时关机。
+    ///
+    /// 必须重新读库：`run_cron` 手里那份 `AccountRow` 是循环开始时的快照，
+    /// 而定时关机就在同一轮里把它写进了 `last_schedule_stop_date`。
+    async fn scheduled_stop_done_today(&self, account: &AccountRow) -> worker::Result<bool> {
+        if account.schedule_stop_minutes().is_none() {
+            return Ok(false);
+        }
+        let today = local_date(self.now, &self.timezone);
+        let fresh = self.db.get_account(account.id).await?;
+        Ok(fresh
+            .and_then(|row| row.last_schedule_stop_date)
+            .is_some_and(|date| date == today))
+    }
+
     /// 抢占式实例保活：拉起处于 Stopped 的可保活抢占式实例。
     ///
-    /// 已知限制：阿里云不提供区分「系统回收」与「用户手动停机」的字段
-    /// （两者都是 `Status == Stopped`）。系统回收前 5 分钟会在
-    /// `OperationLocks` 里标记待回收，但那个窗口比 Cron 间隔还短，
-    /// 靠轮询去抓并不可靠。因此这里的语义是**只要开着保活、实例又处于
-    /// 停止状态就拉起**，手动停机的实例也会被重新启动。
-    /// 需要手动停机时，请先关掉该实例或账号的保活开关。
+    /// 阿里云不提供区分「系统回收」与「用户手动停机」的字段（两者都是
+    /// `Status == Stopped`），`OperationLocks` 只在回收前 5 分钟标记，
+    /// 比巡检间隔还短、抓不住。因此只能靠**前置条件**收窄误判，
+    /// 与上游保持一致的四个闸门（任一不满足就跳过）：
+    ///
+    /// 1. 账号级与实例级保活开关都开启；
+    /// 2. 当前处于「允许运行时段」（见 [`in_allowed_window`]）；
+    /// 3. 未触发流量熔断；
+    /// 4. 今天还没执行过定时关机（定时关机优先于保活）。
+    ///
+    /// 剩下的情形（暂停窗口外手动停机）仍会被拉起，这是接口能力的边界：
+    /// 手动停机前请先关掉该实例或账号的保活开关。
     async fn maybe_keep_alive(
         &self,
         account: &AccountRow,
@@ -1060,10 +1081,23 @@ impl Scheduler {
             return Ok(());
         }
 
-        // 夜间停机窗口内不保活（否则会把计划停机的实例重新拉起）
-        if in_sleep_window(account, local_minutes_of_day(self.now, &self.timezone)) {
+        // 只在「允许运行时段」内保活。注意不能只判断「是否处于停机窗口」：
+        // 只配了关机时刻时那种判断会返回 false，保活会在停机后立刻
+        // 把实例拉回来，定时关机形同虚设。
+        if !in_allowed_window(account, local_minutes_of_day(self.now, &self.timezone)) {
             report.notes.push(format!(
-                "{} 处于定时停机窗口内，跳过抢占式保活",
+                "{} 当前不在允许运行时段，跳过抢占式保活",
+                account.name
+            ));
+            return Ok(());
+        }
+
+        // 本轮刚被定时关机的不保活。快照里的状态是刷新时抓的，
+        // 定时关机发生在其后，若不拦住会在同一轮里把自己刚停的机器拉起来
+        // （上游用 statusChangedBySchedule 表达同一件事）。
+        if self.scheduled_stop_done_today(account).await? {
+            report.notes.push(format!(
+                "{} 今日已执行定时关机，跳过抢占式保活",
                 account.name
             ));
             return Ok(());
@@ -1643,26 +1677,35 @@ impl Scheduler {
 // 纯函数工具
 // ===========================================================================
 
-/// 当前是否处于「定时停机 → 定时开机」之间的睡眠窗口。
+/// 当前是否处于「允许运行时段」，用于保活前的闸门。
 ///
-/// * 未配置任一时刻 → 不算睡眠窗口；
-/// * `stop < start`：窗口为 `[stop, start)`；
-/// * `stop > start`：窗口跨越午夜，为 `[stop, 24:00) ∪ [00:00, start)`；
-/// * `stop == start`：视为未配置（无法判断），不算窗口。
-pub fn in_sleep_window(account: &AccountRow, now_minutes: u32) -> bool {
-    let (Some(stop), Some(start)) = (
-        account.schedule_stop_minutes(),
-        account.schedule_start_minutes(),
-    ) else {
-        return false;
-    };
-    if stop == start {
-        return false;
-    }
-    if stop < start {
-        now_minutes >= stop && now_minutes < start
-    } else {
-        now_minutes >= stop || now_minutes < start
+/// 覆盖「只配了一个时刻」的情形：
+///
+/// * 未配置定时 → 全天允许（`true`）；
+/// * 只配了开机时刻 → 当前是否已过开机点；
+/// * 只配了关机时刻 → 当前是否还没到关机点；
+/// * 两个都配 → `[start, stop)`，跨午夜时取并集。
+///
+/// 上游用的是同一套判断（`!ScheduleEnabled || inTimeRange(...)`）。
+pub fn in_allowed_window(account: &AccountRow, now_minutes: u32) -> bool {
+    let start = account.schedule_start_minutes();
+    let stop = account.schedule_stop_minutes();
+
+    match (start, stop) {
+        (None, None) => true,
+        (Some(start), None) => now_minutes >= start,
+        (None, Some(stop)) => now_minutes < stop,
+        (Some(start), Some(stop)) => {
+            if start == stop {
+                // 区间退化，无法推断，按全天允许处理
+                return true;
+            }
+            if start < stop {
+                now_minutes >= start && now_minutes < stop
+            } else {
+                now_minutes >= start || now_minutes < stop
+            }
+        }
     }
 }
 
@@ -1709,45 +1752,67 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 允许运行时段（保活闸门）
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn sleep_window_within_same_day() {
-        // start=08:00 stop=22:00 → 睡眠窗口 [22:00, 24:00) ∪ [00:00, 08:00)
+    fn allowed_window_without_schedule_is_always_open() {
+        let account = account_with_schedule(None, None);
+        for minutes in [0, 6 * 60, 12 * 60, 23 * 60 + 59] {
+            assert!(in_allowed_window(&account, minutes), "{minutes} 应允许运行");
+        }
+    }
+
+    #[test]
+    fn allowed_window_with_stop_only() {
+        // 只配了关机时间：关机点之前允许，之后不允许。
+        // 只判断「是否处于停机窗口」会漏掉这种情形：缺开机时间时
+        // 那种判断返回 false，保活会在停机后立刻拉起实例。
+        let account = account_with_schedule(None, Some("22:00"));
+        assert!(in_allowed_window(&account, 0));
+        assert!(in_allowed_window(&account, 21 * 60 + 59));
+        assert!(!in_allowed_window(&account, 22 * 60), "已到关机点，不应保活");
+        assert!(!in_allowed_window(&account, 23 * 60 + 59));
+    }
+
+    #[test]
+    fn allowed_window_with_start_only() {
+        // 只配了开机时间：开机点之后允许。
+        let account = account_with_schedule(Some("08:00"), None);
+        assert!(!in_allowed_window(&account, 7 * 60 + 59));
+        assert!(in_allowed_window(&account, 8 * 60));
+        assert!(in_allowed_window(&account, 23 * 60));
+    }
+
+    #[test]
+    fn allowed_window_with_both_same_day() {
         let account = account_with_schedule(Some("08:00"), Some("22:00"));
-        assert!(in_sleep_window(&account, 0));
-        assert!(in_sleep_window(&account, 7 * 60 + 59));
-        assert!(!in_sleep_window(&account, 8 * 60));
-        assert!(!in_sleep_window(&account, 12 * 60));
-        assert!(!in_sleep_window(&account, 21 * 60 + 59));
-        assert!(in_sleep_window(&account, 22 * 60));
-        assert!(in_sleep_window(&account, 23 * 60 + 59));
+        assert!(!in_allowed_window(&account, 7 * 60));
+        assert!(in_allowed_window(&account, 8 * 60));
+        assert!(in_allowed_window(&account, 21 * 60 + 59));
+        assert!(!in_allowed_window(&account, 22 * 60));
     }
 
     #[test]
-    fn sleep_window_overnight_is_running_overnight() {
-        // start=22:00 stop=08:00 → 睡眠窗口 [08:00, 22:00)
-        let account = account_with_schedule(Some("22:00"), Some("08:00"));
-        assert!(in_sleep_window(&account, 8 * 60));
-        assert!(in_sleep_window(&account, 15 * 60));
-        assert!(in_sleep_window(&account, 21 * 60 + 59));
-        assert!(!in_sleep_window(&account, 22 * 60));
-        assert!(!in_sleep_window(&account, 2 * 60));
+    fn allowed_window_across_midnight() {
+        // 22:00 关 → 次日 08:00 开：允许时段为 [08:00, 22:00)
+        let account = account_with_schedule(Some("08:00"), Some("22:00"));
+        assert!(!in_allowed_window(&account, 23 * 60));
+        assert!(!in_allowed_window(&account, 3 * 60));
+
+        let overnight = account_with_schedule(Some("22:00"), Some("06:00"));
+        assert!(in_allowed_window(&overnight, 23 * 60));
+        assert!(in_allowed_window(&overnight, 3 * 60));
+        assert!(!in_allowed_window(&overnight, 12 * 60));
     }
 
     #[test]
-    fn sleep_window_undefined_cases() {
-        assert!(!in_sleep_window(
-            &account_with_schedule(None, Some("08:00")),
-            10 * 60
-        ));
-        assert!(!in_sleep_window(
-            &account_with_schedule(Some("08:00"), None),
-            10 * 60
-        ));
-        // start == stop：无法推断区间，视为不睡眠
-        assert!(!in_sleep_window(
-            &account_with_schedule(Some("08:00"), Some("08:00")),
-            8 * 60
-        ));
+    fn allowed_window_start_equals_stop_is_open() {
+        // 区间退化，无法推断，按全天允许
+        let account = account_with_schedule(Some("08:00"), Some("08:00"));
+        assert!(in_allowed_window(&account, 3 * 60));
+        assert!(in_allowed_window(&account, 8 * 60));
     }
 
     #[test]

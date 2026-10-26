@@ -160,51 +160,6 @@ export function iconSvg(
   return svg
 }
 
-/** 图标 + 文本的行内容器。 */
-export function withIcon(
-  iconNode: Parameters<typeof iconSvg>[0],
-  label?: string,
-  size = 14,
-): HTMLSpanElement {
-  const wrapper = el('span', { class: 'inline-flex items-center gap-1.5' })
-  wrapper.append(iconSvg(iconNode, size))
-  if (label) {
-    wrapper.append(el('span', { text: label }))
-  }
-  return wrapper
-}
-
-/** 节流：同一 tick 内多次调用只执行一次。 */
-export function rafThrottle(fn: () => void): () => void {
-  let scheduled = false
-  return () => {
-    if (scheduled) return
-    scheduled = true
-    requestAnimationFrame(() => {
-      scheduled = false
-      fn()
-    })
-  }
-}
-
-/** 防抖。 */
-export function debounce<T extends (...args: never[]) => void>(fn: T, waitMs: number): T {
-  let timer: number | null = null
-  return ((...args: never[]) => {
-    if (timer !== null) window.clearTimeout(timer)
-    timer = window.setTimeout(() => {
-      timer = null
-      fn(...args)
-    }, waitMs)
-  }) as T
-}
-
-/** 焦点陷阱：把一个元素设为「初始焦点」。 */
-export function focusFirst(container: HTMLElement, selector = 'input, button, select, textarea'): void {
-  const target = container.querySelector<HTMLElement>(selector)
-  target?.focus()
-}
-
 /** Esc 键监听，返回解绑函数。 */
 export function onEscape(handler: () => void): () => void {
   const listener = (event: KeyboardEvent) => {
