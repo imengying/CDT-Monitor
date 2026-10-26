@@ -186,7 +186,7 @@ export class AccountCard {
       'article',
       {
         class: 'card card-hover',
-        style: { padding: '21px 22px', animation: 'stage-in .7s var(--ease-out) both' },
+        style: { padding: '20px 22px' },
       },
       this.buildHeader(),
       this.buildTrafficBlock(),
@@ -226,22 +226,21 @@ export class AccountCard {
     return el(
       'header',
       {
-        class: 'grid items-start gap-3.5',
-        style: { gridTemplateColumns: '46px minmax(0, 1fr) auto' },
+        class: 'grid items-start gap-3',
+        style: { gridTemplateColumns: '40px minmax(0, 1fr) auto' },
       },
       el(
         'div',
         {
-          class: 'grid place-items-center rounded-xl',
+          class: 'grid place-items-center rounded-lg',
           style: {
-            width: '46px',
-            height: '46px',
+            width: '40px',
+            height: '40px',
             color: toneColor,
             backgroundColor: toneBg,
-            boxShadow: 'inset 0 1px 0 var(--color-inner-line)',
           },
         },
-        iconSvg(icons.server, 20),
+        iconSvg(icons.server, 18),
       ),
       el(
         'div',
@@ -261,13 +260,12 @@ export class AccountCard {
       ),
       el(
         'div',
-        { class: 'flex flex-col items-end gap-2' },
+        { class: 'flex flex-col items-end gap-1.5' },
         el(
           'div',
           {
-            class: 'inline-flex items-center gap-1.5 rounded-full px-2.5 text-xs font-bold',
+            class: 'inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium',
             style: {
-              height: '30px',
               color: toneColor,
               backgroundColor: toneBg,
             },
@@ -288,9 +286,9 @@ export class AccountCard {
             'div',
             { class: 'grid gap-0.5' },
             el('span', {
-              class: 'text-[10px] font-bold',
+              class: 'text-xs',
               style: { color: 'var(--color-ink-subtle)' },
-              text: '账户余额',
+              text: '余额',
             }),
             el('b', {
               class: 'font-mono text-xs tabular-nums',
@@ -301,7 +299,7 @@ export class AccountCard {
             'div',
             { class: 'grid gap-0.5' },
             el('span', {
-              class: 'text-[10px] font-bold',
+              class: 'text-xs',
               style: { color: 'var(--color-ink-subtle)' },
               text: '阈值',
             }),
@@ -338,7 +336,7 @@ export class AccountCard {
           'div',
           {},
           el('span', {
-            class: 'mb-1 block text-[10px] font-bold',
+            class: 'mb-1 block text-xs',
             style: { color: 'var(--color-ink-subtle)' },
             text: '本月 CDT 流量',
           }),
@@ -346,11 +344,11 @@ export class AccountCard {
             'div',
             { class: 'flex items-baseline gap-1' },
             el('strong', {
-              class: 'text-3xl font-bold tabular-nums',
+              class: 'text-2xl font-semibold tabular-nums',
               text: (account.cdt_total_bytes / 1024 ** 3).toFixed(2),
             }),
             el('small', {
-              class: 'font-bold tabular-nums',
+              class: 'font-medium tabular-nums',
               style: { color: 'var(--color-ink-subtle)' },
               text: `/ ${account.traffic_limit_gb.toFixed(0)} GB`,
             }),
@@ -387,7 +385,7 @@ export class AccountCard {
       el(
         'div',
         {
-          class: 'mt-2 flex justify-between text-[10px] font-bold tabular-nums',
+          class: 'mt-2 flex justify-between text-xs tabular-nums',
           style: { color: 'var(--color-ink-muted)' },
         },
         el('span', { text: `${percent.toFixed(2)}% 已使用` }),
@@ -512,7 +510,7 @@ export class AccountCard {
       el(
         'span',
         {
-          class: 'flex items-center gap-1.5 text-[10px] tabular-nums',
+          class: 'flex items-center gap-1.5 text-xs tabular-nums',
           style: { color: 'var(--color-ink-subtle)' },
         },
         iconSvg(icons.calendar, 14),

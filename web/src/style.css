@@ -3,47 +3,34 @@
 /*
  * 主题令牌
  * ----------------------------------------------------------------------------
- * 视觉参考上游 CDT-Monitor：苹果风格浅色底、毛玻璃卡片、大圆角、
- * SF Pro Display 字体栈。语义色沿用其绿 / 蓝 / 青 / 琥珀 / 红五档。
+ * 原版 CDT-Monitor 的风格是「浅色卡片 + 深色可切换」，因此这里用 CSS 变量
+ * 定义语义色，并通过 `prefers-color-scheme` 自动切换，不依赖 JS。
  *
- * 所有颜色通过 CSS 变量定义，`light-dark()` 跟随系统主题，
- * 不使用 JS 切换。Tailwind 的 utility（如 `bg-surface`）与本文件中的
- * 语义类（如 `.card`）共用同一套变量。
+ * 使用 `@theme` 把变量暴露给 Tailwind 的 utility（如 `bg-surface`）
+ * 以及自定义的语义类（如 `.card`）。
  */
 @theme {
-  --color-bg: light-dark(#f1f3f5, #14161a);
-  --color-surface: light-dark(rgba(252, 253, 253, 0.82), rgba(28, 31, 36, 0.82));
-  --color-surface-solid: light-dark(#fcfdfd, #1c1f24);
-  --color-surface-muted: light-dark(#f1f3f5, #14161a);
-  --color-surface-raised: light-dark(rgba(255, 255, 255, 0.62), rgba(38, 42, 48, 0.7));
-
-  --color-line: light-dark(rgba(163, 169, 177, 0.34), rgba(255, 255, 255, 0.12));
-  --color-line-strong: light-dark(rgba(118, 125, 135, 0.42), rgba(255, 255, 255, 0.2));
-  --color-inner-line: light-dark(rgba(255, 255, 255, 0.9), rgba(255, 255, 255, 0.08));
-
-  --color-ink: light-dark(#181a1d, #eef1f5);
-  --color-ink-muted: light-dark(#6d727b, #9aa3ad);
-  --color-ink-subtle: light-dark(#8a9098, #737d88);
-
-  --color-brand: light-dark(#2563b8, #6ba4f0);
-  --color-brand-soft: light-dark(#e1ebf8, #1b2a3d);
-  --color-ok: light-dark(#147a55, #4cc79a);
-  --color-ok-soft: light-dark(#dcefe6, #12332a);
-  --color-info: light-dark(#0d7188, #5cbdd4);
-  --color-info-soft: light-dark(#dceff2, #10303a);
-  --color-warn: light-dark(#a86608, #e0a84a);
-  --color-warn-soft: light-dark(#f8eccb, #3a2c10);
-  --color-danger: light-dark(#bd3645, #f07784);
-  --color-danger-soft: light-dark(#fbe0e3, #3d161b);
-
+  --color-surface: light-dark(#ffffff, #111827);
+  --color-surface-muted: light-dark(#f8fafc, #0f172a);
+  --color-surface-raised: light-dark(#ffffff, #1a2332);
+  --color-line: light-dark(#e2e8f0, #253044);
+  --color-line-strong: light-dark(#cbd5e1, #334155);
+  --color-ink: light-dark(#0f172a, #e6edf7);
+  --color-ink-muted: light-dark(#64748b, #93a4bd);
+  --color-ink-subtle: light-dark(#94a3b8, #6b7f9b);
+  --color-brand: light-dark(#2563eb, #60a5fa);
+  --color-brand-soft: light-dark(#eff6ff, #172554);
+  --color-ok: light-dark(#059669, #34d399);
+  --color-ok-soft: light-dark(#ecfdf5, #052e26);
+  --color-info: light-dark(#0891b2, #67e8f9);
+  --color-info-soft: light-dark(#ecfeff, #083344);
+  --color-warn: light-dark(#d97706, #fbbf24);
+  --color-warn-soft: light-dark(#fffbeb, #422006);
+  --color-danger: light-dark(#dc2626, #f87171);
+  --color-danger-soft: light-dark(#fef2f2, #450a0a);
   --font-sans:
-    ui-sans-serif, -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI',
-    'PingFang SC', 'Noto Sans SC', sans-serif;
+    'Inter', 'Noto Sans SC', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: ui-monospace, 'SFMono-Regular', 'JetBrains Mono', Menlo, monospace;
-
-  --radius-lg: 24px;
-  --shadow-lg: 0 26px 60px -34px rgb(20 27 38 / 0.38), 0 1px 0 rgb(255 255 255 / 0.9) inset;
-  --shadow-sm: 0 14px 30px -24px rgb(20 27 38 / 0.44), 0 1px 0 rgb(255 255 255 / 0.92) inset;
 }
 
 /* 让 light-dark() 生效 */
@@ -58,30 +45,11 @@ body {
 
 body {
   font-size: 0.9375rem;
-  background-color: var(--color-bg);
+  background-color: var(--color-surface-muted);
   color: var(--color-ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-}
-
-::selection {
-  color: light-dark(#ffffff, #14161a);
-  background-color: var(--color-ink);
-}
-
-/* 入场动画：卡片依次浮现，与上游一致 */
-@keyframes stage-in {
-  from {
-    opacity: 0;
-    transform: translateY(14px);
-  }
-}
-
-@keyframes progress-in {
-  from {
-    transform: scaleX(0);
-  }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -89,31 +57,23 @@ body {
 /* ------------------------------------------------------------------------- */
 
 @layer components {
-  /* 卡片：毛玻璃 + 大圆角，与上游一致 */
+  /* 卡片：原版控制台的核心视觉单元 */
   .card {
     background-color: var(--color-surface);
-    backdrop-filter: blur(22px) saturate(118%);
-    border: 1px solid var(--color-inner-line);
-    border-radius: 20px;
+    border: 1px solid var(--color-line);
+    border-radius: 0.875rem;
     box-shadow:
-      0 0 0 1px var(--color-line),
-      var(--shadow-lg);
+      0 1px 2px light-dark(rgb(15 23 42 / 0.04), rgb(0 0 0 / 0.3)),
+      0 8px 24px -12px light-dark(rgb(15 23 42 / 0.1), rgb(0 0 0 / 0.5));
   }
 
-  /* 卡片悬浮：轻微上浮 + 阴影增强，与上游一致 */
+  /* 可交互卡片：仅边框变深，不做位移与缩放 */
   .card-hover {
-    transition:
-      transform 320ms cubic-bezier(0.22, 1, 0.36, 1),
-      box-shadow 320ms ease,
-      background-color 320ms ease;
+    transition: border-color 140ms ease;
   }
 
   .card-hover:hover {
-    transform: translateY(-2px);
-    box-shadow:
-      0 0 0 1px var(--color-line-strong),
-      0 32px 62px -40px rgb(20 27 38 / 0.58),
-      inset 0 1px 0 rgb(255 255 255 / 0.92);
+    border-color: color-mix(in oklab, var(--color-ink-subtle) 45%, var(--color-line));
   }
 
   /* 徽章 */
@@ -132,6 +92,16 @@ body {
   .badge-ok {
     background-color: var(--color-ok-soft);
     color: var(--color-ok);
+  }
+
+  .badge-warn {
+    background-color: var(--color-warn-soft);
+    color: var(--color-warn);
+  }
+
+  .badge-danger {
+    background-color: var(--color-danger-soft);
+    color: var(--color-danger);
   }
 
   .badge-brand {
@@ -207,14 +177,6 @@ body {
     border-radius: 0.375rem;
   }
 
-  /* 仅图标按钮：36x36 方形圆角 */
-  .btn:not(:has(span)) {
-    width: 36px;
-    height: 36px;
-    padding: 0;
-    border-radius: 9px;
-  }
-
   /* 输入框 */
   .input {
     width: 100%;
@@ -244,6 +206,22 @@ body {
     font-weight: 600;
     color: var(--color-ink-muted);
     letter-spacing: 0.01em;
+  }
+
+  /* 进度条 */
+  .progress-track {
+    position: relative;
+    height: 0.375rem;
+    width: 100%;
+    overflow: hidden;
+    border-radius: 9999px;
+    background-color: var(--color-surface-muted);
+  }
+
+  .progress-fill {
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 400ms cubic-bezier(0.4, 0, 0.2, 1);
   }
 
   /* 开关 */
@@ -292,7 +270,6 @@ body {
     justify-content: center;
     padding: 1rem;
     background-color: light-dark(rgb(15 23 42 / 0.45), rgb(0 0 0 / 0.7));
-    backdrop-filter: blur(3px);
   }
 
   /* 细滚动条 */

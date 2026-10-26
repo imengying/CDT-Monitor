@@ -176,17 +176,9 @@ export class App {
       },
     })
 
-    // 汇总条：整体一张毛玻璃面板，四格等分，与上游 metric-strip 一致
+    // 汇总条：四格等分，共用一张卡片
     this.summaryGrid = el('section', {
-      class: 'mb-6 grid overflow-hidden grid-cols-2 sm:grid-cols-4',
-      style: {
-        borderRadius: '24px',
-        backgroundColor: 'var(--color-surface-raised)',
-        backdropFilter: 'blur(18px) saturate(112%)',
-        border: '1px solid var(--color-inner-line)',
-        boxShadow: '0 0 0 1px var(--color-line), var(--shadow-lg)',
-        animation: 'stage-in .68s .12s var(--ease-out) both',
-      },
+      class: 'card mb-4 grid overflow-hidden grid-cols-2 sm:grid-cols-4',
     })
 
     this.emptyCard = this.buildEmptyCard()
@@ -242,10 +234,10 @@ export class App {
     return el(
       'header',
       {
-        class: 'sticky top-0 z-30 border-b backdrop-blur-md',
+        class: 'sticky top-0 z-30 border-b',
         style: {
           borderColor: 'var(--color-line)',
-          backgroundColor: 'color-mix(in oklab, var(--color-surface) 82%, transparent)',
+          backgroundColor: 'var(--color-surface)',
         },
       },
       el(
@@ -539,22 +531,21 @@ export class App {
       return el(
         'div',
         {
-          class: 'relative flex items-center gap-3.5 px-5 py-4 transition-colors',
-          style: { minHeight: '92px' },
+          class: 'flex items-center gap-3 px-4 py-3',
         },
         el(
           'div',
           {
-            class: 'grid shrink-0 place-items-center rounded-xl',
-            style: { width: '44px', height: '44px', color: fg, backgroundColor: bg },
+            class: 'grid shrink-0 place-items-center rounded-lg',
+            style: { width: '36px', height: '36px', color: fg, backgroundColor: bg },
           },
-          iconSvg(icon, 20),
+          iconSvg(icon, 17),
         ),
         el(
           'div',
           { class: 'min-w-0' },
           el('label', {
-            class: 'mb-1 block text-[10px] font-bold uppercase',
+            class: 'mb-1 block text-xs font-medium',
             style: { color: 'var(--color-ink-muted)' },
             text: label,
           }),
@@ -562,7 +553,7 @@ export class App {
             'div',
             { class: 'flex items-baseline' },
             el('strong', {
-              class: 'text-2xl font-bold tabular-nums',
+              class: 'text-lg font-semibold tabular-nums',
               style: { color: fg },
               text: value,
             }),
