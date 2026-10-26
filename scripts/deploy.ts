@@ -4,14 +4,13 @@
  * ============================================================================
  * `bun run deploy` 执行本脚本，也是 Cloudflare 控制台的 **Deploy command**。
  *
- * 三步都可重复执行（幂等）：
- *   1. D1 不存在就创建（已存在则跳过）
- *   2. 应用 `migrations/` 下未执行的 SQL（D1 自己记录执行过的文件名）
+ * 三个步骤均可重复执行：
+ *   1. 创建 D1 库，已存在则跳过
+ *   2. 应用 `migrations/` 下未执行的 SQL（D1 记录已执行的文件名）
  *   3. `wrangler deploy`
  *
- * 对应 `wrangler.toml` 里刻意**不写** `database_id` 的做法：让 wrangler
- * 按 `database_name` 自动发现/绑定，这样连 Git 仓库首次部署时不需要先去
- * 控制台建库、复制 id、再改配置。
+ * `wrangler.toml` 不写 `database_id`，由 wrangler 按 `database_name`
+ * 解析绑定，首次部署无需先在控制台建库并回填 id。
  */
 
 import { spawnSync } from "node:child_process";
@@ -38,14 +37,9 @@ function run(args: string[], capture = false): { ok: boolean; out: string } {
 /**
  * 确保 D1 存在。
  *
- * 策略：**先直接 create，再按失败信息判断**。
- *
- * 为什么不先 `d1 list` 再决定：list 的输出是给人看的表格（还会带
- * 提示文案与颜色码），依赖它的格式做判断太脆。create 则是幂等的 ——
- * 已存在时返回明确的「already exists」，我们把它当作成功即可。
- *
- * 这样还有一个好处：并发部署时两个构建同时 create，后到的那个
- * 拿到 already exists，同样继续往下走，不会互相踩。
+ * 直接执行 `d1 create` 并按输出判断结果，不先 `d1 list`：list 输出为
+ * 带颜色码的人读表格，依其格式判断不可靠。create 幂等，库已存在时返回
+ * 「already exists」，视为成功继续。并发部署下后到的构建同样命中此分支。
  */
 function ensureDatabase(): void {
   log(`确保 D1 数据库 ${DATABASE} 存在`);
@@ -93,20 +87,18 @@ function deploy(): void {
   }
 }
 
-/** 部署后提示还没配的 Secret，避免用户对着 500 猜原因。 */
+/** 部署后提示必填的运行时 Secret。 */
 function remindSecrets(): void {
   console.log(
     [
       "",
-      "\x1b[1;33m提醒：以下运行时 Secret 需要在 Cloudflare 控制台配置\x1b[0m",
-      "  Settings → Variables and Secrets（不是 Build variables）",
+      "\x1b[1;33m运行时 Secret（Settings → Variables and Secrets，均为 Secret）\x1b[0m",
       "",
-      "  MASTER_KEY            必须，openssl rand -hex 32",
-      "  TURNSTILE_SITE_KEY    必须（明文亦可，也可写进 wrangler.toml [vars]）",
-      "  TURNSTILE_SECRET_KEY  必须",
-      "  ADMIN_PASSWORD        必需（首次登录后自动转为哈希入库）",
+      "  MASTER_KEY      openssl rand -hex 32",
+      "  ADMIN_USERNAME  管理员用户名",
+      "  ADMIN_PASSWORD  管理员密码",
       "",
-      "未配置 MASTER_KEY 时 Worker 会返回「未绑定 MASTER_KEY」。",
+      "其余配置（阿里云账号、人机校验、通知、日报、时区）在网页「设置」中维护。",
     ].join("\n"),
   );
 }

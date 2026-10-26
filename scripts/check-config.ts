@@ -1,14 +1,14 @@
 #!/usr/bin/env bun
 /**
- * 配置自检
+ * wrangler.toml 结构校验
  * ============================================================================
- * 部署前把 `wrangler.toml` 里几个**删了会静默失败**的段落核对一遍。
+ * 校验必需段落的存在与取值，缺失即退出非零。
  *
- * 背景：`[assets]` 段一旦缺失，Worker 仍然能部署成功，但所有静态资源请求
- * 都会返回「静态资源不可用」——因为 `env.assets("ASSETS")` 拿不到绑定。
- * 这类问题只有打开页面才会发现，因此放进 CI 提前拦。
+ * 这些段落缺失时 Worker 仍能部署成功，但会在运行时失败。例如缺少
+ * `[assets]` 会使 `env.assets("ASSETS")` 无绑定，所有静态资源请求返回错误，
+ * 且仅在打开页面时暴露。
  *
- * 运行：`bun run check:config`（`bun run build` 也会先跑它）
+ * 运行：`bun run check:config`；`bun run build` 会先执行本脚本。
  */
 
 import { readFileSync } from "node:fs";

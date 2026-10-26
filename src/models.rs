@@ -794,10 +794,9 @@ impl Default for BarkConfig {
     }
 }
 
-/// Turnstile 配置。`secret_enc` 为 XChaCha20Poly1305 密文，**永不出库**。
+/// Turnstile 配置。`secret_enc` 为 XChaCha20Poly1305 密文，不出库。
 ///
-/// 未配置（`Secret` 为空）时人机校验整体关闭：登录只校验用户名 + 密码。
-/// 这是刻意的默认值 —— 自建部署先能登进去，再决定要不要开人机校验。
+/// 未配置时不校验人机，登录仅校验用户名与密码。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnstileConfig {
     /// 是否启用。只有 site_key 与 secret 都填了才可能为 true。

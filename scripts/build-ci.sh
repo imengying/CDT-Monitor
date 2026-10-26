@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 #
-# Cloudflare Workers Builds 构建脚本（连接 GitHub 仓库场景）
+# Cloudflare Workers Builds 构建脚本
 # ============================================================================
-# Cloudflare 的构建环境是干净的 Linux 容器：有 Node，没有 Rust，也没有
-# worker-build。这个脚本负责从零把项目构建出来，可重复执行。
+# Cloudflare 构建环境只有 Node，无 Rust 与 worker-build，本脚本负责
+# 安装工具链并完成构建，可重复执行（产物新于源码时直接复用）。
 #
-# 调用时机（同一份代码可能被调用两次，第二次会命中缓存直接退出）：
+# 调用来源：
 #   1. Dashboard → Settings → Build → Build command
 #   2. wrangler.toml 的 [build] command（wrangler deploy 时）
 #
-# 需要的构建变量（Settings → Build → Build variables）：
-#   BUN_VERSION   Bun 版本，例如 1.4.4（默认 1.4.4）
+# 构建期变量（Settings → Build → Build variables）：
+#   BUN_VERSION   Bun 版本，默认 1.4.4
 #
-# 注意：这里的变量只在**构建期**可见。运行时的 MASTER_KEY /
-# TURNSTILE_SECRET_KEY 必须配置在 Settings → Variables and Secrets
-# 并选择 Secret 类型，否则 Worker 启动时会报「未绑定 MASTER_KEY」。
+# 构建期变量仅在构建阶段可见。运行时变量 MASTER_KEY / ADMIN_USERNAME /
+# ADMIN_PASSWORD 需配置在 Settings → Variables and Secrets 并选择 Secret。
 # ============================================================================
 set -euo pipefail
 
@@ -25,7 +24,7 @@ log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*"; }
 
 # ---------------------------------------------------------------------------
-# 0a. 配置自检：先拦掉「部署成功但页面空白」这类配置缺失
+# 0a. 结构校验：拦截部署成功但运行时失败的配置缺失
 # ---------------------------------------------------------------------------
 if [ -f scripts/check-config.ts ]; then
   log "配置自检"

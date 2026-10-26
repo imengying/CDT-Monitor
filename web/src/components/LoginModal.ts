@@ -1,24 +1,21 @@
 /**
- * 登录卡片（对应原版 `LoginModal.vue`）
+ * 登录卡片
  * ============================================================================
  * 居中登录卡片 + Cloudflare Turnstile。
  *
- * Turnstile 配置为 `appearance: 'interaction-only'`：
+ * Turnstile 使用 `appearance: 'interaction-only'`：静默验证通过时卡片上
+ * 不出现任何人机校验痕迹，仅在 Cloudflare 判定可疑时原地展开复选框。
+ * 容器的可见性完全交由 Cloudflare 控制，不手动设置 `display`。
  *
- * * 绝大多数访问者会被**静默验证通过**，卡片上完全看不到人机校验，
- *   登录卡片常态下只有「密码输入 + 登录按钮」两个可见元素；
- * * 只有被 Cloudflare 判定可疑时，才会在原地展开复选框并要求点击；
- * * 因此不能对容器做 `display: none` —— 被隐藏的元素里 Turnstile
- *   不会执行校验，token 永远拿不到。隐藏与否完全交给 Cloudflare。
+ * 三个约束：
  *
- * 另外三个实践要点：
  * 1. 脚本以 `render=explicit` 异步加载，需轮询等待 `window.turnstile` 就绪；
- * 2. token 是一次性的，任何一次提交失败后必须 `reset()`；
- * 3. 组件销毁时必须 `remove()`，否则 SPA 反复进出登录页会泄漏 widget。
+ * 2. token 一次性，提交失败后必须 `reset()`；
+ * 3. 销毁时必须 `remove()`，否则反复进出登录页会泄漏 widget。
  *
- * 由于静默校验是异步的、时机不可控，**提交按钮不再等待 token**：
- * 只要填了密码就能点，token 在提交瞬间读取（必要时用 `getResponse()` 兜底）；
- * 若届时确实还没就绪，就明确提示用户稍候重试，而不是让按钮一直灰着。
+ * 提交按钮不等待 token：静默校验的完成时机不可控，按钮只要求「已填密码
+ * 且未在提交中」。token 在提交瞬间读取（`getResponse()` 兜底），尚未就绪
+ * 则提示用户稍候重试。
  */
 
 import { api, ApiError } from '@/api/client'
@@ -182,12 +179,9 @@ export class LoginModal {
   /**
    * Turnstile 区域。
    *
-   * 这里**不做任何手动显示/隐藏**：`appearance: 'interaction-only'` 已保证
-   * 「无交互需求时不渲染可见内容」。我们只把容器留在 DOM 里，让 Cloudflare
-   * 自己决定是否往里面画东西。
-   *
-   * 早先版本曾用 `display: none` 隐藏容器 —— 那是错的：被隐藏的元素里
-   * Turnstile 不会执行校验，token 永远拿不到。
+   * 容器始终留在 DOM 中且不手动设置 `display`：`appearance: 'interaction-only'`
+   * 已保证无交互需求时不渲染可见内容。被 `display: none` 隐藏的容器内
+   * Turnstile 不会执行校验，token 无法获取。
    */
   private buildTurnstileSection(): HTMLDivElement {
     const available = this.siteKey.trim().length > 0
@@ -338,12 +332,10 @@ export class LoginModal {
   /**
    * 同步按钮可用性。
    *
-   * 注意：**不再要求 token 非空**。
-   *
-   * `interaction-only` 下静默校验由 Cloudflare 异步完成，耗时不可预期；
-   * 若按钮一直等到 token 到位才可点，用户会觉得「输了密码却点不动」。
-   * 现在按钮只要求「填了密码且未在提交中」，token 在提交瞬间读取，
-   * 若届时仍未就绪则给出明确提示（见 `submit()`）。
+   * 不要求 token 非空：`interaction-only` 下的静默校验由 Cloudflare
+   * 异步完成，耗时不可预期，等待 token 会造成按钮长时间不可点。
+   * 条件为「已填密码且未在提交中」，token 于提交瞬间读取，
+   * 未就绪时给出提示（见 `submit()`）。
    */
   private syncSubmitState(): void {
     const ready = !this.submitting && this.passwordInput.value.length > 0

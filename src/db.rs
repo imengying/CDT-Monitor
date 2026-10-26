@@ -886,7 +886,7 @@ impl Db {
         Ok(changed > 0)
     }
 
-    /// 清理过期锁（每次 Cron 顺手打扫）。
+    /// 清理已过期的锁。
     pub async fn purge_locks(&self, now_ms: i64) -> Result<usize> {
         self.exec("DELETE FROM locks WHERE expires_at <= ?", &[j_i64(now_ms)])
             .await
