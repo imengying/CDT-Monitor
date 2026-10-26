@@ -63,6 +63,16 @@ function main(): void {
     hint: "Worker 名需与 Cargo.toml、package.json、D1 database_name 保持一致",
   });
 
+  // --- 兼容日期 ---
+  //
+  // 决定 Workers 运行时行为的时间锚点。缺失或格式错误会被 wrangler 拒绝，
+  // 但写成未来日期时 wrangler 只在部署时才报错，这里提前校验格式。
+  checks.push({
+    name: "compatibility_date 为合法日期",
+    ok: /^compatibility_date\s*=\s*"\d{4}-\d{2}-\d{2}"\s*$/m.test(raw),
+    hint: "格式应为 YYYY-MM-DD，且不晚于当前日期",
+  });
+
   // --- D1 绑定 ---
   checks.push({
     name: "[[d1_databases]] 绑定名为 DB",

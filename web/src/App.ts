@@ -3,7 +3,7 @@
  * ============================================================================
  * 负责整体布局与各区块的装配：
  *
- *   ┌ 顶部导航：标题 · 时区/账期 · 刷新 · 日志 · 设置 · 退出 ┐
+ *   ┌ 顶部导航：标题 · 刷新 · 日志 · 设置 · 退出 ┐
  *   ├ 汇总条：账号 / 本月流量 / 实例 / 熔断                   ┤
  *   ├ 账号卡片区（AccountList）                                ┤
  *   └ 历史流量图表区（TrafficChart）                              ┘
@@ -12,7 +12,7 @@
  * 避免每次 60 秒轮询都重建整棵树（会丢失滚动位置与输入焦点）。
  */
 
-import { formatTime, humanBytes, type AccountOverview } from '@/api/client'
+import { humanBytes, type AccountOverview } from '@/api/client'
 import type { AppState } from '@/lib/store'
 import { clearToasts, store } from '@/lib/store'
 import { el, iconSvg, replaceChildren } from '@/lib/dom'
@@ -49,7 +49,6 @@ export class App {
   private readonly accountList = new AccountList()
 
   /** 需要就地更新的节点。 */
-  private lastRefreshLabel: HTMLSpanElement | null = null
   private refreshButton: HTMLButtonElement | null = null
   private errorBanner: HTMLDivElement | null = null
   private summaryGrid: HTMLElement | null = null
@@ -154,11 +153,6 @@ export class App {
     this.logDrawer = new LogDrawer()
     this.trafficChart = new TrafficChart()
 
-    this.lastRefreshLabel = el('span', {
-      class: 'hidden text-[0.8125rem] sm:inline',
-      style: { color: 'var(--color-ink-subtle)' },
-    })
-
     this.refreshButton = el('button', {
       class: 'btn btn-ghost btn-sm',
       type: 'button',
@@ -258,7 +252,6 @@ export class App {
         el(
           'div',
           { class: 'flex items-center gap-1.5' },
-          this.lastRefreshLabel,
           this.refreshButton,
           barButton('日志', icons.activity, '操作日志', () => this.logDrawer?.open()),
           barButton('设置', icons.settings, '系统设置', () =>
@@ -413,12 +406,6 @@ export class App {
           : [iconSvg(icons.refresh, 13)]),
         el('span', { class: 'hidden sm:inline', text: '刷新' }),
       )
-    }
-
-    if (this.lastRefreshLabel) {
-      const text = overview ? formatTime(overview.generated_at) : ''
-      this.lastRefreshLabel.textContent = text
-      this.lastRefreshLabel.title = text ? `上次刷新：${text}` : ''
     }
 
     this.renderErrorBanner(state)
@@ -593,7 +580,6 @@ export class App {
     this.settingsModal = null
     this.logDrawer = null
     this.shell = null
-    this.lastRefreshLabel = null
     this.refreshButton = null
     this.errorBanner = null
     this.summaryGrid = null

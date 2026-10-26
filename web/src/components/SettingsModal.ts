@@ -1079,23 +1079,26 @@ export class SettingsModal {
           text: '登录时的人机校验。不填就是不启用 —— 只校验用户名与密码。',
         }),
       ),
-      el(
-        'div',
-        {
-          class: 'flex items-start gap-2 rounded-lg px-3 py-2 text-[0.8125rem]',
-          style: {
-            backgroundColor: active ? 'var(--color-ok-soft)' : 'var(--color-surface-muted)',
-            color: active ? 'var(--color-ok)' : 'var(--color-ink-subtle)',
-          },
-        },
-        iconSvg(active ? icons.shield : icons.info, 13),
-        el('span', {
-          class: 'leading-relaxed',
-          text: active
-            ? '已启用：登录时浏览器会静默完成校验，判定可疑时才弹出复选框。'
-            : '未启用：登录只校验用户名 + 密码，建议仅在完全可信的网络环境下保持关闭。',
-        }),
-      ),
+      // 仅启用时显示状态；未启用是默认状态，无需额外说明
+      ...(active
+        ? [
+            el(
+              'div',
+              {
+                class: 'flex items-start gap-2 rounded-lg px-3 py-2 text-[0.8125rem]',
+                style: {
+                  backgroundColor: 'var(--color-ok-soft)',
+                  color: 'var(--color-ok)',
+                },
+              },
+              iconSvg(icons.shield, 13),
+              el('span', {
+                class: 'leading-relaxed',
+                text: '已启用：登录时浏览器会静默完成校验，判定可疑时才弹出复选框。',
+              }),
+            ),
+          ]
+        : []),
       el(
         'div',
         {},
@@ -1586,16 +1589,6 @@ export class SettingsModal {
               el('span', { text: '保存' }),
             ),
           ),
-        ),
-        el(
-          'div',
-          { class: 'border-t pt-4', style: { borderColor: 'var(--color-line)' } },
-          el('h3', { class: 'text-sm font-semibold', text: '登录凭证' }),
-          el('p', {
-            class: 'mt-1 text-xs leading-relaxed',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '由环境变量提供，后台不可修改。',
-          }),
         ),
         el(
           'div',

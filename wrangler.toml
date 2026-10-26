@@ -31,7 +31,7 @@ name = "cdt-monitor"
 # 由 [build] 生成，不要手改
 main = "build/worker/shim.mjs"
 
-compatibility_date = "2025-09-01"
+compatibility_date = "2026-10-01"
 
 # 强制全局 fetch 只走公网：本 Worker 要访问阿里云、Telegram、Bark 等
 # 第三方服务，走公网才是预期行为，避免误命中同账号内的私有来源。
