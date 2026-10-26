@@ -49,7 +49,8 @@ function signatureOf(account: AccountOverview): string {
     name: account.name,
     site_label: account.site_label,
     ak: account.access_key_id_masked,
-    limit: account.traffic_limit_gb,
+    domesticLimit: account.domestic_limit_gb,
+    overseasLimit: account.overseas_limit_gb,
     action: account.over_limit_action,
     actionLabel: account.over_limit_action_label,
     stopMode: account.stop_mode,
@@ -60,6 +61,8 @@ function signatureOf(account: AccountOverview): string {
     enabled: account.enabled,
     balance: account.balance_amount,
     currency: account.balance_currency,
+    cash: account.balance_cash,
+    credit: account.balance_credit,
     domestic: account.cdt_domestic_bytes,
     overseas: account.cdt_overseas_bytes,
     total: account.cdt_total_bytes,
@@ -293,6 +296,7 @@ export class AccountCard {
             el('b', {
               class: 'font-mono text-xs tabular-nums',
               text: humanAmount(account.balance_amount, account.balance_currency),
+              title: this.balanceBreakdown(),
             }),
           ),
           el(
@@ -301,11 +305,11 @@ export class AccountCard {
             el('span', {
               class: 'text-xs',
               style: { color: 'var(--color-ink-subtle)' },
-              text: '阈值',
+              text: '额度 内地 / 非内地',
             }),
             el('b', {
               class: 'font-mono text-xs tabular-nums',
-              text: `${account.traffic_limit_gb} GB`,
+              text: `${account.domestic_limit_gb} / ${account.overseas_limit_gb} GB`,
             }),
           ),
         ),
@@ -314,11 +318,30 @@ export class AccountCard {
   }
 
   /** 流量区：大号数字 + 单条进度 + 百分比与账期。 */
-  private buildTrafficBlock(): HTMLElement {
+  /** 余额分项的 hover 文案；没有分项时返回空串（不显示 tooltip）。 */
+  private balanceBreakdown(): string {
     const account = this.account
-    const percent = account.total_percent
+    const parts: string[] = []
+    if (account.balance_cash !== null) {
+      parts.push(`现金 ${humanAmount(account.balance_cash, account.balance_currency)}`)
+    }
+    if (account.balance_credit !== null && account.balance_credit > 0) {
+      parts.push(`信用 ${humanAmount(account.balance_credit, account.balance_currency)}`)
+    }
+    return parts.join(' · ')
+  }
+
+  /**
+   * 单条进度条。
+   *
+   * 免费额度按地域分两个独立池（中国内地 20 GB / 非中国内地 200 GB），
+   * 各自超限才熔断，因此两个池子各画一条、各按自己的配额算百分比。
+   * 只有实际产生流量的池子才画 —— 单机部署通常只落在一侧。
+   */
+  private buildPoolBar(label: string, bytes: number, limitGb: number): HTMLElement {
+    const percent = limitGb > 0 ? Math.min((bytes / (limitGb * 1024 ** 3)) * 100, 9999) : 0
     const fill =
-      account.threshold_triggered || percent >= 100
+      percent >= 100
         ? 'var(--color-danger)'
         : percent >= 80
           ? 'var(--color-warn)'
@@ -326,12 +349,80 @@ export class AccountCard {
 
     return el(
       'div',
-      {},
+      { class: 'mt-3' },
       el(
         'div',
         {
-          class: 'mt-5 flex items-end justify-between',
+          class: 'flex items-baseline justify-between text-xs tabular-nums',
+          style: { color: 'var(--color-ink-muted)' },
         },
+        el('span', { text: label }),
+        el('span', {
+          text: `${humanBytes(bytes)} / ${limitGb} GB`,
+        }),
+      ),
+      el(
+        'div',
+        {
+          class: 'mt-1.5 overflow-hidden rounded-full',
+          style: {
+            height: '7px',
+            backgroundColor: 'color-mix(in oklab, var(--color-line-strong) 68%, transparent)',
+            boxShadow: 'inset 0 1px 3px rgb(0 0 0 / 0.08)',
+          },
+        },
+        el('i', {
+          class: 'block h-full rounded-full',
+          style: {
+            width: `${Math.min(Math.max(percent, 0), 100)}%`,
+            backgroundColor: fill,
+            animation: 'progress-in .8s .35s var(--ease-emphasis) both',
+          },
+        }),
+      ),
+      el(
+        'div', {
+          class: 'mt-1 text-right text-xs tabular-nums',
+          style: { color: 'var(--color-ink-subtle)' },
+        },
+        el('span', { text: `${percent.toFixed(2)}%` }),
+      ),
+    )
+  }
+
+  /** 流量区：两个池子各自一行进度 + 账期。 */
+  private buildTrafficBlock(): HTMLElement {
+    const account = this.account
+    const bars: HTMLElement[] = []
+
+    if (account.cdt_domestic_bytes > 0 || account.domestic_limit_gb > 0) {
+      if (account.cdt_domestic_bytes > 0) {
+        bars.push(
+          this.buildPoolBar('中国内地', account.cdt_domestic_bytes, account.domestic_limit_gb),
+        )
+      }
+    }
+    if (account.cdt_overseas_bytes > 0) {
+      bars.push(
+        this.buildPoolBar('非中国内地', account.cdt_overseas_bytes, account.overseas_limit_gb),
+      )
+    }
+    if (bars.length === 0) {
+      bars.push(
+        el('p', {
+          class: 'mt-3 text-xs',
+          style: { color: 'var(--color-ink-subtle)' },
+          text: '本月暂无流量记录',
+        }),
+      )
+    }
+
+    return el(
+      'div',
+      {},
+      el(
+        'div',
+        { class: 'mt-5 flex items-end justify-between' },
         el(
           'div',
           {},
@@ -350,7 +441,7 @@ export class AccountCard {
             el('small', {
               class: 'font-medium tabular-nums',
               style: { color: 'var(--color-ink-subtle)' },
-              text: `/ ${account.traffic_limit_gb.toFixed(0)} GB`,
+              text: 'GB 合计',
             }),
           ),
         ),
@@ -363,48 +454,14 @@ export class AccountCard {
           onClick: () => this.refreshAccount(),
         }),
       ),
+      ...bars,
       el(
         'div',
         {
-          class: 'mt-3 overflow-hidden rounded-full',
-          style: {
-            height: '7px',
-            backgroundColor: 'color-mix(in oklab, var(--color-line-strong) 68%, transparent)',
-            boxShadow: 'inset 0 1px 3px rgb(0 0 0 / 0.08)',
-          },
-        },
-        el('i', {
-          class: 'block h-full rounded-full',
-          style: {
-            width: `${Math.min(Math.max(percent, 0), 100)}%`,
-            backgroundColor: fill,
-            animation: 'progress-in .8s .35s var(--ease-emphasis) both',
-          },
-        }),
-      ),
-      el(
-        'div',
-        {
-          class: 'mt-2 flex justify-between text-xs tabular-nums',
+          class: 'mt-2 text-xs tabular-nums',
           style: { color: 'var(--color-ink-muted)' },
         },
-        el('span', { text: `${percent.toFixed(2)}% 已使用` }),
         el('span', { text: `账期 ${account.billing_month || '—'}` }),
-      ),
-      el(
-        'div',
-        {
-          class: 'mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-        },
-        // 只显示实际产生流量的区域：单机部署通常只落在一侧，
-        // 另一侧恒为 0 B，列出来纯属噪音
-        ...(account.cdt_domestic_bytes > 0
-          ? [el('span', { text: `国内 ${humanBytes(account.cdt_domestic_bytes)}` })]
-          : []),
-        ...(account.cdt_overseas_bytes > 0
-          ? [el('span', { text: `非内地 ${humanBytes(account.cdt_overseas_bytes)}` })]
-          : []),
       ),
     )
   }

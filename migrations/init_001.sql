@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS accounts (
   -- Base64(24 字节 Nonce + XChaCha20Poly1305 密文)
   encrypted_access_key_secret TEXT    NOT NULL,
   regions_json                TEXT    NOT NULL DEFAULT '[]',
-  traffic_limit_gb            REAL    NOT NULL DEFAULT 20,
+  -- 免费额度按地域池分开计算：中国内地 20 GB/月、非中国内地 200 GB/月。
+  -- 两池各自独立判定，任一超限即熔断，不存在合计阈值。
+  domestic_limit_gb           REAL    NOT NULL DEFAULT 20,
+  overseas_limit_gb           REAL    NOT NULL DEFAULT 200,
   -- 突变告警阈值（GB）：单次采样增长超过此值即告警。NULL 用全局默认值
   spike_threshold_gb          REAL,
   over_limit_action           TEXT    NOT NULL DEFAULT 'stop_and_notify'
@@ -67,6 +70,9 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
                            REFERENCES accounts (id) ON DELETE CASCADE,
   balance_amount           REAL,
   balance_currency         TEXT,
+  -- 余额分项（BSS 返回的细分字段，用于 hover 展示）
+  balance_cash             REAL,
+  balance_credit           REAL,
   cdt_domestic_bytes       INTEGER NOT NULL DEFAULT 0,
   cdt_overseas_bytes       INTEGER NOT NULL DEFAULT 0,
   billing_month            TEXT    NOT NULL DEFAULT '',

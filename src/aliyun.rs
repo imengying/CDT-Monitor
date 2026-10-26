@@ -543,21 +543,29 @@ impl AliyunClient {
             .await?;
 
         let data = value.get("Data").cloned().unwrap_or(Value::Null);
-        let amount = data
-            .get("AvailableAmount")
-            .and_then(|v| {
+        // 金额统一以字符串返回（避免浮点精度问题），这里两种形态都接受。
+        let amount_of = |key: &str| -> Option<f64> {
+            data.get(key).and_then(|v| {
                 v.as_str()
                     .map(|s| s.trim().to_string())
                     .or_else(|| v.as_f64().map(|f| f.to_string()))
             })
-            .and_then(|s| s.parse::<f64>().ok());
+            .and_then(|s| s.parse::<f64>().ok())
+        };
+
+        let amount = amount_of("AvailableAmount");
         let currency = data
             .get("Currency")
             .and_then(|v| v.as_str())
             .map(|s| s.to_ascii_uppercase());
 
         match amount {
-            Some(amount) => Ok(AccountBalance { amount, currency }),
+            Some(amount) => Ok(AccountBalance {
+                amount,
+                currency,
+                cash: amount_of("AvailableCashAmount"),
+                credit: amount_of("CreditAmount"),
+            }),
             None => Err(AliyunError::Parse(format!(
                 "QueryAccountBalance 响应缺少 Data.AvailableAmount：{}",
                 truncate_json(&value, 200)
@@ -573,8 +581,13 @@ impl AliyunClient {
 /// 账户余额。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountBalance {
+    /// 总可用额度（`Data.AvailableAmount`）。
     pub amount: f64,
     pub currency: Option<String>,
+    /// 现金余额（`Data.AvailableCashAmount`），缺失为 `None`。
+    pub cash: Option<f64>,
+    /// 信用额度（`Data.CreditAmount`）。
+    pub credit: Option<f64>,
 }
 
 /// CDT 流量汇总（字节）。
@@ -894,6 +907,12 @@ fn truncate_json(value: &Value, max_chars: usize) -> String {
 // 便捷封装
 // ===========================================================================
 
+/// 流量合计低于此值时视为「单位可能不是字节」并发告警。
+///
+/// 取 1 KiB：真实账号只要产生过任何公网流量，累计值都不会这么小；
+/// 而若接口返回的是 GB 数值（如 `0.03`），按字节解释就会落到这个区间。
+const MIN_PLAUSIBLE_TRAFFIC_BYTES: i64 = 1024;
+
 /// 一轮账号同步的原始结果（尚未写入 D1）。
 #[derive(Debug, Clone, Default)]
 pub struct AccountSync {
@@ -925,6 +944,14 @@ pub async fn sync_account(client: &AliyunClient, regions: &[String]) -> AccountS
             if traffic.items == 0 {
                 out.warnings
                     .push("CDT 接口未返回任何流量条目（可能当月还没有产生流量）".to_string());
+            } else if traffic.total_bytes() < MIN_PLAUSIBLE_TRAFFIC_BYTES {
+                // 有条目但总量小到不可能是真实值：多半是接口改了单位
+                // （例如从字节变成 GB），按字节解释会低估 1024³ 倍，
+                // 导致熔断永远不触发。宁可报错也不要静默算错。
+                out.warnings.push(format!(
+                    "CDT 流量合计仅 {} 字节，疑似单位不是字节，请核对接口字段说明",
+                    traffic.total_bytes()
+                ));
             }
             out.traffic = Some(traffic);
         }

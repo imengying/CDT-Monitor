@@ -638,7 +638,7 @@ export class App {
           this.chartThresholdRow,
           iconSvg(icons.alert, 12),
           el('span', {
-            text: `${account.name} 本月已熔断（配额 ${account.traffic_limit_gb} GB）`,
+            text: `${account.name} 本月已熔断（内地 ${account.domestic_limit_gb} GB / 非内地 ${account.overseas_limit_gb} GB）`,
           }),
         )
       }

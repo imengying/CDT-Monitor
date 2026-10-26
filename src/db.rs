@@ -268,7 +268,8 @@ impl Db {
         access_key_id: &str,
         encrypted_secret: &str,
         regions_json: &str,
-        traffic_limit_gb: f64,
+        domestic_limit_gb: f64,
+        overseas_limit_gb: f64,
         spike_threshold_gb: Option<f64>,
         over_limit_action: &str,
         stop_mode: &str,
@@ -281,17 +282,19 @@ impl Db {
         self.insert(
             "INSERT INTO accounts (
                 name, site_type, access_key_id, encrypted_access_key_secret, regions_json,
-                traffic_limit_gb, spike_threshold_gb, over_limit_action, stop_mode,
+                domestic_limit_gb, overseas_limit_gb, spike_threshold_gb,
+                over_limit_action, stop_mode,
                 schedule_start_time, schedule_stop_time, spot_keep_alive, enabled,
                 last_schedule_start_date, last_schedule_stop_date, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
             &[
                 j_text(name),
                 j_text(site_type),
                 j_text(access_key_id),
                 j_text(encrypted_secret),
                 j_text(regions_json),
-                j_f64(traffic_limit_gb),
+                j_f64(domestic_limit_gb),
+                j_f64(overseas_limit_gb),
                 j_opt_f64(spike_threshold_gb),
                 j_text(over_limit_action),
                 j_text(stop_mode),
@@ -316,7 +319,8 @@ impl Db {
         access_key_id: &str,
         encrypted_secret: Option<&str>,
         regions_json: &str,
-        traffic_limit_gb: f64,
+        domestic_limit_gb: f64,
+        overseas_limit_gb: f64,
         spike_threshold_gb: Option<f64>,
         over_limit_action: &str,
         stop_mode: &str,
@@ -330,7 +334,8 @@ impl Db {
             Some(_) => {
                 "UPDATE accounts SET
                     name = ?, site_type = ?, access_key_id = ?, encrypted_access_key_secret = ?,
-                    regions_json = ?, traffic_limit_gb = ?, spike_threshold_gb = ?,
+                    regions_json = ?, domestic_limit_gb = ?, overseas_limit_gb = ?,
+                    spike_threshold_gb = ?,
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
                     enabled = ?, updated_at = ?
@@ -339,7 +344,8 @@ impl Db {
             None => {
                 "UPDATE accounts SET
                     name = ?, site_type = ?, access_key_id = ?,
-                    regions_json = ?, traffic_limit_gb = ?, spike_threshold_gb = ?,
+                    regions_json = ?, domestic_limit_gb = ?, overseas_limit_gb = ?,
+                    spike_threshold_gb = ?,
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
                     enabled = ?, updated_at = ?
@@ -353,7 +359,8 @@ impl Db {
         }
         params.extend_from_slice(&[
             j_text(regions_json),
-            j_f64(traffic_limit_gb),
+            j_f64(domestic_limit_gb),
+            j_f64(overseas_limit_gb),
             j_opt_f64(spike_threshold_gb),
             j_text(over_limit_action),
             j_text(stop_mode),
@@ -442,13 +449,15 @@ impl Db {
             .map_err(|e| worker::Error::RustError(format!("实例列表序列化失败：{e}")))?;
         self.exec(
             "INSERT INTO account_snapshots (
-                account_id, balance_amount, balance_currency,
+                account_id, balance_amount, balance_currency, balance_cash, balance_credit,
                 cdt_domestic_bytes, cdt_overseas_bytes, billing_month,
                 instances_json, threshold_triggered_month, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
              ON CONFLICT(account_id) DO UPDATE SET
                 balance_amount = excluded.balance_amount,
                 balance_currency = excluded.balance_currency,
+                balance_cash = excluded.balance_cash,
+                balance_credit = excluded.balance_credit,
                 cdt_domestic_bytes = excluded.cdt_domestic_bytes,
                 cdt_overseas_bytes = excluded.cdt_overseas_bytes,
                 billing_month = excluded.billing_month,
@@ -463,6 +472,8 @@ impl Db {
                 j_i64(update.account_id),
                 j_opt_f64(update.balance_amount),
                 j_opt_text(update.balance_currency.as_deref()),
+                j_opt_f64(update.balance_cash),
+                j_opt_f64(update.balance_credit),
                 j_i64(update.cdt_domestic_bytes.max(0)),
                 j_i64(update.cdt_overseas_bytes.max(0)),
                 j_text(&update.billing_month),

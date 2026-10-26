@@ -37,8 +37,9 @@ use crate::db::Db;
 use crate::models::{
     AccountOverview, AccountRow, BarkConfig, DailyReportConfig, HistoryBucket, InstanceInfo,
     NotifyChannel, OverLimitAction, SnapshotRow, SnapshotUpdate, TelegramConfig, TrafficPoint,
+    TrafficPool, TrafficPools,
     build_overview, gb_to_bytes, human_amount, human_bytes, local_date, local_minutes_of_day,
-    now_ms, parse_hhmm, percent_of_limit, setting_key, utc_offset_minutes, within_window,
+    now_ms, parse_hhmm, setting_key, utc_offset_minutes, within_window,
 };
 use crate::notify::{
     BarkChannel, Channels, Message, NotifyLevel, NotifyOutcome, TelegramChannel, dispatch,
@@ -457,19 +458,32 @@ impl Scheduler {
         };
 
         // 余额同理：沿用旧值，避免余额接口抖动导致界面金额闪成 "-"。
-        let (balance_amount, balance_currency) = match sync.balance.as_ref() {
-            Some(balance) => (Some(balance.amount), balance.currency.clone()),
-            None => match previous.as_ref() {
-                Some(snapshot) => (snapshot.balance_amount, snapshot.balance_currency.clone()),
-                None => (None, None),
-            },
-        };
+        let (balance_amount, balance_currency, balance_cash, balance_credit) =
+            match sync.balance.as_ref() {
+                Some(balance) => (
+                    Some(balance.amount),
+                    balance.currency.clone(),
+                    balance.cash,
+                    balance.credit,
+                ),
+                None => match previous.as_ref() {
+                    Some(snapshot) => (
+                        snapshot.balance_amount,
+                        snapshot.balance_currency.clone(),
+                        snapshot.balance_cash,
+                        snapshot.balance_credit,
+                    ),
+                    None => (None, None, None, None),
+                },
+            };
 
         self.db
             .upsert_snapshot(&SnapshotUpdate {
                 account_id: account.id,
                 balance_amount,
                 balance_currency,
+                balance_cash,
+                balance_credit,
                 cdt_domestic_bytes: domestic_bytes,
                 cdt_overseas_bytes: overseas_bytes,
                 billing_month: billing_month.clone(),
@@ -494,23 +508,30 @@ impl Scheduler {
             .await?;
 
         let total_bytes = domestic_bytes + overseas_bytes;
-        let limit_bytes = gb_to_bytes(account.traffic_limit_gb);
+        // 免费额度分为两个独立池：中国内地与非中国内地各自计费，
+        // 任一池超限就要熔断。用合计值与单一阈值判断会两个方向都出错：
+        // 国内 19G + 海外 19G 合计 38G 时合计阈值不会触发，但国内已经超额；
+        // 国内 5G + 海外 200G 合计 205G 会误触发，但两池其实都还在免费额度内。
+        let pools = TrafficPools {
+            domestic: TrafficPool::new(domestic_bytes, account.domestic_limit_gb),
+            overseas: TrafficPool::new(overseas_bytes, account.overseas_limit_gb),
+        };
         let already_triggered = previous
             .as_ref()
             .map(|snapshot| snapshot.threshold_triggered(&billing_month))
             .unwrap_or(false);
 
         let mut threshold_fired = false;
-        if limit_bytes > 0 && total_bytes >= limit_bytes && !already_triggered {
+        if pools.any_exceeded() && !already_triggered {
             threshold_fired = self
-                .handle_threshold(account, total_bytes, domestic_bytes, overseas_bytes)
+                .handle_threshold(account, &pools)
                 .await?;
         }
 
         // 突变告警：相邻两次采样之间增长过多，说明流量正在被快速消耗。
         // 与阈值熔断互补 —— 熔断是「到上限才管」，突变是「刚发生就知道」。
         let spike_detected = self
-            .check_spike(account, previous_sample.as_ref(), total_bytes)
+            .check_spike(account, previous_sample.as_ref(), total_bytes, &pools)
             .await;
 
         for warning in &sync.warnings {
@@ -545,6 +566,7 @@ impl Scheduler {
         account: &AccountRow,
         previous: Option<&TrafficPoint>,
         current_total: i64,
+        current_pools: &TrafficPools,
     ) -> bool {
         let Some(prev) = previous else {
             return false;
@@ -584,10 +606,11 @@ impl Scheduler {
         )
         .with_details(vec![
             format!(
-                "当前已用 {}（配额 {:.0} GB 的 {:.1}%）",
-                human_bytes(current_total),
-                account.traffic_limit_gb,
-                percent_of_limit(current_total, account.traffic_limit_gb)
+                "当前已用 中国内地 {} / {} GB · 非中国内地 {} / {} GB",
+                human_bytes(current_pools.domestic.bytes),
+                trim_float(current_pools.domestic.limit_gb),
+                human_bytes(current_pools.overseas.bytes),
+                trim_float(current_pools.overseas.limit_gb)
             ),
             format!(
                 "账期 {}",
@@ -632,9 +655,7 @@ impl Scheduler {
     async fn handle_threshold(
         &self,
         account: &AccountRow,
-        total_bytes: i64,
-        domestic_bytes: i64,
-        overseas_bytes: i64,
+        pools: &TrafficPools,
     ) -> worker::Result<bool> {
         let billing_month = crate::models::billing_month(self.now, &self.timezone);
         let lock_name = format!("threshold:{}:{}", account.id, billing_month);
@@ -653,18 +674,23 @@ impl Scheduler {
 
         let mut details = vec![
             format!(
-                "国内 {} / 海外 {} / 合计 {}",
-                human_bytes(domestic_bytes),
-                human_bytes(overseas_bytes),
-                human_bytes(total_bytes)
+                "中国内地 {} / {} GB（{:.2}%）",
+                human_bytes(pools.domestic.bytes),
+                trim_float(pools.domestic.limit_gb),
+                pools.domestic.percent()
             ),
             format!(
-                "阈值 {} GB（{:.2}%）",
-                trim_float(account.traffic_limit_gb),
-                percent_of_limit(total_bytes, account.traffic_limit_gb)
+                "非中国内地 {} / {} GB（{:.2}%）",
+                human_bytes(pools.overseas.bytes),
+                trim_float(pools.overseas.limit_gb),
+                pools.overseas.percent()
             ),
-            format!("账期 {}", billing_month),
         ];
+        let exceeded = pools.exceeded_labels();
+        if !exceeded.is_empty() {
+            details.push(format!("已超额度：{}", exceeded.join("、")));
+        }
+        details.push(format!("账期 {}", billing_month));
 
         let mut stopped = Vec::new();
         let mut stop_failures = Vec::new();
@@ -737,19 +763,15 @@ impl Scheduler {
             )
             .await?;
 
-        let title = format!("{} 流量超阈值", account.name);
+        let title = format!("{} 流量超额度", account.name);
+        let summary = format!(
+            "{} 已超出免费额度",
+            exceeded.join("、")
+        );
         let body = if account.action() == OverLimitAction::StopAndNotify {
-            format!(
-                "合计 {} 已超过阈值 {} GB，已按策略停机。",
-                human_bytes(total_bytes),
-                trim_float(account.traffic_limit_gb)
-            )
+            format!("{summary}，已按策略停机。")
         } else {
-            format!(
-                "合计 {} 已超过阈值 {} GB，当前策略为仅通知，实例仍在运行。",
-                human_bytes(total_bytes),
-                trim_float(account.traffic_limit_gb)
-            )
+            format!("{summary}，当前策略为仅通知，实例仍在运行。")
         };
 
         self.notify(
@@ -1008,7 +1030,14 @@ impl Scheduler {
     // 抢占式保活
     // -----------------------------------------------------------------------
 
-    /// 抢占式实例保活：仅拉起「被系统释放后处于 Stopped」的可保活实例。
+    /// 抢占式实例保活：拉起处于 Stopped 的可保活抢占式实例。
+    ///
+    /// 已知限制：阿里云不提供区分「系统回收」与「用户手动停机」的字段
+    /// （两者都是 `Status == Stopped`）。系统回收前 5 分钟会在
+    /// `OperationLocks` 里标记待回收，但那个窗口比 Cron 间隔还短，
+    /// 靠轮询去抓并不可靠。因此这里的语义是**只要开着保活、实例又处于
+    /// 停止状态就拉起**，手动停机的实例也会被重新启动。
+    /// 需要手动停机时，请先关掉该实例或账号的保活开关。
     async fn maybe_keep_alive(
         &self,
         account: &AccountRow,
@@ -1241,14 +1270,13 @@ impl Scheduler {
                 (None, _) => "未知".to_string(),
             };
             details.push(format!(
-                "{}（{}）：国内 {} · 海外 {} · 合计 {} / {} GB（{:.2}%）｜余额 {}｜实例 {} 台{}",
+                "{}（{}）：内地 {} / {} GB · 非内地 {} / {} GB｜余额 {}｜实例 {} 台{}",
                 overview.name,
                 overview.site_label,
                 human_bytes(overview.cdt_domestic_bytes),
+                trim_float(overview.domestic_limit_gb),
                 human_bytes(overview.cdt_overseas_bytes),
-                human_bytes(overview.cdt_total_bytes),
-                trim_float(overview.traffic_limit_gb),
-                overview.total_percent,
+                trim_float(overview.overseas_limit_gb),
                 balance,
                 overview.instances.len(),
                 if overview.threshold_triggered {
@@ -1665,7 +1693,8 @@ mod tests {
             access_key_id: "LTAI5tTestKey".to_string(),
             encrypted_access_key_secret: "cipher".to_string(),
             regions_json: "[]".to_string(),
-            traffic_limit_gb: 20.0,
+            domestic_limit_gb: crate::models::DEFAULT_DOMESTIC_LIMIT_GB,
+            overseas_limit_gb: crate::models::DEFAULT_OVERSEAS_LIMIT_GB,
             spike_threshold_gb: None,
             over_limit_action: "stop_and_notify".to_string(),
             stop_mode: "StopCharging".to_string(),

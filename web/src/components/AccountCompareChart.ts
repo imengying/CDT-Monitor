@@ -129,8 +129,10 @@ export class AccountCompareChart {
       value: Number(account.total_percent.toFixed(2)),
       itemStyle: { color: toneColor(account.total_percent) },
       // 供 tooltip 使用
-      bytes: account.cdt_total_bytes,
-      limit: account.traffic_limit_gb,
+      domesticBytes: account.cdt_domestic_bytes,
+      overseasBytes: account.cdt_overseas_bytes,
+      domesticLimit: account.domestic_limit_gb,
+      overseasLimit: account.overseas_limit_gb,
     }))
 
     const option: EChartsCoreOption = {
@@ -142,12 +144,22 @@ export class AccountCompareChart {
         borderColor: resolveColor('--color-line'),
         textStyle: { color: resolveColor('--color-ink'), fontSize: 12 },
         formatter: (params: unknown) => {
-          const item = params as { name: string; data: { bytes: number; limit: number; value: number } }
+          const item = params as {
+            name: string
+            data: {
+              domesticBytes: number
+              overseasBytes: number
+              domesticLimit: number
+              overseasLimit: number
+              value: number
+            }
+          }
           const data = item.data
           return [
             `<div style="font-weight:600;margin-bottom:2px">${escapeHtml(item.name)}</div>`,
-            `${humanBytes(data.bytes)} / ${data.limit} GB`,
-            `占比 ${data.value}%`,
+            `内地 ${humanBytes(data.domesticBytes)} / ${data.domesticLimit} GB`,
+            `非内地 ${humanBytes(data.overseasBytes)} / ${data.overseasLimit} GB`,
+            `最高占比 ${data.value}%`,
           ].join('<br/>')
         },
       },

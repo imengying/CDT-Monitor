@@ -107,7 +107,10 @@ export interface AccountOverview {
   site_type: SiteType
   site_label: string
   access_key_id_masked: string
-  traffic_limit_gb: number
+  domestic_limit_gb: number
+  overseas_limit_gb: number
+  balance_cash: number | null
+  balance_credit: number | null
   spike_threshold_gb: number | null
   over_limit_action: OverLimitAction
   over_limit_action_label: string
@@ -148,7 +151,8 @@ export interface TrafficPoint {
 export interface TrafficHistoryResponse {
   account_id: number
   bucket: HistoryBucket
-  traffic_limit_gb: number
+  domestic_limit_gb: number
+  overseas_limit_gb: number
   billing_month: string
   threshold_triggered: boolean
   points: TrafficPoint[]
@@ -188,7 +192,8 @@ export interface AccountDto {
   access_key_id: string
   access_key_id_masked: string
   regions: string[]
-  traffic_limit_gb: number
+  domestic_limit_gb: number
+  overseas_limit_gb: number
   spike_threshold_gb: number | null
   over_limit_action: OverLimitAction
   over_limit_action_label: string
@@ -211,7 +216,8 @@ export interface AccountInput {
   /** 编辑时留空表示沿用原密钥 */
   access_key_secret?: string
   regions: string[]
-  traffic_limit_gb: number
+  domestic_limit_gb: number
+  overseas_limit_gb: number
   spike_threshold_gb: number | null
   over_limit_action: OverLimitAction
   stop_mode: StopMode

@@ -225,6 +225,70 @@ pub fn percent_of_limit(bytes: i64, limit_gb: f64) -> f64 {
     ((pct * 100.0).round() / 100.0).clamp(0.0, 9999.99)
 }
 
+// ===========================================================================
+// 流量池
+// ===========================================================================
+
+/// CDT 免费额度按地域分成两个独立计费的池子。
+///
+/// 中国内地每月 20 GB、非中国内地每月 200 GB，**不共享**：超额后各自
+/// 从 0 重新累计阶梯并开始计费。因此熔断必须分池判断，任何「合计阈值」
+/// 都会同时造成漏停（国内已超额但合计没到）和误停（合计到了但两池都还在
+/// 免费额度内）。
+pub const DEFAULT_DOMESTIC_LIMIT_GB: f64 = 20.0;
+pub const DEFAULT_OVERSEAS_LIMIT_GB: f64 = 200.0;
+
+/// 单个流量池的用量与配额。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrafficPool {
+    pub bytes: i64,
+    pub limit_gb: f64,
+}
+
+impl TrafficPool {
+    pub fn new(bytes: i64, limit_gb: f64) -> Self {
+        Self {
+            bytes: bytes.max(0),
+            limit_gb,
+        }
+    }
+
+    /// 是否已达/超配额。配额 <= 0 视为不限制。
+    pub fn exceeded(&self) -> bool {
+        self.limit_gb > 0.0 && self.bytes >= gb_to_bytes(self.limit_gb)
+    }
+
+    pub fn percent(&self) -> f64 {
+        percent_of_limit(self.bytes, self.limit_gb)
+    }
+}
+
+/// 账号的两池用量快照。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrafficPools {
+    pub domestic: TrafficPool,
+    pub overseas: TrafficPool,
+}
+
+impl TrafficPools {
+    /// 任一池超限即需要熔断。
+    pub fn any_exceeded(&self) -> bool {
+        self.domestic.exceeded() || self.overseas.exceeded()
+    }
+
+    /// 已超限的池子名称（用于告警文案）；为空表示都没超。
+    pub fn exceeded_labels(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.domestic.exceeded() {
+            out.push("中国内地");
+        }
+        if self.overseas.exceeded() {
+            out.push("非中国内地");
+        }
+        out
+    }
+}
+
 /// 人类可读的流量文案，例如 `3.42 GiB`。
 pub fn human_bytes(bytes: i64) -> String {
     let value = bytes.max(0) as f64;
@@ -561,7 +625,10 @@ pub struct AccountRow {
     pub access_key_id: String,
     pub encrypted_access_key_secret: String,
     pub regions_json: String,
-    pub traffic_limit_gb: f64,
+    /// 中国内地流量阈值（GB）。
+    pub domestic_limit_gb: f64,
+    /// 非中国内地流量阈值（GB）。
+    pub overseas_limit_gb: f64,
     /// 突变告警阈值（GB）；`None` 表示使用全局默认值。
     pub spike_threshold_gb: Option<f64>,
     pub over_limit_action: String,
@@ -630,7 +697,8 @@ impl AccountRow {
             access_key_id: self.access_key_id.clone(),
             access_key_id_masked: mask_secret(&self.access_key_id),
             regions: self.regions(),
-            traffic_limit_gb: self.traffic_limit_gb,
+            domestic_limit_gb: self.domestic_limit_gb,
+            overseas_limit_gb: self.overseas_limit_gb,
             spike_threshold_gb: self.spike_threshold_gb,
             over_limit_action: self.action(),
             over_limit_action_label: self.action().label().to_string(),
@@ -654,6 +722,8 @@ pub struct SnapshotRow {
     pub account_id: i64,
     pub balance_amount: Option<f64>,
     pub balance_currency: Option<String>,
+    pub balance_cash: Option<f64>,
+    pub balance_credit: Option<f64>,
     pub cdt_domestic_bytes: i64,
     pub cdt_overseas_bytes: i64,
     pub billing_month: String,
@@ -743,6 +813,10 @@ pub struct SnapshotUpdate {
     pub account_id: i64,
     pub balance_amount: Option<f64>,
     pub balance_currency: Option<String>,
+    /// 现金余额（hover 展示用）。
+    pub balance_cash: Option<f64>,
+    /// 信用额度。
+    pub balance_credit: Option<f64>,
     pub cdt_domestic_bytes: i64,
     pub cdt_overseas_bytes: i64,
     pub billing_month: String,
@@ -1098,7 +1172,10 @@ pub struct AccountDto {
     pub access_key_id: String,
     pub access_key_id_masked: String,
     pub regions: Vec<String>,
-    pub traffic_limit_gb: f64,
+    /// 中国内地流量阈值（GB）。
+    pub domestic_limit_gb: f64,
+    /// 非中国内地流量阈值（GB）。
+    pub overseas_limit_gb: f64,
     /// 突变告警阈值（GB）；`None` 表示使用默认值。
     pub spike_threshold_gb: Option<f64>,
     pub over_limit_action: OverLimitAction,
@@ -1126,7 +1203,10 @@ pub struct AccountInput {
     pub access_key_secret: Option<String>,
     #[serde(default)]
     pub regions: Vec<String>,
-    pub traffic_limit_gb: f64,
+    /// 中国内地流量阈值（GB）。
+    pub domestic_limit_gb: f64,
+    /// 非中国内地流量阈值（GB）。
+    pub overseas_limit_gb: f64,
     /// 突变告警阈值（GB）；省略或 `null` 用默认值，0 表示关闭。
     #[serde(default)]
     pub spike_threshold_gb: Option<f64>,
@@ -1188,8 +1268,11 @@ impl AccountInput {
         if self.access_key_id.trim().len() < 8 {
             return Err("AccessKey ID 不合法".to_string());
         }
-        if !self.traffic_limit_gb.is_finite() || self.traffic_limit_gb <= 0.0 {
-            return Err("流量阈值必须大于 0".to_string());
+        if !self.domestic_limit_gb.is_finite() || self.domestic_limit_gb <= 0.0 {
+            return Err("中国内地流量阈值必须大于 0".to_string());
+        }
+        if !self.overseas_limit_gb.is_finite() || self.overseas_limit_gb <= 0.0 {
+            return Err("非中国内地流量阈值必须大于 0".to_string());
         }
         if let Some(time) = self.schedule_start_time.as_deref()
             && !time.trim().is_empty()
@@ -1215,7 +1298,8 @@ pub struct AccountOverview {
     pub site_type: SiteType,
     pub site_label: String,
     pub access_key_id_masked: String,
-    pub traffic_limit_gb: f64,
+    pub domestic_limit_gb: f64,
+    pub overseas_limit_gb: f64,
     pub over_limit_action: OverLimitAction,
     pub over_limit_action_label: String,
     pub stop_mode: StopMode,
@@ -1226,6 +1310,10 @@ pub struct AccountOverview {
     pub enabled: bool,
     pub balance_amount: Option<f64>,
     pub balance_currency: Option<String>,
+    /// 现金余额；`None` 表示接口未返回该字段。
+    pub balance_cash: Option<f64>,
+    /// 信用额度；`None` 表示接口未返回该字段。
+    pub balance_credit: Option<f64>,
     pub cdt_domestic_bytes: i64,
     pub cdt_overseas_bytes: i64,
     pub cdt_total_bytes: i64,
@@ -1265,7 +1353,9 @@ pub struct JobDto {
 pub struct TrafficHistoryResponse {
     pub account_id: i64,
     pub bucket: HistoryBucket,
-    pub traffic_limit_gb: f64,
+    /// 使用所选账号的两个阈值；没有账号时为默认额度。
+    pub domestic_limit_gb: f64,
+    pub overseas_limit_gb: f64,
     pub billing_month: String,
     /// 是否已超过阈值（前端用于图表提示线）。
     pub threshold_triggered: bool,
@@ -1451,6 +1541,8 @@ pub fn build_overview(
         total,
         balance_amount,
         balance_currency,
+        balance_cash,
+        balance_credit,
         updated_at,
         triggered,
         instances,
@@ -1461,11 +1553,13 @@ pub fn build_overview(
             snap.total_bytes(),
             snap.balance_amount,
             snap.balance_currency.clone(),
+            snap.balance_cash,
+            snap.balance_credit,
             Some(snap.updated_at),
             snap.threshold_triggered(&month),
             snap.instances(),
         ),
-        None => (0, 0, 0, None, None, None, false, Vec::new()),
+        None => (0, 0, 0, None, None, None, None, None, false, Vec::new()),
     };
 
     AccountOverview {
@@ -1474,7 +1568,8 @@ pub fn build_overview(
         site_type: account.site(),
         site_label: account.site().label().to_string(),
         access_key_id_masked: mask_secret(&account.access_key_id),
-        traffic_limit_gb: account.traffic_limit_gb,
+        domestic_limit_gb: account.domestic_limit_gb,
+        overseas_limit_gb: account.overseas_limit_gb,
         over_limit_action: account.action(),
         over_limit_action_label: account.action().label().to_string(),
         stop_mode: account.stop_mode(),
@@ -1485,12 +1580,17 @@ pub fn build_overview(
         enabled: account.is_enabled(),
         balance_amount,
         balance_currency,
+        balance_cash,
+        balance_credit,
         cdt_domestic_bytes: domestic,
         cdt_overseas_bytes: overseas,
         cdt_total_bytes: total,
-        domestic_percent: percent_of_limit(domestic, account.traffic_limit_gb),
-        overseas_percent: percent_of_limit(overseas, account.traffic_limit_gb),
-        total_percent: percent_of_limit(total, account.traffic_limit_gb),
+        // 两个池子各按自己的配额算百分比；合计百分比没有意义（配额不同），
+        // 用两池中较高的那个代表整体水位，供卡片进度条与图表参考线使用。
+        domestic_percent: percent_of_limit(domestic, account.domestic_limit_gb),
+        overseas_percent: percent_of_limit(overseas, account.overseas_limit_gb),
+        total_percent: percent_of_limit(domestic, account.domestic_limit_gb)
+            .max(percent_of_limit(overseas, account.overseas_limit_gb)),
         billing_month: month,
         threshold_triggered: triggered,
         snapshot_updated_at: updated_at,
@@ -1656,5 +1756,71 @@ mod tests {
     fn mask() {
         assert_eq!(mask_secret("LTAI5tAbCdEfGhIj"), "LTAI****GhIj");
         assert_eq!(mask_secret("short"), "****");
+    }
+
+    // -----------------------------------------------------------------------
+    // 双池额度
+    // -----------------------------------------------------------------------
+
+    fn pools(domestic_bytes: i64, overseas_bytes: i64) -> TrafficPools {
+        TrafficPools {
+            domestic: TrafficPool::new(domestic_bytes, DEFAULT_DOMESTIC_LIMIT_GB),
+            overseas: TrafficPool::new(overseas_bytes, DEFAULT_OVERSEAS_LIMIT_GB),
+        }
+    }
+
+    #[test]
+    fn domestic_pool_fires_even_when_total_is_well_under_combined() {
+        // 19 GiB 内地 + 19 GiB 非内地 = 38 GiB。合计远低于 200 GiB，
+        // 但内地池已经逼近 20 GiB —— 旧版按合计判定会漏掉这种情况。
+        let p = pools(gb_to_bytes(19.0), gb_to_bytes(19.0));
+        assert!(!p.domestic.exceeded());
+        assert!(!p.overseas.exceeded());
+        assert!(!p.any_exceeded());
+
+        let p = pools(gb_to_bytes(20.0), gb_to_bytes(19.0));
+        assert!(p.domestic.exceeded(), "内地满 20 GiB 应判定超限");
+        assert!(p.any_exceeded());
+        assert_eq!(p.exceeded_labels(), vec!["中国内地"]);
+    }
+
+    #[test]
+    fn overseas_pool_does_not_fire_when_only_near_limit() {
+        // 5 GiB 内地 + 200 GiB 非内地 = 205 GiB。合计超过 200，
+        // 旧版会误判熔断；双池下只有非内地刚好到线。
+        let p = pools(gb_to_bytes(5.0), gb_to_bytes(199.0));
+        assert!(!p.any_exceeded(), "两池都没到线，不应熔断");
+
+        let p = pools(gb_to_bytes(5.0), gb_to_bytes(200.0));
+        assert!(p.overseas.exceeded());
+        assert_eq!(p.exceeded_labels(), vec!["非中国内地"]);
+    }
+
+    #[test]
+    fn both_pools_can_exceed_together() {
+        let p = pools(gb_to_bytes(25.0), gb_to_bytes(210.0));
+        assert!(p.any_exceeded());
+        assert_eq!(p.exceeded_labels(), vec!["中国内地", "非中国内地"]);
+    }
+
+    #[test]
+    fn pool_percent_uses_its_own_limit() {
+        let p = pools(gb_to_bytes(10.0), gb_to_bytes(100.0));
+        assert_eq!(p.domestic.percent(), 50.0);
+        assert_eq!(p.overseas.percent(), 50.0);
+    }
+
+    #[test]
+    fn zero_limit_disables_the_pool() {
+        // 配额为 0 视为不限制，避免用户误填 0 导致立刻熔断。
+        let p = TrafficPool::new(gb_to_bytes(500.0), 0.0);
+        assert!(!p.exceeded());
+    }
+
+    #[test]
+    fn negative_bytes_are_clamped() {
+        let p = TrafficPool::new(-1, DEFAULT_DOMESTIC_LIMIT_GB);
+        assert_eq!(p.bytes, 0);
+        assert_eq!(p.percent(), 0.0);
     }
 }

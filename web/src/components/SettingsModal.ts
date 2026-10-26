@@ -121,7 +121,10 @@ interface AccountForm {
   regions: string[]
   /** 「地区」下拉的当前选择，仅用于筛选地域清单，不提交。 */
   regionGroup: string
-  trafficLimitGb: number
+  /** 中国内地流量阈值（GB）。 */
+  domesticLimitGb: number
+  /** 非中国内地流量阈值（GB）。 */
+  overseasLimitGb: number
   /** 突变告警阈值（GB）；null 表示使用默认值，0 表示关闭 */
   spikeThresholdGb: number | null
   overLimitAction: OverLimitAction
@@ -142,7 +145,8 @@ function blankAccountForm(): AccountForm {
     accessKeySecret: '',
     regions: [...DEFAULT_REGIONS],
     regionGroup: REGION_GROUPS[0],
-    trafficLimitGb: 20,
+    domesticLimitGb: 20,
+    overseasLimitGb: 200,
     spikeThresholdGb: null,
     overLimitAction: 'stop_and_notify',
     stopMode: 'StopCharging',
@@ -195,7 +199,8 @@ function formFromAccount(account: AccountDto): AccountForm {
     accessKeySecret: '',
     regions: [...account.regions],
     regionGroup: groupOfRegion(account.regions[0] ?? ''),
-    trafficLimitGb: account.traffic_limit_gb,
+    domesticLimitGb: account.domestic_limit_gb,
+    overseasLimitGb: account.overseas_limit_gb,
     spikeThresholdGb: account.spike_threshold_gb,
     overLimitAction: account.over_limit_action,
     stopMode: account.stop_mode,
@@ -842,7 +847,7 @@ export class SettingsModal {
       const metaRow = el('div', {
         class: 'mt-1 font-mono text-[0.8125rem]',
         style: { color: 'var(--color-ink-subtle)' },
-        text: `${account.access_key_id_masked} · 阈值 ${account.traffic_limit_gb} GB · ${account.regions.length} 个地域`,
+        text: `${account.access_key_id_masked} · 额度 ${account.domestic_limit_gb}/${account.overseas_limit_gb} GB · ${account.regions.length} 个地域`,
       })
 
       const actions = el(
@@ -1079,10 +1084,18 @@ export class SettingsModal {
         'div',
         { class: 'grid gap-3 sm:grid-cols-3' },
         this.field(
-          '流量阈值（GB）',
-          this.numberInput(form.trafficLimitGb, (value) => {
-            this.form.trafficLimitGb = value
+          '中国内地额度（GB）',
+          this.numberInput(form.domesticLimitGb, (value) => {
+            this.form.domesticLimitGb = value
           }),
+          '默认 20，两个池子分别判定',
+        ),
+        this.field(
+          '非中国内地额度（GB）',
+          this.numberInput(form.overseasLimitGb, (value) => {
+            this.form.overseasLimitGb = value
+          }),
+          '默认 200',
         ),
         this.field(
           '突变告警阈值（GB）',
@@ -1131,6 +1144,12 @@ export class SettingsModal {
           },
         ),
       ),
+
+      el('p', {
+        class: 'text-xs leading-relaxed',
+        style: { color: 'var(--color-ink-subtle)' },
+        text: '抢占式保活会把处于停止状态的抢占实例重新启动。阿里云不区分实例是被系统收回还是手动停机，因此手动停机前请先关闭保活。',
+      }),
 
       el(
         'div',
@@ -1182,7 +1201,8 @@ export class SettingsModal {
       site_type: form.siteType,
       access_key_id: form.accessKeyId.trim(),
       regions: [...form.regions],
-      traffic_limit_gb: Number(form.trafficLimitGb),
+      domestic_limit_gb: Number(form.domesticLimitGb),
+      overseas_limit_gb: Number(form.overseasLimitGb),
       spike_threshold_gb: form.spikeThresholdGb,
       over_limit_action: form.overLimitAction,
       stop_mode: form.stopMode,

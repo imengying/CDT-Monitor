@@ -115,7 +115,7 @@ cdt-monitor/
 
 | 配置 | 位置 |
 |---|---|
-| 阿里云账号、阈值、停机策略、定时、保活 | 设置 → 阿里云账号 |
+| 阿里云账号、额度、停机策略、定时、保活 | 设置 → 阿里云账号 |
 | Turnstile | 设置 → 人机校验 |
 | Telegram | 设置 → Telegram |
 | Bark | 设置 → Bark |
@@ -215,7 +215,7 @@ bun run dev:web                  # :5173
 1. housekeeping（每日一次，锁保护）
      清理过期锁 / 90 天前历史 / 30 天前日志 / 7 天前 Job
 2. 逐账号：CDT 流量 + 余额 + 各地域 ECS 实例 → 写快照 → 采样历史
-3. 阈值判定：合计 ≥ traffic_limit_gb
+3. 额度判定：任一池（内地 / 非内地）超出各自额度
      首次超限 → 标记账期 + 通知 [+ 停机（stop_and_notify）]
 4. 定时关机（20 分钟窗口，失败下轮重试）
 5. 定时开机（同窗口，受熔断闸门约束）
@@ -292,7 +292,7 @@ bun run dev:web                  # :5173
 | 表 | 用途 |
 |---|---|
 | `settings` | KV 配置（时区、日报、TG/Bark 密文、Turnstile 密文） |
-| `accounts` | 阿里云账号（AK、加密 Secret、地域、阈值、策略、定时、保活） |
+| `accounts` | 阿里云账号（AK、加密 Secret、地域、双池额度、策略、定时、保活） |
 | `account_snapshots` | 每账号一行最新状态，首页只读此表 |
 | `traffic_history` | 流量采样（账期累计值），索引 `(account_id, recorded_at)` |
 | `jobs` | 异步任务状态 |
@@ -314,6 +314,57 @@ bun run dev:web                  # :5173
 | ECS 控制 | `StartInstance` / `StopInstance`（含 `StoppedMode`） | 2014-05-26 |
 | 余额 | `QueryAccountBalance` | 2017-12-14 |
 
+### 免费额度与阈值
+
+CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、不合并计算：
+
+| 池 | 免费额度 |
+|---|---|
+| 中国内地 | 20 GB / 月 |
+| 非中国内地（含中国香港） | 200 GB / 月 |
+
+任一池超出即触发熔断。两个池子分别判定，不使用合计阈值 —— 用合计判断会
+同时造成漏停（内地已超额但合计没到）和误停（合计到了但两池都还在额度内）。
+账号的 `domestic_limit_gb` / `overseas_limit_gb` 就是这两条线，默认 20 / 200。
+
+### RAM 最小权限
+
+只读查询 + 实例启停所需的最小策略：
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cdt:ListCdtInternetTraffic",
+        "cdt:GetCdtInternetTraffic"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["bssopenapi:QueryAccountBalance"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["ecs:DescribeInstances"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["ecs:StartInstance", "ecs:StopInstance"],
+      "Resource": "acs:ecs:<region>:<主账号 UID>:instance/<实例 ID>"
+    }
+  ]
+}
+```
+
+`ecs:DescribeInstances` 不能省：启停接口内部会先校验实例状态。
+若实例在 VPC 内且报权限错误，再补 `vpc:DescribeVpcs` 等基础网络查询权限。
+
 签名遵循 RPC V1（`HMAC-SHA1`），含针对官方样例的回归测试：
 
 ```rust
@@ -329,7 +380,7 @@ assert_eq!(sign("testsecret", &to_sign), "OLeaidS1JvxuMvnyHOwuJ+uX5qY=");
 ## 开发与校验
 
 ```bash
-cargo test                                                    # 79 个单元测试
+cargo test                                                    # 85 个单元测试
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 bun run typecheck:web
 bun run check:config

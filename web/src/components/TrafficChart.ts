@@ -262,7 +262,8 @@ export class TrafficChart {
   private buildOption(): EChartsCoreOption {
     const colors = palette()
     const points = this.data?.points ?? []
-    const limitGb = this.data?.traffic_limit_gb ?? 0
+    const domesticLimitGb = this.data?.domestic_limit_gb ?? 0
+    const overseasLimitGb = this.data?.overseas_limit_gb ?? 0
     const exceeded = this.data?.threshold_triggered ?? false
 
     const labels = points.map((point) =>
@@ -395,18 +396,39 @@ export class TrafficChart {
           itemStyle: { color: colors.muted },
           data: total,
           markLine:
-            limitGb > 0
+            domesticLimitGb > 0 || overseasLimitGb > 0
               ? {
                   silent: true,
                   symbol: 'none',
-                  label: {
-                    formatter: `配额 ${limitGb} GB`,
-                    color: colors.danger,
-                    fontSize: 10,
-                    position: 'insideEndTop',
-                  },
                   lineStyle: { color: colors.danger, type: 'dashed', width: 1 },
-                  data: [{ yAxis: limitGb }],
+                  data: [
+                    ...(domesticLimitGb > 0
+                      ? [
+                          {
+                            yAxis: domesticLimitGb,
+                            label: {
+                              formatter: `内地 ${domesticLimitGb} GB`,
+                              color: colors.danger,
+                              fontSize: 10,
+                              position: 'insideEndTop' as const,
+                            },
+                          },
+                        ]
+                      : []),
+                    ...(overseasLimitGb > 0
+                      ? [
+                          {
+                            yAxis: overseasLimitGb,
+                            label: {
+                              formatter: `非内地 ${overseasLimitGb} GB`,
+                              color: colors.danger,
+                              fontSize: 10,
+                              position: 'insideEndBottom' as const,
+                            },
+                          },
+                        ]
+                      : []),
+                  ],
                 }
               : undefined,
         },
