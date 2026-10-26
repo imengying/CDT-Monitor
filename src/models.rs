@@ -123,6 +123,19 @@ pub fn billing_month(ms: i64, tz: &str) -> String {
     format!("{:04}-{:02}", dt.year(), dt.month())
 }
 
+/// 本地当天 00:00 对应的 Unix 毫秒。
+pub fn local_day_start_ms(ms: i64, tz: &str) -> i64 {
+    let dt = local_datetime(ms, tz);
+    let offset_ms = utc_offset_minutes(tz) as i64 * 60_000;
+    let naive_start = dt
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_default()
+        .and_utc()
+        .timestamp_millis();
+    naive_start - offset_ms
+}
+
 /// 本地日期 `YYYY-MM-DD`，用于「每日任务只执行一次」的去重标记。
 pub fn local_date(ms: i64, tz: &str) -> String {
     let dt = local_datetime(ms, tz);
@@ -223,67 +236,101 @@ pub fn percent_of_limit(bytes: i64, limit_gb: f64) -> f64 {
 }
 
 // ===========================================================================
-// 流量池
+// CDT 额度池
 // ===========================================================================
 
-/// CDT 免费额度按地域分成两个独立计费的池子。
+/// CDT 免费额度按地域分两档：中国内地 20 GB/月，其余（含中国香港）200 GB/月。
 ///
-/// 中国内地每月 20 GB、非中国内地每月 200 GB，**不共享**：超额后各自
-/// 从 0 重新累计阶梯并开始计费。因此熔断必须分池判断，任何「合计阈值」
-/// 都会同时造成漏停（国内已超额但合计没到）和误停（合计到了但两池都还在
-/// 免费额度内）。
-pub const DEFAULT_DOMESTIC_LIMIT_GB: f64 = 20.0;
-pub const DEFAULT_OVERSEAS_LIMIT_GB: f64 = 200.0;
+/// 一个账号只落在一个池里 —— 由它的 `region_id` 决定，因此查询 CDT 用量时
+/// 只需取对应那一类的累计值，不需要自己两池相加。
+pub const DOMESTIC_QUOTA_GB: f64 = 20.0;
+pub const OVERSEAS_QUOTA_GB: f64 = 200.0;
 
-/// 单个流量池的用量与配额。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TrafficPool {
-    pub bytes: i64,
-    pub limit_gb: f64,
+/// 地域 ID → 中文名。与前端下拉共用同一份清单，避免两边不一致。
+pub struct RegionName;
+
+impl RegionName {
+    /// 已知地域的中文名；不认识的返回原始 ID。
+    pub fn of(region_id: &str) -> &str {
+        match region_id.trim() {
+            "cn-hongkong" => "中国香港",
+            "cn-hangzhou" => "华东 1（杭州）",
+            "cn-shanghai" => "华东 2（上海）",
+            "cn-qingdao" => "华北 1（青岛）",
+            "cn-beijing" => "华北 2（北京）",
+            "cn-zhangjiakou" => "华北 3（张家口）",
+            "cn-huhehaote" => "华北 5（呼和浩特）",
+            "cn-wulanchabu" => "华北 6（乌兰察布）",
+            "cn-shenzhen" => "华南 1（深圳）",
+            "cn-heyuan" => "华南 2（河源）",
+            "cn-guangzhou" => "华南 3（广州）",
+            "cn-chengdu" => "西南 1（成都）",
+            "ap-southeast-1" => "新加坡",
+            "ap-northeast-1" => "日本（东京）",
+            "ap-northeast-2" => "韩国（首尔）",
+            "us-west-1" => "美国（硅谷）",
+            "us-east-1" => "美国（弗吉尼亚）",
+            other => other,
+        }
+    }
 }
 
-impl TrafficPool {
-    pub fn new(bytes: i64, limit_gb: f64) -> Self {
-        Self {
-            bytes: bytes.max(0),
-            limit_gb,
+/// 账号所属的额度池。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaPool {
+    /// 中国内地地域。
+    Domestic,
+    /// 非中国内地（中国香港及海外）。
+    Overseas,
+}
+
+impl QuotaPool {
+    /// 按地域 ID 归类。
+    ///
+    /// `cn-` 开头且不是 `cn-hongkong` 的算中国内地，其余一律非中国内地。
+    /// 香港虽然 `cn-` 开头，但计费上属于海外池。
+    pub fn of_region(region_id: &str) -> Self {
+        let lower = region_id.trim().to_ascii_lowercase();
+        if lower.starts_with("cn-") && lower != "cn-hongkong" {
+            Self::Domestic
+        } else {
+            Self::Overseas
         }
     }
 
-    /// 是否已达/超配额。配额 <= 0 视为不限制。
-    pub fn exceeded(&self) -> bool {
-        self.limit_gb > 0.0 && self.bytes >= gb_to_bytes(self.limit_gb)
+    /// 该池的免费额度（GB）。
+    pub fn quota_gb(self) -> f64 {
+        match self {
+            Self::Domestic => DOMESTIC_QUOTA_GB,
+            Self::Overseas => OVERSEAS_QUOTA_GB,
+        }
     }
 
-    pub fn percent(&self) -> f64 {
-        percent_of_limit(self.bytes, self.limit_gb)
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Domestic => "中国内地",
+            Self::Overseas => "非中国内地",
+        }
     }
 }
 
-/// 账号的两池用量快照。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TrafficPools {
-    pub domestic: TrafficPool,
-    pub overseas: TrafficPool,
+/// 百分比：`used_gb / total_gb * 100`，保留两位小数。
+pub fn percent_of(used_gb: f64, total_gb: f64) -> f64 {
+    if !total_gb.is_finite() || total_gb <= 0.0 {
+        return 0.0;
+    }
+    let pct = (used_gb.max(0.0) / total_gb) * 100.0;
+    ((pct * 100.0).round() / 100.0).clamp(0.0, 9999.99)
 }
 
-impl TrafficPools {
-    /// 任一池超限即需要熔断。
-    pub fn any_exceeded(&self) -> bool {
-        self.domestic.exceeded() || self.overseas.exceeded()
+/// 用量是否达到告警阈值。
+///
+/// `threshold_gb <= 0` 表示不限制也不告警；否则达到或超过即触发。
+pub fn threshold_reached(used_gb: f64, threshold_gb: f64) -> bool {
+    if !threshold_gb.is_finite() || threshold_gb <= 0.0 {
+        return false;
     }
-
-    /// 已超限的池子名称（用于告警文案）；为空表示都没超。
-    pub fn exceeded_labels(&self) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        if self.domestic.exceeded() {
-            out.push("中国内地");
-        }
-        if self.overseas.exceeded() {
-            out.push("非中国内地");
-        }
-        out
-    }
+    used_gb.is_finite() && used_gb >= threshold_gb
 }
 
 /// 人类可读的流量文案，例如 `3.42 GiB`。
@@ -300,33 +347,6 @@ pub fn human_bytes(bytes: i64) -> String {
         idx += 1;
     }
     format!("{:.2} {}", scaled, units[idx])
-}
-
-// ===========================================================================
-// 突变检测
-// ===========================================================================
-
-/// 判断单次采样是否为异常突变。
-///
-/// 只对「本次比上次增长超过 `threshold_bytes`」告警，且要求距上次采样足够近：
-/// 若上次采样是三天前，增长很大是正常的，不是突变。
-pub fn is_traffic_spike(
-    previous_bytes: i64,
-    current_bytes: i64,
-    since_last_ms: i64,
-    threshold_bytes: i64,
-    max_gap_ms: i64,
-) -> bool {
-    if previous_bytes < 0 || current_bytes <= previous_bytes {
-        return false;
-    }
-    if since_last_ms <= 0 || since_last_ms > max_gap_ms {
-        return false;
-    }
-    if threshold_bytes <= 0 {
-        return false;
-    }
-    current_bytes - previous_bytes >= threshold_bytes
 }
 
 /// 金额文案，例如 `¥ 12.30`。
@@ -621,13 +641,12 @@ pub struct AccountRow {
     pub site_type: String,
     pub access_key_id: String,
     pub encrypted_access_key_secret: String,
-    pub regions_json: String,
-    /// 中国内地流量阈值（GB）。
-    pub domestic_limit_gb: f64,
-    /// 非中国内地流量阈值（GB）。
-    pub overseas_limit_gb: f64,
-    /// 突变告警阈值（GB）；`None` 表示使用全局默认值。
-    pub spike_threshold_gb: Option<f64>,
+    /// 地域 ID，单值。决定实例所在位置与 CDT 额度池。
+    pub region_id: String,
+    /// 实例 ID；为空时该账号只统计流量、不管理实例。
+    pub instance_id: Option<String>,
+    /// 告警阈值（GB）。0 表示不限制也不告警。
+    pub traffic_threshold_gb: f64,
     pub over_limit_action: String,
     pub stop_mode: String,
     pub schedule_start_time: Option<String>,
@@ -661,18 +680,17 @@ impl AccountRow {
         self.spot_keep_alive != 0
     }
 
-    /// 账号配置的地域列表。
-    ///
-    /// 为空表示「不采集实例」—— CDT 流量与余额不依赖地域，照常查询。
-    /// 此前空列表会回退到内置的四个默认地域，导致用户明明没勾任何地域，
-    /// 却在后台悄悄查了四个，与界面呈现不符。
-    pub fn regions(&self) -> Vec<String> {
-        let parsed: Vec<String> = serde_json::from_str(&self.regions_json).unwrap_or_default();
-        parsed
-            .into_iter()
-            .map(|r| r.trim().to_string())
-            .filter(|r| !r.is_empty())
-            .collect()
+    /// 该地域属于哪个额度池 —— 中国内地 20 GB，其余（含香港）200 GB。
+    pub fn quota_pool(&self) -> QuotaPool {
+        QuotaPool::of_region(&self.region_id)
+    }
+
+    /// 实例 ID（去掉空白）；为空表示不管理实例。
+    pub fn instance_id_opt(&self) -> Option<&str> {
+        self.instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     pub fn schedule_start_minutes(&self) -> Option<u32> {
@@ -692,10 +710,12 @@ impl AccountRow {
             site_label: self.site().label().to_string(),
             access_key_id: self.access_key_id.clone(),
             access_key_id_masked: mask_secret(&self.access_key_id),
-            regions: self.regions(),
-            domestic_limit_gb: self.domestic_limit_gb,
-            overseas_limit_gb: self.overseas_limit_gb,
-            spike_threshold_gb: self.spike_threshold_gb,
+            region_id: self.region_id.clone(),
+            region_name: RegionName::of(&self.region_id).to_string(),
+            instance_id: self.instance_id.clone(),
+            traffic_threshold_gb: self.traffic_threshold_gb,
+            quota_gb: self.quota_pool().quota_gb(),
+            quota_label: self.quota_pool().label().to_string(),
             over_limit_action: self.action(),
             over_limit_action_label: self.action().label().to_string(),
             stop_mode: self.stop_mode(),
@@ -820,14 +840,20 @@ pub struct SnapshotUpdate {
     pub updated_at: i64,
 }
 
-/// `traffic_history` 表里的一个采样点（图表里的一个桶）。
+/// 一个流量采样点：某个小时 / 某天的**当月累计用量**。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrafficPoint {
+pub struct TrafficSample {
     /// 桶起始时间（Unix 毫秒）。
     pub recorded_at: i64,
-    pub domestic_bytes: i64,
-    pub overseas_bytes: i64,
-    pub total_bytes: i64,
+    /// 当月累计流量（GB）。
+    pub traffic_gb: f64,
+}
+
+/// 历史流量的两种粒度。
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficHistory {
+    pub hourly: Vec<TrafficSample>,
+    pub daily: Vec<TrafficSample>,
 }
 
 /// `jobs` 表行。
@@ -1167,13 +1193,14 @@ pub struct AccountDto {
     pub site_label: String,
     pub access_key_id: String,
     pub access_key_id_masked: String,
-    pub regions: Vec<String>,
-    /// 中国内地流量阈值（GB）。
-    pub domestic_limit_gb: f64,
-    /// 非中国内地流量阈值（GB）。
-    pub overseas_limit_gb: f64,
-    /// 突变告警阈值（GB）；`None` 表示使用默认值。
-    pub spike_threshold_gb: Option<f64>,
+    pub region_id: String,
+    pub region_name: String,
+    pub instance_id: Option<String>,
+    /// 告警阈值（GB）。0 表示不限制也不告警。
+    pub traffic_threshold_gb: f64,
+    /// 该地域所属池的免费额度（GB），只读展示。
+    pub quota_gb: f64,
+    pub quota_label: String,
     pub over_limit_action: OverLimitAction,
     pub over_limit_action_label: String,
     pub stop_mode: StopMode,
@@ -1197,15 +1224,12 @@ pub struct AccountInput {
     /// 修改时留空表示沿用原密钥。
     #[serde(default)]
     pub access_key_secret: Option<String>,
+    pub region_id: String,
     #[serde(default)]
-    pub regions: Vec<String>,
-    /// 中国内地流量阈值（GB）。
-    pub domestic_limit_gb: f64,
-    /// 非中国内地流量阈值（GB）。
-    pub overseas_limit_gb: f64,
-    /// 突变告警阈值（GB）；省略或 `null` 用默认值，0 表示关闭。
+    pub instance_id: Option<String>,
+    /// 告警阈值（GB）。0 表示不限制也不告警。
     #[serde(default)]
-    pub spike_threshold_gb: Option<f64>,
+    pub traffic_threshold_gb: f64,
     pub over_limit_action: OverLimitAction,
     pub stop_mode: StopMode,
     #[serde(default)]
@@ -1223,21 +1247,18 @@ fn default_true() -> bool {
 }
 
 impl AccountInput {
-    /// 归一化后的地域列表（去空白、去重、保序）。
-    pub fn normalized_regions(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for region in &self.regions {
-            let trimmed = region.trim();
-            if trimmed.is_empty() || out.iter().any(|r| r == trimmed) {
-                continue;
-            }
-            out.push(trimmed.to_string());
-        }
-        out
+    /// 归一化后的地域 ID（去空白）。
+    pub fn normalized_region(&self) -> String {
+        self.region_id.trim().to_ascii_lowercase()
     }
 
-    pub fn regions_json(&self) -> String {
-        serde_json::to_string(&self.normalized_regions()).unwrap_or_else(|_| "[]".to_string())
+    /// 归一化后的实例 ID；空串视为未配置。
+    pub fn normalized_instance_id(&self) -> Option<String> {
+        self.instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     }
 
     pub fn schedule_start_minutes(&self) -> Option<u32> {
@@ -1264,11 +1285,11 @@ impl AccountInput {
         if self.access_key_id.trim().len() < 8 {
             return Err("AccessKey ID 不合法".to_string());
         }
-        if !self.domestic_limit_gb.is_finite() || self.domestic_limit_gb <= 0.0 {
-            return Err("中国内地流量阈值必须大于 0".to_string());
+        if self.normalized_region().is_empty() {
+            return Err("请选择地域".to_string());
         }
-        if !self.overseas_limit_gb.is_finite() || self.overseas_limit_gb <= 0.0 {
-            return Err("非中国内地流量阈值必须大于 0".to_string());
+        if !self.traffic_threshold_gb.is_finite() || self.traffic_threshold_gb < 0.0 {
+            return Err("告警阈值不能为负数".to_string());
         }
         if let Some(time) = self.schedule_start_time.as_deref()
             && !time.trim().is_empty()
@@ -1294,8 +1315,14 @@ pub struct AccountOverview {
     pub site_type: SiteType,
     pub site_label: String,
     pub access_key_id_masked: String,
-    pub domestic_limit_gb: f64,
-    pub overseas_limit_gb: f64,
+    pub region_id: String,
+    pub region_name: String,
+    pub instance_id: Option<String>,
+    /// 告警阈值（GB）。0 表示不限制也不告警。
+    pub traffic_threshold_gb: f64,
+    /// 该地域所属池的免费额度（GB）。
+    pub quota_gb: f64,
+    pub quota_label: String,
     pub over_limit_action: OverLimitAction,
     pub over_limit_action_label: String,
     pub stop_mode: StopMode,
@@ -1310,12 +1337,14 @@ pub struct AccountOverview {
     pub balance_cash: Option<f64>,
     /// 信用额度；`None` 表示接口未返回该字段。
     pub balance_credit: Option<f64>,
-    pub cdt_domestic_bytes: i64,
-    pub cdt_overseas_bytes: i64,
-    pub cdt_total_bytes: i64,
-    pub domestic_percent: f64,
-    pub overseas_percent: f64,
-    pub total_percent: f64,
+    /// 该账号所属池的当月累计用量（GB）。
+    pub traffic_used_gb: f64,
+    /// 相对免费额度的百分比。
+    pub percentage: f64,
+    /// 相对账号阈值的百分比（阈值为 0 时为 0）。
+    pub threshold_percentage: f64,
+    /// 是否已达到账号设定的告警阈值。
+    pub over_threshold: bool,
     pub billing_month: String,
     /// 本月是否已触发流量熔断（熔断后禁止任何自动/手动开机）。
     pub threshold_triggered: bool,
@@ -1347,15 +1376,13 @@ pub struct JobDto {
 /// 流量历史响应。
 #[derive(Debug, Clone, Serialize)]
 pub struct TrafficHistoryResponse {
-    pub account_id: i64,
-    pub bucket: HistoryBucket,
-    /// 使用所选账号的两个阈值；没有账号时为默认额度。
-    pub domestic_limit_gb: f64,
-    pub overseas_limit_gb: f64,
+    pub history: TrafficHistory,
+    /// 账号的告警阈值（GB），0 表示不限制。
+    pub traffic_threshold_gb: f64,
+    /// 该账号地域所属池的免费额度（GB）。
+    pub quota_gb: f64,
     pub billing_month: String,
-    /// 是否已超过阈值（前端用于图表提示线）。
     pub threshold_triggered: bool,
-    pub points: Vec<TrafficPoint>,
 }
 
 /// 图表查询参数（从 URL query 解析而来）。
@@ -1531,10 +1558,11 @@ pub fn build_overview(
     now: i64,
 ) -> AccountOverview {
     let month = billing_month(now, timezone);
+    let pool = account.quota_pool();
+    let quota_gb = pool.quota_gb();
+
     let (
-        domestic,
-        overseas,
-        total,
+        used_bytes,
         balance_amount,
         balance_currency,
         balance_cash,
@@ -1544,9 +1572,10 @@ pub fn build_overview(
         instances,
     ) = match snapshot {
         Some(snap) => (
-            snap.cdt_domestic_bytes.max(0),
-            snap.cdt_overseas_bytes.max(0),
-            snap.total_bytes(),
+            match pool {
+                QuotaPool::Domestic => snap.cdt_domestic_bytes.max(0),
+                QuotaPool::Overseas => snap.cdt_overseas_bytes.max(0),
+            },
             snap.balance_amount,
             snap.balance_currency.clone(),
             snap.balance_cash,
@@ -1555,8 +1584,11 @@ pub fn build_overview(
             snap.threshold_triggered(&month),
             snap.instances(),
         ),
-        None => (0, 0, 0, None, None, None, None, None, false, Vec::new()),
+        None => (0, None, None, None, None, None, false, Vec::new()),
     };
+
+    // 卡片与图表都按 GB 展示，统一在这里换算一次。
+    let used_gb = bytes_to_gb(used_bytes);
 
     AccountOverview {
         id: account.id,
@@ -1564,8 +1596,12 @@ pub fn build_overview(
         site_type: account.site(),
         site_label: account.site().label().to_string(),
         access_key_id_masked: mask_secret(&account.access_key_id),
-        domestic_limit_gb: account.domestic_limit_gb,
-        overseas_limit_gb: account.overseas_limit_gb,
+        region_id: account.region_id.clone(),
+        region_name: RegionName::of(&account.region_id).to_string(),
+        instance_id: account.instance_id.clone(),
+        traffic_threshold_gb: account.traffic_threshold_gb,
+        quota_gb: account.quota_pool().quota_gb(),
+        quota_label: account.quota_pool().label().to_string(),
         over_limit_action: account.action(),
         over_limit_action_label: account.action().label().to_string(),
         stop_mode: account.stop_mode(),
@@ -1578,15 +1614,10 @@ pub fn build_overview(
         balance_currency,
         balance_cash,
         balance_credit,
-        cdt_domestic_bytes: domestic,
-        cdt_overseas_bytes: overseas,
-        cdt_total_bytes: total,
-        // 两个池子各按自己的配额算百分比；合计百分比没有意义（配额不同），
-        // 用两池中较高的那个代表整体水位，供卡片进度条与图表参考线使用。
-        domestic_percent: percent_of_limit(domestic, account.domestic_limit_gb),
-        overseas_percent: percent_of_limit(overseas, account.overseas_limit_gb),
-        total_percent: percent_of_limit(domestic, account.domestic_limit_gb)
-            .max(percent_of_limit(overseas, account.overseas_limit_gb)),
+        traffic_used_gb: used_gb,
+        percentage: percent_of(used_gb, quota_gb),
+        threshold_percentage: percent_of(used_gb, account.traffic_threshold_gb),
+        over_threshold: threshold_reached(used_gb, account.traffic_threshold_gb),
         billing_month: month,
         threshold_triggered: triggered,
         snapshot_updated_at: updated_at,
@@ -1637,34 +1668,6 @@ mod tests {
         assert!(!is_supported_timezone("UTC+8:15"), "非白名单取值应被拒绝");
         assert!(!is_supported_timezone("Asia/Shanghai"), "不支持 IANA 名称");
         assert!(!is_supported_timezone(""));
-    }
-
-    #[test]
-    fn spike_detection() {
-        let gb = gb_to_bytes(1.0);
-        let one_hour = 60 * 60 * 1000;
-        // 一小时内涨了 2 GiB，阈值 1 GiB → 是突变
-        assert!(is_traffic_spike(gb, gb * 3, one_hour, gb, 2 * one_hour));
-        // 涨得不够多 → 不算
-        assert!(!is_traffic_spike(
-            gb,
-            gb + gb / 2,
-            one_hour,
-            gb,
-            2 * one_hour
-        ));
-        // 时间跨度太长 → 正常增长，不算突变
-        assert!(!is_traffic_spike(
-            gb,
-            gb * 10,
-            48 * one_hour,
-            gb,
-            2 * one_hour
-        ));
-        // 流量下降（账期重置）→ 不算
-        assert!(!is_traffic_spike(gb * 5, gb, one_hour, gb, 2 * one_hour));
-        // 阈值 <= 0 → 关闭
-        assert!(!is_traffic_spike(gb, gb * 100, one_hour, 0, 2 * one_hour));
     }
 
     #[test]
@@ -1755,115 +1758,67 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 地域列表
+    // 额度池划分
     // -----------------------------------------------------------------------
 
-    fn account_row_with_regions(json: &str) -> AccountRow {
-        AccountRow {
-            id: 1,
-            name: "t".to_string(),
-            site_type: "china".to_string(),
-            access_key_id: "LTAI5tTestKey".to_string(),
-            encrypted_access_key_secret: "x".to_string(),
-            regions_json: json.to_string(),
-            domestic_limit_gb: DEFAULT_DOMESTIC_LIMIT_GB,
-            overseas_limit_gb: DEFAULT_OVERSEAS_LIMIT_GB,
-            spike_threshold_gb: None,
-            over_limit_action: "stop_and_notify".to_string(),
-            stop_mode: "StopCharging".to_string(),
-            schedule_start_time: None,
-            schedule_stop_time: None,
-            spot_keep_alive: 0,
-            enabled: 1,
-            last_schedule_start_date: None,
-            last_schedule_stop_date: None,
-            created_at: 0,
-            updated_at: 0,
+    #[test]
+    fn hongkong_belongs_to_overseas_pool() {
+        // 香港虽然是 cn- 开头，但计费上算非中国内地，额度 200 GB
+        assert_eq!(QuotaPool::of_region("cn-hongkong"), QuotaPool::Overseas);
+        assert_eq!(QuotaPool::of_region("cn-hongkong").quota_gb(), 200.0);
+    }
+
+    #[test]
+    fn mainland_regions_belong_to_domestic_pool() {
+        for region in ["cn-hangzhou", "cn-beijing", "cn-shanghai", "cn-shenzhen", "cn-chengdu"] {
+            assert_eq!(
+                QuotaPool::of_region(region),
+                QuotaPool::Domestic,
+                "{region} 应算中国内地"
+            );
+            assert_eq!(QuotaPool::of_region(region).quota_gb(), 20.0);
         }
     }
 
     #[test]
-    fn empty_regions_mean_no_instance_scan() {
-        // 用户界面默认不勾任何地域，此时不应偷偷去查默认的四个。
-        let row = account_row_with_regions("[]");
-        assert!(row.regions().is_empty());
-    }
-
-    #[test]
-    fn regions_are_trimmed_and_blank_removed() {
-        let row = account_row_with_regions(r#"[" cn-hongkong ", "", "  ", "ap-southeast-1"]"#);
-        assert_eq!(row.regions(), vec!["cn-hongkong", "ap-southeast-1"]);
-    }
-
-    #[test]
-    fn malformed_regions_json_yields_empty() {
-        let row = account_row_with_regions("not-json");
-        assert!(row.regions().is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // 双池额度
-    // -----------------------------------------------------------------------
-
-    fn pools(domestic_bytes: i64, overseas_bytes: i64) -> TrafficPools {
-        TrafficPools {
-            domestic: TrafficPool::new(domestic_bytes, DEFAULT_DOMESTIC_LIMIT_GB),
-            overseas: TrafficPool::new(overseas_bytes, DEFAULT_OVERSEAS_LIMIT_GB),
+    fn overseas_regions_use_200gb_quota() {
+        for region in ["ap-southeast-1", "ap-northeast-1", "us-west-1", "eu-central-1"] {
+            assert_eq!(
+                QuotaPool::of_region(region),
+                QuotaPool::Overseas,
+                "{region} 应算非中国内地"
+            );
+            assert_eq!(QuotaPool::of_region(region).quota_gb(), 200.0);
         }
     }
 
     #[test]
-    fn domestic_pool_fires_even_when_total_is_well_under_combined() {
-        // 19 GiB 内地 + 19 GiB 非内地 = 38 GiB。合计远低于 200 GiB，
-        // 但内地池已经逼近 20 GiB —— 旧版按合计判定会漏掉这种情况。
-        let p = pools(gb_to_bytes(19.0), gb_to_bytes(19.0));
-        assert!(!p.domestic.exceeded());
-        assert!(!p.overseas.exceeded());
-        assert!(!p.any_exceeded());
+    fn region_matching_is_case_insensitive_and_trimmed() {
+        assert_eq!(QuotaPool::of_region(" CN-Hangzhou "), QuotaPool::Domestic);
+        assert_eq!(QuotaPool::of_region("CN-HONGKONG"), QuotaPool::Overseas);
+    }
 
-        let p = pools(gb_to_bytes(20.0), gb_to_bytes(19.0));
-        assert!(p.domestic.exceeded(), "内地满 20 GiB 应判定超限");
-        assert!(p.any_exceeded());
-        assert_eq!(p.exceeded_labels(), vec!["中国内地"]);
+    // -----------------------------------------------------------------------
+    // 告警阈值
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_threshold_means_unlimited() {
+        // 0 = 不限制也不告警，任何用量都不该触发
+        assert!(!threshold_reached(0.0, 0.0));
+        assert!(!threshold_reached(999.0, 0.0));
+        assert!(!threshold_reached(0.0, 0.0));
     }
 
     #[test]
-    fn overseas_pool_does_not_fire_when_only_near_limit() {
-        // 5 GiB 内地 + 200 GiB 非内地 = 205 GiB。合计超过 200，
-        // 旧版会误判熔断；双池下只有非内地刚好到线。
-        let p = pools(gb_to_bytes(5.0), gb_to_bytes(199.0));
-        assert!(!p.any_exceeded(), "两池都没到线，不应熔断");
-
-        let p = pools(gb_to_bytes(5.0), gb_to_bytes(200.0));
-        assert!(p.overseas.exceeded());
-        assert_eq!(p.exceeded_labels(), vec!["非中国内地"]);
+    fn threshold_triggers_at_or_above_value() {
+        assert!(!threshold_reached(199.99, 200.0));
+        assert!(threshold_reached(200.0, 200.0), "刚好到线就应触发");
+        assert!(threshold_reached(201.0, 200.0));
     }
 
     #[test]
-    fn both_pools_can_exceed_together() {
-        let p = pools(gb_to_bytes(25.0), gb_to_bytes(210.0));
-        assert!(p.any_exceeded());
-        assert_eq!(p.exceeded_labels(), vec!["中国内地", "非中国内地"]);
-    }
-
-    #[test]
-    fn pool_percent_uses_its_own_limit() {
-        let p = pools(gb_to_bytes(10.0), gb_to_bytes(100.0));
-        assert_eq!(p.domestic.percent(), 50.0);
-        assert_eq!(p.overseas.percent(), 50.0);
-    }
-
-    #[test]
-    fn zero_limit_disables_the_pool() {
-        // 配额为 0 视为不限制，避免用户误填 0 导致立刻熔断。
-        let p = TrafficPool::new(gb_to_bytes(500.0), 0.0);
-        assert!(!p.exceeded());
-    }
-
-    #[test]
-    fn negative_bytes_are_clamped() {
-        let p = TrafficPool::new(-1, DEFAULT_DOMESTIC_LIMIT_GB);
-        assert_eq!(p.bytes, 0);
-        assert_eq!(p.percent(), 0.0);
+    fn negative_threshold_is_treated_as_unlimited() {
+        assert!(!threshold_reached(500.0, -1.0));
     }
 }

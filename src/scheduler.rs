@@ -29,17 +29,17 @@
 //! 这段本地时间窗口内让路——否则保活会把刚被计划停机的实例重新拉起，
 //! 使定时策略失效。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use crate::aliyun::AliyunClient;
 use crate::crypto::{Crypto, random_hex};
 use crate::db::Db;
 use crate::models::{
     AccountOverview, AccountRow, BarkConfig, DailyReportConfig, HistoryBucket, InstanceInfo,
-    NotifyChannel, OverLimitAction, SnapshotRow, SnapshotUpdate, TelegramConfig, TrafficPoint,
-    TrafficPool, TrafficPools,
-    build_overview, gb_to_bytes, human_amount, human_bytes, local_date, local_minutes_of_day,
-    now_ms, parse_hhmm, setting_key, utc_offset_minutes, within_window,
+    NotifyChannel, OverLimitAction, QuotaPool, SnapshotRow, SnapshotUpdate, TelegramConfig,
+    build_overview, bytes_to_gb, human_amount, local_date,
+    local_day_start_ms,
+    local_minutes_of_day, now_ms, parse_hhmm, setting_key, threshold_reached, within_window,
 };
 use crate::notify::{
     BarkChannel, Channels, Message, NotifyLevel, NotifyOutcome, TelegramChannel, dispatch,
@@ -61,41 +61,11 @@ pub const LOG_RETENTION_DAYS: i64 = 30;
 pub const JOB_RETENTION_DAYS: i64 = 7;
 /// 单实例动作锁 TTL（分钟）。
 pub const INSTANCE_LOCK_TTL_MINUTES: i64 = 30;
-/// 突变告警的默认阈值（GiB）：单次采样间隔内增长超过此值即告警。
-pub const DEFAULT_SPIKE_THRESHOLD_GB: f64 = 5.0;
-/// 突变判定允许的最大采样间隔：超过则视为正常增长（例如 Cron 停跑一整天）。
-pub const SPIKE_MAX_GAP_MS: i64 = 2 * 60 * 60 * 1000;
 
 // ===========================================================================
 // 辅助函数
 // ===========================================================================
 
-/// 突变阈值（GB）。账号可覆盖，`None` 用默认值。
-fn spike_threshold_gb(account: &AccountRow) -> f64 {
-    account
-        .spike_threshold_gb
-        .unwrap_or(DEFAULT_SPIKE_THRESHOLD_GB)
-        .max(0.0)
-}
-
-/// 把毫秒间隔转成便于阅读的时长。
-fn human_duration(ms: i64) -> String {
-    let minutes = (ms.max(0) / 60_000).max(1);
-    if minutes < 60 {
-        return format!("{minutes} 分钟");
-    }
-    let hours = minutes / 60;
-    let rest = minutes % 60;
-    if hours < 24 {
-        if rest == 0 {
-            format!("{hours} 小时")
-        } else {
-            format!("{hours} 小时 {rest} 分钟")
-        }
-    } else {
-        format!("{} 天", hours / 24)
-    }
-}
 
 // ===========================================================================
 // 结果结构
@@ -113,8 +83,6 @@ pub struct RefreshOutcome {
     pub overseas_bytes: i64,
     /// 本次刷新是否**新触发**了熔断。
     pub threshold_fired: bool,
-    /// 本次采样是否检测到异常增长（已发出告警）。
-    pub spike_detected: bool,
     /// 局部失败 / 提示信息。
     pub warnings: Vec<String>,
 }
@@ -129,7 +97,6 @@ impl RefreshOutcome {
             domestic_bytes: 0,
             overseas_bytes: 0,
             threshold_fired: false,
-            spike_detected: false,
             warnings: vec![error],
         }
     }
@@ -142,7 +109,6 @@ pub struct CronReport {
     pub accounts_refreshed: usize,
     pub accounts_failed: usize,
     pub thresholds_fired: usize,
-    pub spikes_detected: usize,
     pub instances_started: usize,
     pub instances_stopped: usize,
     pub keep_alive_started: usize,
@@ -155,12 +121,11 @@ impl CronReport {
     /// 单行摘要。
     pub fn summary(&self) -> String {
         format!(
-            "账号 {}/{} 刷新成功，失败 {}，熔断 {}，突变 {}，停机 {}，开机 {}，保活 {}，日报 {}",
+            "账号 {}/{} 刷新成功，失败 {}，熔断 {}，停机 {}，开机 {}，保活 {}，日报 {}",
             self.accounts_refreshed,
             self.accounts_total,
             self.accounts_failed,
             self.thresholds_fired,
-            self.spikes_detected,
             self.instances_stopped,
             self.instances_started,
             self.keep_alive_started,
@@ -318,7 +283,7 @@ impl Scheduler {
     ///
     /// 用于周期性巡检产生的告警：Cron 每 15 分钟一轮，若不加抑制，
     /// 一次持续异常会连续轰炸。去重键应包含「异常主体 + 时间片」，
-    /// 例如 `spike:3:4850000`。
+    /// 例如 `threshold:3:2026-10`。
     pub async fn notify_once(
         &self,
         dedup_key: &str,
@@ -394,8 +359,12 @@ impl Scheduler {
     async fn refresh_account_inner(&self, account: &AccountRow) -> worker::Result<RefreshOutcome> {
         let secret = self.account_secret(account)?;
         let client = AliyunClient::from_account(account, secret);
-        let regions = account.regions();
-        let sync = crate::aliyun::sync_account(&client, &regions).await;
+        let sync = crate::aliyun::sync_account(
+            &client,
+            &account.region_id,
+            account.instance_id_opt(),
+        )
+        .await;
 
         let previous = self.db.get_snapshot(account.id).await?;
         let billing_month = crate::models::billing_month(self.now, &self.timezone);
@@ -422,27 +391,13 @@ impl Scheduler {
                 .unwrap_or(false);
         }
 
-        // 若某地域整体查询失败（而不是"这个地域没有实例"），沿用旧快照里该
-        // 地域的实例，避免一次网络抖动就让界面上的实例整片消失。
-        if !sync.failed_regions.is_empty()
-            && let Some(previous_snapshot) = previous.as_ref()
-        {
-            let failed: BTreeSet<&str> = sync
-                .failed_regions
-                .iter()
-                .map(|region| region.as_str())
-                .collect();
-            let synced_ids: BTreeSet<String> = instances
-                .iter()
-                .map(|instance| instance.instance_id.clone())
-                .collect();
-            for old in previous_snapshot.instances() {
-                if failed.contains(old.region_id.as_str())
-                    && !synced_ids.contains(old.instance_id.as_str())
-                {
-                    instances.push(old);
-                }
-            }
+        // 实例查询失败（而不是「这个地域没有实例」）时沿用旧快照，
+        // 避免一次网络抖动就让卡片上的实例信息消失。
+        if sync.instances_failed {
+            instances = previous
+                .as_ref()
+                .map(|snapshot| snapshot.instances())
+                .unwrap_or_default();
         }
 
         // CDT 查询失败时沿用上次快照的流量值，绝不写成 0（否则阈值会误判为安全）。
@@ -492,47 +447,35 @@ impl Scheduler {
             })
             .await?;
 
-        // 采样历史（数值不变时按心跳去重）。
-        //
-        // 写入前先取上一次采样，用于突变检测：CDT 上报的是账期累计值，
-        // 两条相邻记录的增长量即这段时间消耗的流量。
-        let previous_sample = self.db.latest_history(account.id).await.ok().flatten();
-        self.db
-            .sample_history(
-                account.id,
-                self.now,
-                domestic_bytes,
-                overseas_bytes,
-                HISTORY_HEARTBEAT_MS,
-            )
-            .await?;
-
+        // 账号落在哪个额度池由地域决定：中国内地 20 GB、其余（含香港）200 GB。
+        // CDT 接口按地域分类汇总，这里取账号所属那一类的累计值。
         let total_bytes = domestic_bytes + overseas_bytes;
-        // 免费额度分为两个独立池：中国内地与非中国内地各自计费，
-        // 任一池超限就要熔断。用合计值与单一阈值判断会两个方向都出错：
-        // 国内 19G + 海外 19G 合计 38G 时合计阈值不会触发，但国内已经超额；
-        // 国内 5G + 海外 200G 合计 205G 会误触发，但两池其实都还在免费额度内。
-        let pools = TrafficPools {
-            domestic: TrafficPool::new(domestic_bytes, account.domestic_limit_gb),
-            overseas: TrafficPool::new(overseas_bytes, account.overseas_limit_gb),
-        };
+        let pool = account.quota_pool();
+        let used_gb = bytes_to_gb(match pool {
+            QuotaPool::Domestic => domestic_bytes,
+            QuotaPool::Overseas => overseas_bytes,
+        });
+
+        // 采样历史：按小时、按天各落一个点，存的是**当月累计用量**。
+        // 同一小时内多次采样覆盖同一个点，所以 15 分钟巡检不会把表撑大。
+        if sync.traffic.is_some() {
+            let day_start = local_day_start_ms(self.now, &self.timezone);
+            self.db
+                .add_traffic_stats(account.id, used_gb, self.now, day_start)
+                .await?;
+        }
+
         let already_triggered = previous
             .as_ref()
             .map(|snapshot| snapshot.threshold_triggered(&billing_month))
             .unwrap_or(false);
 
         let mut threshold_fired = false;
-        if pools.any_exceeded() && !already_triggered {
+        if threshold_reached(used_gb, account.traffic_threshold_gb) && !already_triggered {
             threshold_fired = self
-                .handle_threshold(account, &pools)
+                .handle_threshold(account, used_gb, pool)
                 .await?;
         }
-
-        // 突变告警：相邻两次采样之间增长过多，说明流量正在被快速消耗。
-        // 与阈值熔断互补 —— 熔断是「到上限才管」，突变是「刚发生就知道」。
-        let spike_detected = self
-            .check_spike(account, previous_sample.as_ref(), total_bytes, &pools)
-            .await;
 
         for warning in &sync.warnings {
             let _ = self
@@ -552,80 +495,8 @@ impl Scheduler {
             domestic_bytes,
             overseas_bytes,
             threshold_fired,
-            spike_detected,
             warnings: sync.warnings,
         })
-    }
-
-    /// 检测单次采样是否异常增长，命中则记录日志并推送告警。
-    ///
-    /// 返回是否发出了告警。用幂等锁按「账号 + 小时」去重，避免同一波流量
-    /// 在每次 Cron 都重复通知。
-    async fn check_spike(
-        &self,
-        account: &AccountRow,
-        previous: Option<&TrafficPoint>,
-        current_total: i64,
-        current_pools: &TrafficPools,
-    ) -> bool {
-        let Some(prev) = previous else {
-            return false;
-        };
-
-        let threshold_bytes = gb_to_bytes(spike_threshold_gb(account));
-        let gap = self.now.saturating_sub(prev.recorded_at);
-        if !crate::models::is_traffic_spike(
-            prev.total_bytes,
-            current_total,
-            gap,
-            threshold_bytes,
-            SPIKE_MAX_GAP_MS,
-        ) {
-            return false;
-        }
-
-        let increase = current_total - prev.total_bytes;
-        let detail = format!(
-            "{} 内增长 {}（{} → {}），超过突变阈值 {}",
-            human_duration(gap),
-            human_bytes(increase),
-            human_bytes(prev.total_bytes),
-            human_bytes(current_total),
-            human_bytes(threshold_bytes)
-        );
-
-        let _ = self
-            .db
-            .add_log(Some(account.id), "traffic_spike", None, &detail, now_ms())
-            .await;
-
-        let message = Message::new(
-            format!("流量异常增长 · {}", account.name),
-            format!("{detail}，请确认是否有预期外的流量消耗。"),
-            NotifyLevel::Alert,
-        )
-        .with_details(vec![
-            format!(
-                "当前已用 中国内地 {} / {} GB · 非中国内地 {} / {} GB",
-                human_bytes(current_pools.domestic.bytes),
-                trim_float(current_pools.domestic.limit_gb),
-                human_bytes(current_pools.overseas.bytes),
-                trim_float(current_pools.overseas.limit_gb)
-            ),
-            format!(
-                "账期 {}",
-                crate::models::billing_month(self.now, &self.timezone)
-            ),
-        ])
-        .with_group("CDT-Spike");
-
-        // 同一账号同一小时内只告警一次：Cron 每 15 分钟一轮，
-        // 一次持续的大流量会连续触发几十条通知。
-        let hour_key = self.now / (60 * 60 * 1000);
-        let dedup_key = format!("spike:{}:{}", account.id, hour_key);
-        self.notify_once(&dedup_key, 60 * 60 * 1000, message)
-            .await
-            .is_some()
     }
 
     /// 刷新全部启用账号。
@@ -655,7 +526,8 @@ impl Scheduler {
     async fn handle_threshold(
         &self,
         account: &AccountRow,
-        pools: &TrafficPools,
+        used_gb: f64,
+        pool: QuotaPool,
     ) -> worker::Result<bool> {
         let billing_month = crate::models::billing_month(self.now, &self.timezone);
         let lock_name = format!("threshold:{}:{}", account.id, billing_month);
@@ -673,24 +545,15 @@ impl Scheduler {
             .await?;
 
         let mut details = vec![
+            format!("地域 {}（{}池）", account.region_id, pool.label()),
             format!(
-                "中国内地 {} / {} GB（{:.2}%）",
-                human_bytes(pools.domestic.bytes),
-                trim_float(pools.domestic.limit_gb),
-                pools.domestic.percent()
+                "已用 {:.2} GB / 阈值 {} GB",
+                used_gb,
+                trim_float(account.traffic_threshold_gb)
             ),
-            format!(
-                "非中国内地 {} / {} GB（{:.2}%）",
-                human_bytes(pools.overseas.bytes),
-                trim_float(pools.overseas.limit_gb),
-                pools.overseas.percent()
-            ),
+            format!("该池免费额度 {} GB", trim_float(pool.quota_gb())),
+            format!("账期 {}", billing_month),
         ];
-        let exceeded = pools.exceeded_labels();
-        if !exceeded.is_empty() {
-            details.push(format!("已超额度：{}", exceeded.join("、")));
-        }
-        details.push(format!("账期 {}", billing_month));
 
         let mut stopped = Vec::new();
         let mut stop_failures = Vec::new();
@@ -763,10 +626,11 @@ impl Scheduler {
             )
             .await?;
 
-        let title = format!("{} 流量超额度", account.name);
+        let title = format!("{} 流量达到阈值", account.name);
         let summary = format!(
-            "{} 已超出免费额度",
-            exceeded.join("、")
+            "已用 {:.2} GB，达到设定阈值 {} GB",
+            used_gb,
+            trim_float(account.traffic_threshold_gb)
         );
         let body = if account.action() == OverLimitAction::StopAndNotify {
             format!("{summary}，已按策略停机。")
@@ -1276,7 +1140,7 @@ impl Scheduler {
             .collect();
 
         let mut details = Vec::new();
-        let mut total_bytes = 0i64;
+        let mut used_total_gb = 0.0f64;
         let mut triggered = 0usize;
         let mut running = 0usize;
         let mut stopped = 0usize;
@@ -1284,7 +1148,7 @@ impl Scheduler {
         for account in &accounts {
             let snapshot = snapshots.get(&account.id);
             let overview: AccountOverview = build_overview(account, snapshot, tz, self.now);
-            total_bytes += overview.cdt_total_bytes;
+            used_total_gb += overview.traffic_used_gb;
             if overview.threshold_triggered {
                 triggered += 1;
             }
@@ -1304,13 +1168,13 @@ impl Scheduler {
                 (None, _) => "未知".to_string(),
             };
             details.push(format!(
-                "{}（{}）：内地 {} / {} GB · 非内地 {} / {} GB｜余额 {}｜实例 {} 台{}",
+                "{}（{} · {}）：{:.2} / {} GB（{:.2}%）｜余额 {}｜实例 {} 台{}",
                 overview.name,
-                overview.site_label,
-                human_bytes(overview.cdt_domestic_bytes),
-                trim_float(overview.domestic_limit_gb),
-                human_bytes(overview.cdt_overseas_bytes),
-                trim_float(overview.overseas_limit_gb),
+                overview.region_name,
+                overview.quota_label,
+                overview.traffic_used_gb,
+                trim_float(overview.quota_gb),
+                overview.percentage,
                 balance,
                 overview.instances.len(),
                 if overview.threshold_triggered {
@@ -1326,10 +1190,10 @@ impl Scheduler {
         }
 
         let body = format!(
-            "{} 概览：{} 个账号，合计流量 {}，实例运行 {} / 停止 {}，已熔断 {} 个。",
+            "{} 概览：{} 个账号，合计流量 {:.2} GB，实例运行 {} / 停止 {}，已熔断 {} 个。",
             local_date(self.now, tz),
             accounts.len(),
-            human_bytes(total_bytes),
+            used_total_gb,
             running,
             stopped,
             triggered
@@ -1374,11 +1238,7 @@ impl Scheduler {
 
         let region_id = match target.as_ref() {
             Some(instance) => instance.region_id.clone(),
-            None => account
-                .regions()
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "cn-hangzhou".to_string()),
+            None => account.region_id.clone(),
         };
 
         if start && self.threshold_blocked(&account).await? {
@@ -1657,19 +1517,15 @@ impl Scheduler {
             .collect())
     }
 
-    /// 流量历史（按小时 / 天分桶）。
+    /// 流量历史：小时点与天点各取最近一批。
     pub async fn traffic_history(
         &self,
         account_id: i64,
-        bucket: HistoryBucket,
-        limit: u32,
-    ) -> worker::Result<Vec<crate::models::TrafficPoint>> {
-        let offset_ms = utc_offset_minutes(&self.timezone) as i64 * 60_000;
-        let until = self.now;
-        let since = until - bucket.default_span_ms();
-        self.db
-            .aggregate_history(account_id, bucket, offset_ms, since, until, limit)
-            .await
+    ) -> worker::Result<crate::models::TrafficHistory> {
+        Ok(crate::models::TrafficHistory {
+            hourly: self.db.traffic_history(account_id, HistoryBucket::Hour).await?,
+            daily: self.db.traffic_history(account_id, HistoryBucket::Day).await?,
+        })
     }
 }
 
@@ -1735,10 +1591,9 @@ mod tests {
             site_type: "china".to_string(),
             access_key_id: "LTAI5tTestKey".to_string(),
             encrypted_access_key_secret: "cipher".to_string(),
-            regions_json: "[]".to_string(),
-            domestic_limit_gb: crate::models::DEFAULT_DOMESTIC_LIMIT_GB,
-            overseas_limit_gb: crate::models::DEFAULT_OVERSEAS_LIMIT_GB,
-            spike_threshold_gb: None,
+            region_id: "cn-hongkong".to_string(),
+            instance_id: None,
+            traffic_threshold_gb: 0.0,
             over_limit_action: "stop_and_notify".to_string(),
             stop_mode: "StopCharging".to_string(),
             schedule_start_time: start.map(|s| s.to_string()),
@@ -1869,7 +1724,6 @@ mod tests {
             accounts_refreshed: 2,
             accounts_failed: 1,
             thresholds_fired: 1,
-            spikes_detected: 0,
             instances_started: 2,
             instances_stopped: 1,
             keep_alive_started: 1,

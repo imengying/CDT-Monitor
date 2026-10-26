@@ -45,7 +45,7 @@ use sha1::Sha1;
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit};
 
 use crate::crypto::{CryptoError, random_hex};
-use crate::models::{AccountRow, InstanceInfo, SiteType, StopMode};
+use crate::models::{AccountRow, InstanceInfo, QuotaPool, SiteType, StopMode};
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -609,12 +609,10 @@ pub struct AccountBalance {
 /// 控制台与账单展示时才换算成 GB，**接口层不做换算**。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CdtTraffic {
-    /// 中国内地地域流量。
+    /// 中国内地地域累计流量。
     pub domestic_bytes: i64,
-    /// 非中国内地（中国香港及海外）流量。
+    /// 非中国内地（中国香港及海外）累计流量。
     pub overseas_bytes: i64,
-    /// 无法归类、已按站点默认归类并入上面的字节数（仅用于日志告警）。
-    pub unclassified_bytes: i64,
     /// 解析到的条目数（0 表示接口没返回数据）。
     pub items: usize,
 }
@@ -624,10 +622,24 @@ impl CdtTraffic {
         self.domestic_bytes.max(0) + self.overseas_bytes.max(0)
     }
 
+    /// 取某个额度池的累计流量。
+    ///
+    /// 一个账号只落在一个池里（由地域决定），所以这里返回的是**整个池**的
+    /// 用量，不是单个实例的 —— CDT 接口按地域汇总，拿不到实例粒度。
+    pub fn pool_bytes(&self, pool: QuotaPool) -> i64 {
+        match pool {
+            QuotaPool::Domestic => self.domestic_bytes.max(0),
+            QuotaPool::Overseas => self.overseas_bytes.max(0),
+        }
+    }
+
     /// 解析 `ListCdtInternetTraffic` 的响应。
     ///
     /// `TrafficDetails` 既可能是数组，也可能是 `{"Item": [...]}` 形式；
     /// 部分响应会把数据包在 `Data` 里，两种情况都处理。
+    ///
+    /// 地域字段缺失的条目按站点归入对应池（国内站算内地、国际站算海外），
+    /// 这是接口偶发缺字段时的兜底，不改变正常路径。
     pub fn parse(value: &Value, site: SiteType) -> Self {
         let mut out = CdtTraffic::default();
 
@@ -654,16 +666,16 @@ impl CdtTraffic {
                 .filter(|v| !v.is_empty());
             out.items += 1;
 
-            match classify_region(region, site) {
-                RegionClass::Domestic => out.domestic_bytes += bytes,
-                RegionClass::Overseas => out.overseas_bytes += bytes,
-                RegionClass::Unknown => {
-                    out.unclassified_bytes += bytes;
-                    match site {
-                        SiteType::China => out.domestic_bytes += bytes,
-                        SiteType::Intl => out.overseas_bytes += bytes,
-                    }
-                }
+            let pool = match region {
+                Some(region) => QuotaPool::of_region(region),
+                None => match site {
+                    SiteType::China => QuotaPool::Domestic,
+                    SiteType::Intl => QuotaPool::Overseas,
+                },
+            };
+            match pool {
+                QuotaPool::Domestic => out.domestic_bytes += bytes,
+                QuotaPool::Overseas => out.overseas_bytes += bytes,
             }
         }
 
@@ -712,38 +724,6 @@ fn json_to_i64(value: &Value) -> Option<i64> {
         return Some(f.round() as i64);
     }
     value.as_str()?.trim().parse::<i64>().ok()
-}
-
-/// 地域归类结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RegionClass {
-    Domestic,
-    Overseas,
-    Unknown,
-}
-
-/// 把 `BusinessRegionId` 归到「中国内地」或「非中国内地」。
-///
-/// CDT 的计费口径是两者分开计费，判定规则与上游一致：
-/// 以 `cn-` 开头且不是 `cn-hongkong` 的算中国内地，其余（中国香港、
-/// 亚太、欧美等）一律算非中国内地。
-fn classify_region(region: Option<&str>, _site: SiteType) -> RegionClass {
-    let Some(region) = region else {
-        return RegionClass::Unknown;
-    };
-    let lower = region.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return RegionClass::Unknown;
-    }
-
-    // 中国香港虽以 cn- 开头，但计费上属于非中国内地
-    if lower == "cn-hongkong" {
-        return RegionClass::Overseas;
-    }
-    if lower.starts_with("cn-") {
-        return RegionClass::Domestic;
-    }
-    RegionClass::Overseas
 }
 
 /// 取形如 `{"Instances": {"Instance": [...]}}` 的数组。
@@ -927,28 +907,30 @@ pub struct AccountSync {
     /// CDT 流量；`None` 表示查询失败（调用方应沿用上次快照，而不是写成 0）。
     pub traffic: Option<CdtTraffic>,
     pub balance: Option<AccountBalance>,
+    /// 该账号地域下的实例（通常就一台）。
     pub instances: Vec<InstanceInfo>,
-    /// 查询失败的地域列表：调用方据此决定是否沿用旧快照里的实例。
-    pub failed_regions: Vec<String>,
-    /// 局部失败信息：例如「cn-shanghai 地域查询失败」，不影响其它地域。
+    /// 实例查询是否失败：失败时调用方沿用旧快照里的实例。
+    pub instances_failed: bool,
+    /// 局部失败信息，不影响其它数据源。
     pub warnings: Vec<String>,
 }
 
-/// 依次拉取某账号的 CDT 流量、余额与全部地域实例。
+/// 拉取某账号的 CDT 流量、余额与实例。
 ///
 /// 三个来源互相独立：任一失败只记 warning，其余照常返回，避免一次
 /// 网络抖动就让整张卡片变成错误状态。
-pub async fn sync_account(client: &AliyunClient, regions: &[String]) -> AccountSync {
+///
+/// `instance_filter` 不为空时只保留这一台实例 —— 账号配置了实例 ID 时，
+/// 用地域级 DescribeInstances 的结果再筛一次，省掉单独的查询接口。
+pub async fn sync_account(
+    client: &AliyunClient,
+    region_id: &str,
+    instance_filter: Option<&str>,
+) -> AccountSync {
     let mut out = AccountSync::default();
 
     match client.query_cdt_traffic().await {
         Ok(traffic) => {
-            if traffic.unclassified_bytes > 0 {
-                out.warnings.push(format!(
-                    "CDT 有 {} 字节无法按地域归类，已按站点默认归类",
-                    traffic.unclassified_bytes
-                ));
-            }
             if traffic.items == 0 {
                 out.warnings
                     .push("CDT 接口未返回任何流量条目（可能当月还没有产生流量）".to_string());
@@ -973,13 +955,18 @@ pub async fn sync_account(client: &AliyunClient, regions: &[String]) -> AccountS
         Err(err) => out.warnings.push(format!("余额查询失败：{}", err.short())),
     }
 
-    for region in regions {
-        match client.describe_instances(region).await {
-            Ok(mut instances) => out.instances.append(&mut instances),
+    if !region_id.trim().is_empty() {
+        match client.describe_instances(region_id).await {
+            Ok(mut instances) => {
+                if let Some(instance_id) = instance_filter {
+                    instances.retain(|item| item.instance_id == instance_id);
+                }
+                out.instances = instances;
+            }
             Err(err) => {
-                out.failed_regions.push(region.clone());
+                out.instances_failed = true;
                 out.warnings
-                    .push(format!("{region} 实例查询失败：{}", err.short()));
+                    .push(format!("{region_id} 实例查询失败：{}", err.short()));
             }
         }
     }
@@ -1052,7 +1039,6 @@ mod tests {
         assert_eq!(traffic.domestic_bytes, 3 * 1073741824, "内地合计 3 GiB");
         assert_eq!(traffic.overseas_bytes, 5 * 1073741824, "非内地合计 5 GiB");
         assert_eq!(traffic.items, 4);
-        assert_eq!(traffic.unclassified_bytes, 0);
         assert_eq!(traffic.total_bytes(), 8 * 1073741824);
     }
 
@@ -1125,7 +1111,6 @@ mod tests {
             "TrafficDetails": [ { "Traffic": 42 }, { "Traffic": 8 } ]
         });
         let cn = CdtTraffic::parse(&value, SiteType::China);
-        assert_eq!(cn.unclassified_bytes, 50);
         assert_eq!(cn.domestic_bytes, 50);
         assert_eq!(cn.overseas_bytes, 0);
 
@@ -1151,24 +1136,26 @@ mod tests {
             "内地仅 cn-hangzhou + cn-shanghai"
         );
         assert_eq!(traffic.overseas_bytes, 230, "香港计入非内地");
-        assert_eq!(traffic.unclassified_bytes, 0);
     }
 
     #[test]
-    fn classify_region_boundaries() {
-        let c = |r: &str| classify_region(Some(r), SiteType::China);
-        assert_eq!(c("cn-hongkong"), RegionClass::Overseas);
-        assert_eq!(c("CN-HongKong"), RegionClass::Overseas);
-        assert_eq!(c("cn-hangzhou"), RegionClass::Domestic);
-        assert_eq!(c("cn-beijing"), RegionClass::Domestic);
-        assert_eq!(c("ap-southeast-1"), RegionClass::Overseas);
-        assert_eq!(c("us-west-1"), RegionClass::Overseas);
-        assert_eq!(c("eu-central-1"), RegionClass::Overseas);
-        assert_eq!(classify_region(None, SiteType::China), RegionClass::Unknown);
-        assert_eq!(
-            classify_region(Some("   "), SiteType::China),
-            RegionClass::Unknown
-        );
+    fn cdt_entries_split_by_quota_pool() {
+        // 解析时按地域归池：cn- 且非香港 → 内地，其余（含香港）→ 海外
+        let value = serde_json::json!({
+            "TrafficDetails": [
+                { "BusinessRegionId": "cn-hangzhou", "Traffic": 100 },
+                { "BusinessRegionId": "cn-hongkong", "Traffic": 200 },
+                { "BusinessRegionId": "ap-southeast-1", "Traffic": 300 },
+                { "BusinessRegionId": "us-west-1", "Traffic": 400 },
+            ]
+        });
+        let traffic = CdtTraffic::parse(&value, SiteType::China);
+        assert_eq!(traffic.domestic_bytes, 100);
+        assert_eq!(traffic.overseas_bytes, 900);
+
+        // pool_bytes 取该账号所在池的累计值
+        assert_eq!(traffic.pool_bytes(QuotaPool::Domestic), 100);
+        assert_eq!(traffic.pool_bytes(QuotaPool::Overseas), 900);
     }
 
     #[test]

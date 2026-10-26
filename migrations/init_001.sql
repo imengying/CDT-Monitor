@@ -38,13 +38,12 @@ CREATE TABLE IF NOT EXISTS accounts (
   access_key_id               TEXT    NOT NULL,
   -- Base64(24 字节 Nonce + XChaCha20Poly1305 密文)
   encrypted_access_key_secret TEXT    NOT NULL,
-  regions_json                TEXT    NOT NULL DEFAULT '[]',
-  -- 免费额度按地域池分开计算：中国内地 20 GB/月、非中国内地 200 GB/月。
-  -- 两池各自独立判定，任一超限即熔断，不存在合计阈值。
-  domestic_limit_gb           REAL    NOT NULL DEFAULT 20,
-  overseas_limit_gb           REAL    NOT NULL DEFAULT 200,
-  -- 突变告警阈值（GB）：单次采样增长超过此值即告警。NULL 用全局默认值
-  spike_threshold_gb          REAL,
+  -- 一个账号对应一个地域、一台实例
+  region_id                   TEXT    NOT NULL DEFAULT 'cn-hongkong',
+  instance_id                 TEXT,
+  -- 告警阈值（GB）。0 表示不限制也不告警；大于 0 时累计流量到线即告警。
+  -- 实际比较的额度按 region_id 决定：中国内地地域 20 GB，其余 200 GB。
+  traffic_threshold_gb        REAL    NOT NULL DEFAULT 0,
   over_limit_action           TEXT    NOT NULL DEFAULT 'stop_and_notify'
                               CHECK (over_limit_action IN ('stop_and_notify', 'notify_only')),
   stop_mode                   TEXT    NOT NULL DEFAULT 'StopCharging'
@@ -85,19 +84,26 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
 -- ---------------------------------------------------------------------------
 -- 流量历史采样（CDT 为账期累计值，图表按小时/天取桶内最大值）
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS traffic_history (
-  id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  account_id     INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
-  recorded_at    INTEGER NOT NULL,
-  domestic_bytes INTEGER NOT NULL DEFAULT 0,
-  overseas_bytes INTEGER NOT NULL DEFAULT 0,
-  total_bytes    INTEGER NOT NULL DEFAULT 0
+-- 流量采样：每个小时一个点、每天一个点，存的是「当月累计用量」。
+-- 分两张表是因为小时表只需保留最近 25 条、日表 31 条，
+-- 混在一起要靠时间窗过滤，查询更复杂。
+CREATE TABLE IF NOT EXISTS traffic_hourly (
+  account_id  INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+  recorded_at INTEGER NOT NULL,
+  -- 当月累计流量（GB）
+  traffic     REAL    NOT NULL,
+  PRIMARY KEY (account_id, recorded_at)
 );
 
-CREATE INDEX IF NOT EXISTS idx_traffic_history_account_time
-  ON traffic_history (account_id, recorded_at);
-CREATE INDEX IF NOT EXISTS idx_traffic_history_time
-  ON traffic_history (recorded_at);
+CREATE TABLE IF NOT EXISTS traffic_daily (
+  account_id  INTEGER NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+  recorded_at INTEGER NOT NULL,
+  traffic     REAL    NOT NULL,
+  PRIMARY KEY (account_id, recorded_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_traffic_hourly_time ON traffic_hourly (recorded_at);
+CREATE INDEX IF NOT EXISTS idx_traffic_daily_time ON traffic_daily (recorded_at);
 
 -- ---------------------------------------------------------------------------
 -- 异步任务（手动刷新 / 开关机 / 通知测试 / 日报）

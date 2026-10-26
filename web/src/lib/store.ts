@@ -9,11 +9,9 @@
  */
 
 import type {
-  HistoryBucket,
   OverviewResponse,
   SessionResponse,
   SettingsResponse,
-  TrafficHistoryResponse,
 } from '@/api/client'
 
 export type Phase = 'booting' | 'unauthenticated' | 'ready'
@@ -37,11 +35,6 @@ export interface AppState {
 
   settings: SettingsResponse | null
 
-  chartAccountId: number | null
-  chartBucket: HistoryBucket
-  chartData: TrafficHistoryResponse | null
-  chartLoading: boolean
-  chartError: string
 
   settingsOpen: boolean
   logsOpen: boolean
@@ -59,11 +52,6 @@ export function initialState(): AppState {
     overviewError: '',
     refreshingAll: false,
     settings: null,
-    chartAccountId: null,
-    chartBucket: 'hour',
-    chartData: null,
-    chartLoading: false,
-    chartError: '',
     settingsOpen: false,
     logsOpen: false,
     toasts: [],

@@ -15,7 +15,7 @@
 import {
   api,
   humanAmount,
-  humanBytes,
+
   relativeTime,
   type AccountOverview,
   type InstanceInfo,
@@ -49,8 +49,9 @@ function signatureOf(account: AccountOverview): string {
     name: account.name,
     site_label: account.site_label,
     ak: account.access_key_id_masked,
-    domesticLimit: account.domestic_limit_gb,
-    overseasLimit: account.overseas_limit_gb,
+    region: account.region_name,
+    threshold: account.traffic_threshold_gb,
+    quota: account.quota_gb,
     action: account.over_limit_action,
     actionLabel: account.over_limit_action_label,
     stopMode: account.stop_mode,
@@ -63,9 +64,9 @@ function signatureOf(account: AccountOverview): string {
     currency: account.balance_currency,
     cash: account.balance_cash,
     credit: account.balance_credit,
-    domestic: account.cdt_domestic_bytes,
-    overseas: account.cdt_overseas_bytes,
-    total: account.cdt_total_bytes,
+    used: account.traffic_used_gb,
+    percent: account.percentage,
+    overThreshold: account.over_threshold,
     month: account.billing_month,
     triggered: account.threshold_triggered,
     instances: account.instances.map((instance) => ({
@@ -112,6 +113,7 @@ export class AccountCard {
   constructor(
     account: AccountOverview,
     private readonly onEdit?: (accountId: number) => void,
+    private readonly onHistory?: (account: AccountOverview) => void,
   ) {
     this.account = account
     this.signature = signatureOf(account)
@@ -258,7 +260,7 @@ export class AccountCard {
         el('span', {
           class: 'mt-1 block truncate text-xs',
           style: { color: 'var(--color-ink-subtle)' },
-          text: primary?.region_id || account.site_label,
+          text: account.region_name,
         }),
       ),
       el(
@@ -305,11 +307,11 @@ export class AccountCard {
             el('span', {
               class: 'text-xs',
               style: { color: 'var(--color-ink-subtle)' },
-              text: '额度 内地 / 非内地',
+              text: '免费额度',
             }),
             el('b', {
               class: 'font-mono text-xs tabular-nums',
-              text: `${account.domestic_limit_gb} / ${account.overseas_limit_gb} GB`,
+              text: `${account.quota_gb} GB`,
             }),
           ),
         ),
@@ -318,6 +320,11 @@ export class AccountCard {
   }
 
   /** 流量区：大号数字 + 单条进度 + 百分比与账期。 */
+  /** 打开历史流量弹窗。 */
+  private openHistory(): void {
+    this.onHistory?.(this.account)
+  }
+
   /** 余额分项的 hover 文案；没有分项时返回空串（不显示 tooltip）。 */
   private balanceBreakdown(): string {
     const account = this.account
@@ -331,91 +338,16 @@ export class AccountCard {
     return parts.join(' · ')
   }
 
-  /**
-   * 单条进度条。
-   *
-   * 免费额度按地域分两个独立池（中国内地 20 GB / 非中国内地 200 GB），
-   * 各自超限才熔断，因此两个池子各画一条、各按自己的配额算百分比。
-   * 只有实际产生流量的池子才画 —— 单机部署通常只落在一侧。
-   */
-  private buildPoolBar(label: string, bytes: number, limitGb: number): HTMLElement {
-    const percent = limitGb > 0 ? Math.min((bytes / (limitGb * 1024 ** 3)) * 100, 9999) : 0
+  /** 流量区：大号数字 + 一条进度 + 百分比与阈值。 */
+  private buildTrafficBlock(): HTMLElement {
+    const account = this.account
+    const percent = account.percentage
     const fill =
-      percent >= 100
+      account.threshold_triggered || percent >= 100
         ? 'var(--color-danger)'
         : percent >= 80
           ? 'var(--color-warn)'
           : 'var(--color-ink)'
-
-    return el(
-      'div',
-      { class: 'mt-3' },
-      el(
-        'div',
-        {
-          class: 'flex items-baseline justify-between text-xs tabular-nums',
-          style: { color: 'var(--color-ink-muted)' },
-        },
-        el('span', { text: label }),
-        el('span', {
-          text: `${humanBytes(bytes)} / ${limitGb} GB`,
-        }),
-      ),
-      el(
-        'div',
-        {
-          class: 'mt-1.5 overflow-hidden rounded-full',
-          style: {
-            height: '7px',
-            backgroundColor: 'color-mix(in oklab, var(--color-line-strong) 68%, transparent)',
-            boxShadow: 'inset 0 1px 3px rgb(0 0 0 / 0.08)',
-          },
-        },
-        el('i', {
-          class: 'block h-full rounded-full',
-          style: {
-            width: `${Math.min(Math.max(percent, 0), 100)}%`,
-            backgroundColor: fill,
-            animation: 'progress-in .8s .35s var(--ease-emphasis) both',
-          },
-        }),
-      ),
-      el(
-        'div', {
-          class: 'mt-1 text-right text-xs tabular-nums',
-          style: { color: 'var(--color-ink-subtle)' },
-        },
-        el('span', { text: `${percent.toFixed(2)}%` }),
-      ),
-    )
-  }
-
-  /** 流量区：两个池子各自一行进度 + 账期。 */
-  private buildTrafficBlock(): HTMLElement {
-    const account = this.account
-    const bars: HTMLElement[] = []
-
-    if (account.cdt_domestic_bytes > 0 || account.domestic_limit_gb > 0) {
-      if (account.cdt_domestic_bytes > 0) {
-        bars.push(
-          this.buildPoolBar('中国内地', account.cdt_domestic_bytes, account.domestic_limit_gb),
-        )
-      }
-    }
-    if (account.cdt_overseas_bytes > 0) {
-      bars.push(
-        this.buildPoolBar('非中国内地', account.cdt_overseas_bytes, account.overseas_limit_gb),
-      )
-    }
-    if (bars.length === 0) {
-      bars.push(
-        el('p', {
-          class: 'mt-3 text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: '本月暂无流量记录',
-        }),
-      )
-    }
 
     return el(
       'div',
@@ -436,32 +368,70 @@ export class AccountCard {
             { class: 'flex items-baseline gap-1' },
             el('strong', {
               class: 'text-2xl font-semibold tabular-nums',
-              text: (account.cdt_total_bytes / 1024 ** 3).toFixed(2),
+              text: account.traffic_used_gb.toFixed(2),
             }),
             el('small', {
               class: 'font-medium tabular-nums',
               style: { color: 'var(--color-ink-subtle)' },
-              text: 'GB 合计',
+              text: `/ ${account.quota_gb.toFixed(0)} GB`,
             }),
           ),
         ),
-        this.actionButton({
-          key: 'refresh',
-          label: '',
-          icon: icons.refresh,
-          className: 'btn-ghost',
-          title: '刷新',
-          onClick: () => this.refreshAccount(),
-        }),
+        el(
+          'div',
+          { class: 'flex items-center gap-1' },
+          el(
+            'button',
+            {
+              class: 'btn btn-ghost btn-sm',
+              type: 'button',
+              title: '历史流量',
+              on: { click: () => this.openHistory() },
+            },
+            iconSvg(icons.chart, 13),
+          ),
+          this.actionButton({
+            key: 'refresh',
+            label: '',
+            icon: icons.refresh,
+            className: 'btn-ghost',
+            title: '刷新',
+            onClick: () => this.refreshAccount(),
+          }),
+        ),
       ),
-      ...bars,
       el(
         'div',
         {
-          class: 'mt-2 text-xs tabular-nums',
+          class: 'mt-3 overflow-hidden rounded-full',
+          style: {
+            height: '7px',
+            backgroundColor: 'color-mix(in oklab, var(--color-line-strong) 68%, transparent)',
+            boxShadow: 'inset 0 1px 3px rgb(0 0 0 / 0.08)',
+          },
+        },
+        el('i', {
+          class: 'block h-full rounded-full',
+          style: {
+            width: `${Math.min(Math.max(percent, 0), 100)}%`,
+            backgroundColor: fill,
+            animation: 'progress-in .8s .35s var(--ease-emphasis) both',
+          },
+        }),
+      ),
+      el(
+        'div',
+        {
+          class: 'mt-2 flex justify-between text-xs tabular-nums',
           style: { color: 'var(--color-ink-muted)' },
         },
-        el('span', { text: `账期 ${account.billing_month || '—'}` }),
+        el('span', { text: `${percent.toFixed(2)}% 已使用` }),
+        el('span', {
+          text:
+            account.traffic_threshold_gb > 0
+              ? `阈值 ${account.traffic_threshold_gb} GB`
+              : '未设阈值',
+        }),
       ),
     )
   }
@@ -743,7 +713,10 @@ export class AccountList {
 
   private readonly cards = new Map<number, AccountCard>()
 
-  constructor(private readonly onEdit?: (accountId: number) => void) {
+  constructor(
+    private readonly onEdit?: (accountId: number) => void,
+    private readonly onHistory?: (account: AccountOverview) => void,
+  ) {
     // 两列网格，与上游一致；窄屏单列
     this.element = el('section', {
       class: 'grid gap-4',
@@ -761,7 +734,7 @@ export class AccountList {
       if (existing) {
         existing.update(account)
       } else {
-        const card = new AccountCard(account, this.onEdit)
+        const card = new AccountCard(account, this.onEdit, this.onHistory)
         this.cards.set(account.id, card)
         this.element.append(card.element)
       }

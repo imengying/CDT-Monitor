@@ -118,7 +118,6 @@ export class LogDrawer {
       ['', '全部类型'],
       ['login', '登录'],
       ['threshold', '熔断'],
-      ['traffic_spike', '突变'],
       ['manual', '手动操作'],
       ['batch', '批量操作'],
       ['schedule', '定时开关机'],

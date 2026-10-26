@@ -41,81 +41,28 @@ type Tab = 'accounts' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'system'
 /**
  * 可选地域。
  *
- * 每勾一个地域就要单独发一次 DescribeInstances，勾得越多刷新越慢，
- * 所以只收录阿里云实际提供的地域。已下线（如南京、福州本地地域）的不列。
- *
- * 国内统一用城市名，省得「华南1（深圳）」这种编号占宽度。
+ * 与上游保持同一份清单和叫法（「华东 1（杭州）」这种官方编号）。
+ * 一个账号只对应一个地域，下拉单选即可。
  */
-interface RegionOption {
-  value: string
-  label: string
-  /** 所属大区，与 `REGION_GROUPS` 中的名称对应。 */
-  group: string
-}
-
-/**
- * CDT 免费额度（GB/月）。
- *
- * 阿里云定的固定值，不是用户可配项，因此只展示不可输入。
- * 与后端 `DEFAULT_DOMESTIC_LIMIT_GB` / `DEFAULT_OVERSEAS_LIMIT_GB` 一致。
- */
-const CDT_DOMESTIC_QUOTA_GB = 20
-const CDT_OVERSEAS_QUOTA_GB = 200
-
-/** 「地区」下拉的选项；决定「地域」列出哪一批城市。 */
-const REGION_GROUPS = ['中国', '亚太', '北美', '中欧'] as const
-
-const REGION_OPTIONS: RegionOption[] = [
-  // 香港在计费上属非中国内地，但按使用习惯与国内地域放在一起，并排在最前
-  { value: 'cn-hongkong', label: '香港', group: '中国' },
-
-  { value: 'cn-qingdao', label: '青岛', group: '中国' },
-  { value: 'cn-beijing', label: '北京', group: '中国' },
-  { value: 'cn-zhangjiakou', label: '张家口', group: '中国' },
-  { value: 'cn-huhehaote', label: '呼和浩特', group: '中国' },
-  { value: 'cn-wulanchabu', label: '乌兰察布', group: '中国' },
-  { value: 'cn-wulanchabu-acdr-1', label: '乌兰察布（专属云）', group: '中国' },
-  { value: 'cn-wulanchabu-gic-1', label: '乌兰察布（通用行业云）', group: '中国' },
-  { value: 'cn-hangzhou', label: '杭州', group: '中国' },
-  { value: 'cn-hangzhou-acdr-ut-1', label: '杭州（专属云）', group: '中国' },
-  { value: 'cn-shanghai', label: '上海', group: '中国' },
-  { value: 'cn-shanghai-cloudspe', label: '上海（云预发演练）', group: '中国' },
-  { value: 'cn-shenzhen', label: '深圳', group: '中国' },
-  { value: 'cn-heyuan', label: '河源', group: '中国' },
-  { value: 'cn-guangzhou', label: '广州', group: '中国' },
-  { value: 'cn-zhongwei', label: '中卫', group: '中国' },
-  { value: 'cn-wuhan-lr', label: '武汉（本地地域）', group: '中国' },
-  { value: 'cn-chengdu', label: '成都', group: '中国' },
-
-  { value: 'ap-northeast-1', label: '日本（东京）', group: '亚太' },
-  { value: 'ap-northeast-2', label: '韩国（首尔）', group: '亚太' },
-  { value: 'ap-southeast-1', label: '新加坡', group: '亚太' },
-  { value: 'ap-southeast-3', label: '马来西亚（吉隆坡）', group: '亚太' },
-  { value: 'ap-southeast-8', label: '马来西亚（柔佛州）', group: '亚太' },
-  { value: 'ap-southeast-5', label: '印度尼西亚（雅加达）', group: '亚太' },
-  { value: 'ap-southeast-6', label: '菲律宾（马尼拉）', group: '亚太' },
-  { value: 'ap-southeast-7', label: '泰国（曼谷）', group: '亚太' },
-
-  { value: 'us-east-1', label: '美国（弗吉尼亚）', group: '北美' },
-  { value: 'us-west-1', label: '美国（硅谷）', group: '北美' },
-  { value: 'us-southeast-1', label: '美国（亚特兰大）', group: '北美' },
-  { value: 'na-south-1', label: '墨西哥', group: '北美' },
-
-  { value: 'eu-west-1', label: '英国（伦敦）', group: '中欧' },
-  { value: 'eu-central-1', label: '德国（法兰克福）', group: '中欧' },
-  { value: 'eu-west-2', label: '法国（巴黎）', group: '中欧' },
-  { value: 'me-east-1', label: '阿联酋（迪拜）', group: '中欧' },
+const REGION_OPTIONS: { value: string; label: string }[] = [
+  { value: 'cn-hongkong', label: '中国香港' },
+  { value: 'cn-hangzhou', label: '华东 1（杭州）' },
+  { value: 'cn-shanghai', label: '华东 2（上海）' },
+  { value: 'cn-qingdao', label: '华北 1（青岛）' },
+  { value: 'cn-beijing', label: '华北 2（北京）' },
+  { value: 'cn-zhangjiakou', label: '华北 3（张家口）' },
+  { value: 'cn-huhehaote', label: '华北 5（呼和浩特）' },
+  { value: 'cn-wulanchabu', label: '华北 6（乌兰察布）' },
+  { value: 'cn-shenzhen', label: '华南 1（深圳）' },
+  { value: 'cn-heyuan', label: '华南 2（河源）' },
+  { value: 'cn-guangzhou', label: '华南 3（广州）' },
+  { value: 'cn-chengdu', label: '西南 1（成都）' },
+  { value: 'ap-southeast-1', label: '新加坡' },
+  { value: 'ap-northeast-1', label: '日本（东京）' },
+  { value: 'ap-northeast-2', label: '韩国（首尔）' },
+  { value: 'us-west-1', label: '美国（硅谷）' },
+  { value: 'us-east-1', label: '美国（弗吉尼亚）' },
 ]
-
-/** 地域 → 显示名；不在清单里的原样显示（账号里可能存着已下线的地域）。 */
-function regionLabel(region: string): string {
-  return REGION_OPTIONS.find((item) => item.value === region)?.label ?? region
-}
-
-/** 地域所属大区；未知地域返回第一个分组，避免「地区」下拉出现空值。 */
-function groupOfRegion(region: string): string {
-  return REGION_OPTIONS.find((item) => item.value === region)?.group ?? REGION_GROUPS[0]
-}
 
 /** 账号表单。 */
 interface AccountForm {
@@ -124,11 +71,10 @@ interface AccountForm {
   siteType: SiteType
   accessKeyId: string
   accessKeySecret: string
-  regions: string[]
-  /** 「地区」下拉的当前选择，仅用于筛选地域清单，不提交。 */
-  regionGroup: string
-  /** 突变告警阈值（GB）；null 表示使用默认值，0 表示关闭 */
-  spikeThresholdGb: number | null
+  regionId: string
+  instanceId: string
+  /** 告警阈值（GB）。0 表示不限制也不告警。 */
+  trafficThresholdGb: number
   overLimitAction: OverLimitAction
   stopMode: StopMode
   scheduleStart: string
@@ -145,11 +91,9 @@ function blankAccountForm(): AccountForm {
     siteType: 'china',
     accessKeyId: '',
     accessKeySecret: '',
-    // 默认一个都不勾：勾多少地域就要发多少次 DescribeInstances，
-    // 预先勾上四个会让新建账号的首次刷新变慢，也让用户以为这是必填。
-    regions: [],
-    regionGroup: REGION_GROUPS[0],
-    spikeThresholdGb: null,
+    regionId: 'cn-hongkong',
+    instanceId: '',
+    trafficThresholdGb: 0,
     overLimitAction: 'stop_and_notify',
     stopMode: 'StopCharging',
     scheduleStart: '',
@@ -199,9 +143,9 @@ function formFromAccount(account: AccountDto): AccountForm {
     siteType: account.site_type,
     accessKeyId: account.access_key_id,
     accessKeySecret: '',
-    regions: [...account.regions],
-    regionGroup: groupOfRegion(account.regions[0] ?? ''),
-    spikeThresholdGb: account.spike_threshold_gb,
+    regionId: account.region_id,
+    instanceId: account.instance_id ?? '',
+    trafficThresholdGb: account.traffic_threshold_gb,
     overLimitAction: account.over_limit_action,
     stopMode: account.stop_mode,
     scheduleStart: account.schedule_start_time ?? '',
@@ -564,152 +508,6 @@ export class SettingsModal {
     return node
   }
 
-  /**
-   * 地域多选。
-   *
-   * 只列 `group` 对应大区的地域 —— 一个账号可以横跨多个大区，所以「地区」
-   * 只是一层筛选，真正的配置是勾选出来的地域集合。
-   *
-   * 触发器长得像下拉框，点开后在 body 上挂一个浮层放复选框 —— 挂 body 是因为
-   * 设置页里任何 `renderContent()` 都会重建表单节点，浮层若在表单内部会被
-   * 连带销毁（此前下拉框「自己闭合」就是这个原因）。
-   */
-  private regionMultiSelect(
-    group: string,
-    selected: string[],
-    onChange: (value: string[]) => void,
-  ): HTMLElement {
-    const trigger = el(
-      'button',
-      {
-        class: 'input flex items-center justify-between gap-2 text-left',
-        type: 'button',
-        'aria-haspopup': 'true',
-        'aria-expanded': 'false',
-      },
-      el('span', { class: 'truncate', text: this.regionsSummary(group, selected) }),
-      iconSvg(icons.chevronDown, 14),
-    ) as HTMLButtonElement
-
-    const close = (): void => {
-      this.closeRegionPanel()
-      trigger.setAttribute('aria-expanded', 'false')
-    }
-
-    trigger.addEventListener('click', () => {
-      close()
-
-      const panel = el('div', {
-        class: 'card fixed z-[70] max-h-80 overflow-y-auto p-2 scroll-thin',
-        role: 'group',
-        'aria-label': '选择地域',
-      })
-
-      // 面板挂 body 上用 fixed 定位，必须自己跟随触发器位置。
-      // 设置页内容在 `this.content` 里独立滚动，用 absolute 会钉在页面原始
-      // 位置 —— 表现为滚轮滚动后勾选框留在原地、与触发器脱节。
-      const reposition = (): void => {
-        const rect = trigger.getBoundingClientRect()
-        panel.style.left = `${rect.left}px`
-        panel.style.width = `${rect.width}px`
-        // 下方空间不够时向上翻转，避免面板被视口裁掉
-        const spaceBelow = window.innerHeight - rect.bottom
-        if (spaceBelow < 200 && rect.top > spaceBelow) {
-          panel.style.top = ''
-          panel.style.bottom = `${window.innerHeight - rect.top + 4}px`
-        } else {
-          panel.style.bottom = ''
-          panel.style.top = `${rect.bottom + 4}px`
-        }
-      }
-      reposition()
-
-      for (const option of REGION_OPTIONS) {
-        if (option.group !== group) continue
-
-        const box = el('input', { type: 'checkbox' }) as HTMLInputElement
-        box.checked = selected.includes(option.value)
-        box.addEventListener('change', () => {
-          const next = box.checked
-            ? [...selected, option.value]
-            : selected.filter((item) => item !== option.value)
-          selected = next
-          onChange(next)
-          replaceChildren(
-            trigger.firstElementChild as HTMLElement,
-            document.createTextNode(this.regionsSummary(group, next)),
-          )
-        })
-        panel.append(
-          el(
-            'label',
-            {
-              class:
-                'flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-[0.8125rem] hover:bg-(--color-surface-muted)',
-              style: { color: 'var(--color-ink)' },
-            },
-            box,
-            el('span', { text: option.label }),
-          ),
-        )
-      }
-
-      if (!panel.firstElementChild) {
-        panel.append(
-          el('p', {
-            class: 'px-2 py-1.5 text-[0.8125rem]',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '该地区暂无可选地域。',
-          }),
-        )
-      }
-
-      document.body.append(panel)
-      this.regionPanel = panel
-      trigger.setAttribute('aria-expanded', 'true')
-
-      this.content.addEventListener('scroll', reposition, { passive: true })
-      window.addEventListener('resize', reposition, { passive: true })
-
-      // 点空白处关闭：延迟注册，避免这次点击立刻把自己关掉
-      window.setTimeout(() => {
-        const onDocClick = (event: MouseEvent): void => {
-          const target = event.target as Node
-          if (panel.contains(target) || trigger.contains(target)) return
-          close()
-          document.removeEventListener('click', onDocClick, true)
-        }
-        document.addEventListener('click', onDocClick, true)
-      }, 0)
-
-      this.regionPanelCleanup = (): void => {
-        this.content.removeEventListener('scroll', reposition)
-        window.removeEventListener('resize', reposition)
-      }
-    })
-
-    return el('div', { class: 'relative' }, trigger)
-  }
-
-  /** 已选地域的摘要文案。 */
-  /**
-   * 触发器上的摘要。
-   *
-   * 显示当前大区已选的地域；若总选择里还有别的区，补一句总数，
-   * 否则切到「中国」看不到已勾的香港会以为丢了。
-   */
-  private regionsSummary(group: string, selected: string[]): string {
-    const inGroup = selected.filter((item) => groupOfRegion(item) === group)
-    if (selected.length === 0) return '未选择'
-    if (inGroup.length === 0) return `本区未选 · 共 ${selected.length} 个`
-    if (inGroup.length <= 2) {
-      const text = inGroup.map(regionLabel).join('、')
-      return inGroup.length === selected.length ? text : `${text} · 共 ${selected.length} 个`
-    }
-    const text = `${regionLabel(inGroup[0]!)} 等 ${inGroup.length} 个`
-    return inGroup.length === selected.length ? text : `${text} · 共 ${selected.length} 个`
-  }
-
   /** 开关。 */
   private switchControl(
     label: string,
@@ -888,7 +686,7 @@ export class SettingsModal {
       const metaRow = el('div', {
         class: 'mt-1 font-mono text-[0.8125rem]',
         style: { color: 'var(--color-ink-subtle)' },
-        text: `${account.access_key_id_masked} · 额度 ${account.domestic_limit_gb}/${account.overseas_limit_gb} GB · ${account.regions.length} 个地域`,
+        text: `${account.access_key_id_masked} · ${account.region_name} · 阈值 ${account.traffic_threshold_gb > 0 ? `${account.traffic_threshold_gb} GB` : '未设'}`,
       })
 
       const actions = el(
@@ -995,12 +793,6 @@ export class SettingsModal {
   private buildAccountForm(): HTMLElement {
     const form = this.form
 
-    // 地域控件放在一个稳定的容器里：切换「地区」时只替换容器内容，
-    // 不重建整张表单（否则同行的下拉框会被销毁）。
-    const regionsHost = el('div', {}, this.regionMultiSelect(form.regionGroup, form.regions, (value) => {
-      this.form.regions = value
-    }))
-
     const scheduleStart = this.textInput(form.scheduleStart, (value) => {
       this.form.scheduleStart = value
     }, { placeholder: '08:00' })
@@ -1089,23 +881,21 @@ export class SettingsModal {
         'div',
         { class: 'grid gap-3 sm:grid-cols-3' },
         this.field(
-          '地区',
+          '地域',
           this.selectInput(
-            form.regionGroup,
-            REGION_GROUPS.map((name) => ({ value: name, label: name })),
+            form.regionId,
+            REGION_OPTIONS.map((item) => ({ value: item.value, label: item.label })),
             (value) => {
-              this.form.regionGroup = value
-              // 只重建地域控件，「地区」「停机模式」保持不动，避免下拉被销毁
-              replaceChildren(
-                regionsHost,
-                this.regionMultiSelect(value, this.form.regions, (next) => {
-                  this.form.regions = next
-                }),
-              )
+              this.form.regionId = value
             },
           ),
         ),
-        this.field('地域', regionsHost),
+        this.field(
+          '实例 ID',
+          this.textInput(form.instanceId, (value) => {
+            this.form.instanceId = value
+          }, { placeholder: 'i-bp…（可留空）' }),
+        ),
         this.field(
           '停机模式',
           this.selectInput(
@@ -1125,15 +915,15 @@ export class SettingsModal {
         'div',
         { class: 'grid gap-3 sm:grid-cols-2' },
         this.field(
-          '突变告警阈值（GB）',
+          '告警阈值（GB）',
           this.numberInput(
-            form.spikeThresholdGb ?? 0,
+            form.trafficThresholdGb,
             (value) => {
-              this.form.spikeThresholdGb = value > 0 ? value : null
+              this.form.trafficThresholdGb = value
             },
             '0',
           ),
-          '单次采样增长超过此值即告警，填 0 使用默认值',
+          '达到此值即告警；填 0 表示不限制也不告警',
         ),
         this.field(
           '超限动作',
@@ -1231,11 +1021,9 @@ export class SettingsModal {
       name: form.name.trim(),
       site_type: form.siteType,
       access_key_id: form.accessKeyId.trim(),
-      regions: [...form.regions],
-      // 额度是阿里云固定值，不作为可编辑项提交
-      domestic_limit_gb: CDT_DOMESTIC_QUOTA_GB,
-      overseas_limit_gb: CDT_OVERSEAS_QUOTA_GB,
-      spike_threshold_gb: form.spikeThresholdGb,
+      region_id: form.regionId,
+      instance_id: form.instanceId.trim() || null,
+      traffic_threshold_gb: form.trafficThresholdGb,
       over_limit_action: form.overLimitAction,
       stop_mode: form.stopMode,
       schedule_start_time: form.scheduleStart.trim() || null,

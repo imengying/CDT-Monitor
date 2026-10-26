@@ -68,7 +68,7 @@ cdt-monitor/
         └── components/
             ├── LoginModal.ts   登录卡片 + Turnstile
             ├── AccountCard.ts  账号卡片 + 实例控制
-            ├── TrafficChart.ts ECharts 趋势图
+            ├── HistoryModal.ts ECharts 历史流量弹窗
             ├── SettingsModal.ts 设置弹窗（6 个标签页）
             ├── LogDrawer.ts    日志抽屉
             └── ToastStack.ts   提示条容器
@@ -221,7 +221,6 @@ bun run dev:web                  # :5173
 5. 定时开机（同窗口，受熔断闸门约束）
 6. 抢占式保活（见下方闸门）
 7. 每日日报（60 分钟窗口，当天仅一次）
-8. 突变检测：单次采样增长超过阈值即告警（按账号小时去重）
 ```
 
 窗口取 60 分钟：巡检间隔 15 分钟，一次网络抖动后下一轮还能补上。
@@ -309,9 +308,9 @@ bun run dev:web                  # :5173
 | 表 | 用途 |
 |---|---|
 | `settings` | KV 配置（时区、日报、TG/Bark 密文、Turnstile 密文） |
-| `accounts` | 阿里云账号（AK、加密 Secret、地域、双池额度、策略、定时、保活） |
+| `accounts` | 阿里云账号（AK、加密 Secret、地域、实例 ID、告警阈值、策略、定时、保活） |
 | `account_snapshots` | 每账号一行最新状态，首页只读此表 |
-| `traffic_history` | 流量采样（账期累计值），索引 `(account_id, recorded_at)` |
+| `traffic_hourly` / `traffic_daily` | 流量采样（账期累计值），索引 `(account_id, recorded_at)` |
 | `jobs` | 异步任务状态 |
 | `action_logs` | 自动化动作 / 告警 / 登录审计 |
 | `sessions` | 登录设备，用于踢下线 |
@@ -344,12 +343,15 @@ CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、
 | 中国内地 | 20 GB / 月 |
 | 非中国内地（含中国香港） | 200 GB / 月 |
 
-任一池超出即触发熔断。两个池子分别判定，不使用合计阈值 —— 用合计判断会
-同时造成漏停（内地已超额但合计没到）和误停（合计到了但两池都还在额度内）。
+一个账号只落在一个池里 —— 由它的 `region_id` 决定（`cn-` 开头且不是
+`cn-hongkong` 的算内地，其余含香港算非内地）。查询 CDT 用量时取对应那一类
+的累计值即可，不需要两池相加。
 
-额度是阿里云定的固定值，**界面上只展示不可编辑**；数据库仍保留
-`domestic_limit_gb` / `overseas_limit_gb` 两列，便于阿里云调整额度的
-那一天只改常量而不动表结构。
+额度是阿里云定的固定值，不算用户配置项。用户能设的是**告警阈值**
+（`traffic_threshold_gb`）：
+
+* `0` → 不限制也不告警
+* `> 0` → 累计流量达到该值即告警，并按策略停机（`stop_and_notify`）
 
 ### RAM 最小权限
 

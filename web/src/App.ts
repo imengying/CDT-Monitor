@@ -6,29 +6,26 @@
  *   ┌ 顶部导航：标题 · 刷新 · 日志 · 设置 · 退出 ┐
  *   ├ 汇总条：账号 / 本月流量 / 实例 / 熔断                   ┤
  *   ├ 账号卡片区（AccountList）                                ┤
- *   └ 历史流量图表区（TrafficChart）                              ┘
+ *   └ 历史流量弹窗（HistoryModal，由卡片上的按钮打开）              ┘
  *
  * 渲染策略：外壳只构建一次，各区块通过 `update(state)` 增量刷新，
  * 避免每次 60 秒轮询都重建整棵树（会丢失滚动位置与输入焦点）。
  */
 
-import type { AccountOverview } from '@/api/client'
+import { api, type AccountOverview } from '@/api/client'
 import type { AppState } from '@/lib/store'
 import { clearToasts, store } from '@/lib/store'
 import { el, iconSvg, replaceChildren } from '@/lib/dom'
 import { icons } from '@/lib/icons'
 import {
   bootstrap,
-  loadChart,
   loadOverview,
   logout,
   refreshAll,
-  selectChartAccount,
-  setChartBucket,
+  reportError,
 } from '@/lib/actions'
 import { AccountList } from '@/components/AccountCard'
-import { AccountCompareChart } from '@/components/AccountCompareChart'
-import { TrafficChart } from '@/components/TrafficChart'
+import { HistoryModal } from '@/components/HistoryModal'
 import { LoginModal } from '@/components/LoginModal'
 import { LogDrawer } from '@/components/LogDrawer'
 import { SettingsModal } from '@/components/SettingsModal'
@@ -48,13 +45,13 @@ export class App {
 
   private shell: HTMLElement | null = null
   private loginModal: LoginModal | null = null
-  private trafficChart: TrafficChart | null = null
-  private compareChart: AccountCompareChart | null = null
+  private historyModal: HistoryModal | null = null
   private settingsModal: SettingsModal | null = null
   private logDrawer: LogDrawer | null = null
 
-  private readonly accountList = new AccountList((accountId) =>
-    this.settingsModal?.open(store.get().settings, false, accountId),
+  private readonly accountList = new AccountList(
+    (accountId) => this.settingsModal?.open(store.get().settings, false, accountId),
+    (account) => void this.openHistory(account),
   )
 
   /** 需要就地更新的节点。 */
@@ -62,16 +59,9 @@ export class App {
   private errorBanner: HTMLDivElement | null = null
   private summaryGrid: HTMLElement | null = null
   private emptyCard: HTMLElement | null = null
-  private chartPanel: HTMLElement | null = null
-  private chartAccountSelect: HTMLSelectElement | null = null
-  private chartThresholdRow: HTMLParagraphElement | null = null
-  private chartSlot: HTMLElement | null = null
-  private compareChartSlot: HTMLDivElement | null = null
-  private comparePanel: HTMLElement | null = null
 
   private pollTimer: number | null = null
   private lastPhase: AppState['phase'] | null = null
-  private lastChartError = ''
 
   constructor(root: HTMLElement) {
     this.root = root
@@ -159,12 +149,21 @@ export class App {
   // 控制台装配
   // -------------------------------------------------------------------------
 
+  /** 打开某账号的历史流量弹窗。数据按需拉取，不进 store。 */
+  private async openHistory(account: AccountOverview): Promise<void> {
+    if (!this.historyModal) return
+    try {
+      const data = await api.history(account.id)
+      this.historyModal.open(account.name, data)
+    } catch (error) {
+      reportError(error, '加载历史流量失败')
+    }
+  }
+
   private renderShell(state: Readonly<AppState>): void {
     this.settingsModal = new SettingsModal()
     this.logDrawer = new LogDrawer()
-    this.trafficChart = new TrafficChart()
-    this.compareChart = new AccountCompareChart()
-    this.comparePanel = this.buildComparePanel()
+    this.historyModal = new HistoryModal()
 
     this.refreshButton = el('button', {
       class: 'btn btn-ghost btn-sm',
@@ -187,18 +186,6 @@ export class App {
     })
 
     this.emptyCard = this.buildEmptyCard()
-    this.chartPanel = this.buildChartPanel()
-    this.chartSlot = this.chartPanel.querySelector<HTMLElement>('[data-role="chart-slot"]')
-    this.chartAccountSelect = this.chartPanel.querySelector<HTMLSelectElement>(
-      '[data-role="chart-account"]',
-    )
-    this.chartThresholdRow = this.chartPanel.querySelector<HTMLParagraphElement>(
-      '[data-role="chart-threshold"]',
-    )
-
-    // 图表容器直接放进占位槽，保证 mount() 时已有可用 DOM
-    this.chartSlot?.append(this.trafficChart.element)
-    this.compareChartSlot?.append(this.compareChart.element)
 
     this.shell = el(
       'div',
@@ -211,14 +198,16 @@ export class App {
         this.summaryGrid,
         this.emptyCard,
         this.accountList.element,
-        this.comparePanel,
-        this.chartPanel,
       ),
     )
 
-    replaceChildren(this.root, this.shell, this.settingsModal.element, this.logDrawer.element)
-    this.trafficChart.mount()
-    this.compareChart.mount()
+    replaceChildren(
+      this.root,
+      this.shell,
+      this.settingsModal.element,
+      this.logDrawer.element,
+      this.historyModal.element,
+    )
     this.updateShell(state)
   }
 
@@ -322,118 +311,6 @@ export class App {
     return card
   }
 
-  /** 多账号对比区块。账号少于 2 个时没有比较意义，整体隐藏。 */
-  private buildComparePanel(): HTMLElement {
-    this.compareChartSlot = el('div', { class: 'px-4 py-3' })
-    const section = el(
-      'section',
-      { class: 'card mt-4 hidden overflow-hidden' },
-      el(
-        'header',
-        {
-          class: 'flex items-center gap-2 border-b px-4 py-2.5',
-          style: { borderColor: 'var(--color-line)' },
-        },
-        iconSvg(icons.chart, 14),
-        el('h2', { class: 'text-sm font-semibold', text: '账号流量对比' }),
-        el('span', {
-          class: 'text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: '按配额占用比例',
-        }),
-      ),
-      this.compareChartSlot,
-    )
-    return section
-  }
-
-  private buildChartPanel(): HTMLElement {
-    const select = el('select', {
-      class: 'input py-1 text-xs',
-      style: { width: 'auto', minWidth: '8rem' },
-      dataset: { role: 'chart-account' },
-      on: {
-        change: (event) => {
-          const value = Number((event.target as HTMLSelectElement).value)
-          if (Number.isFinite(value)) void selectChartAccount(value)
-        },
-      },
-    }) as HTMLSelectElement
-
-    const thresholdRow = el('p', {
-      class: 'mb-2 hidden items-center gap-1.5 rounded-lg px-3 py-1.5 text-[0.8125rem]',
-      style: {
-        backgroundColor: 'var(--color-danger-soft)',
-        color: 'var(--color-danger)',
-      },
-      dataset: { role: 'chart-threshold' },
-    }) as HTMLParagraphElement
-
-    const bucketButton = (bucket: 'hour' | 'day', label: string): HTMLButtonElement =>
-      el(
-        'button',
-        {
-          class: 'px-2.5 py-1 transition-colors',
-          type: 'button',
-          dataset: { bucket },
-          on: { click: () => void setChartBucket(bucket) },
-        },
-        el('span', { text: label }),
-      ) as HTMLButtonElement
-
-    return el(
-      'section',
-      { class: 'card mt-4 hidden overflow-hidden' },
-      el(
-        'header',
-        {
-          class: 'flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5',
-          style: { borderColor: 'var(--color-line)' },
-        },
-        el(
-          'div',
-          { class: 'flex items-center gap-2' },
-          iconSvg(icons.chart, 14),
-          el('h2', { class: 'text-xs font-semibold', text: '历史流量趋势' }),
-        ),
-        el(
-          'div',
-          { class: 'flex flex-wrap items-center gap-1.5' },
-          select,
-          el(
-            'div',
-            {
-              class: 'flex overflow-hidden rounded-lg border text-[0.8125rem]',
-              style: { borderColor: 'var(--color-line)' },
-            },
-            bucketButton('hour', '按小时'),
-            bucketButton('day', '按天'),
-          ),
-          el(
-            'button',
-            {
-              class: 'btn btn-ghost btn-sm',
-              type: 'button',
-              'aria-label': '刷新图表',
-              on: { click: () => void loadChart() },
-            },
-            iconSvg(icons.refresh, 12),
-          ),
-        ),
-      ),
-      el(
-        'div',
-        { class: 'px-4 py-3' },
-        thresholdRow,
-        el('div', { dataset: { role: 'chart-slot' } }),
-      ),
-    )
-  }
-
-  // -------------------------------------------------------------------------
-  // 增量更新
-  // -------------------------------------------------------------------------
-
   private updateShell(state: Readonly<AppState>): void {
     const overview = state.overview
     const accounts = overview?.accounts ?? []
@@ -454,22 +331,6 @@ export class App {
     this.renderSummary(accounts)
     this.renderEmptyState(state, accounts)
     this.accountList.render(accounts)
-    // 账号少于 2 个时横向对比没有意义，整块隐藏
-    const comparable = accounts.filter((account) => account.enabled)
-    if (this.comparePanel) {
-      const show = comparable.length >= 2
-      this.comparePanel.classList.toggle('hidden', !show)
-      if (show) this.compareChart?.update(accounts)
-    }
-    this.renderChartPanel(state, accounts)
-
-    // 图表错误只在变化时提示一次，避免 60 秒轮询反复弹窗
-    if (state.chartError && state.chartError !== this.lastChartError) {
-      this.lastChartError = state.chartError
-    }
-    if (!state.chartError) {
-      this.lastChartError = ''
-    }
   }
 
   private renderErrorBanner(state: Readonly<AppState>): void {
@@ -501,13 +362,13 @@ export class App {
   private renderSummary(accounts: AccountOverview[]): void {
     if (!this.summaryGrid) return
 
-    let totalBytes = 0
+    let totalUsedGb = 0
     let running = 0
     let stopped = 0
     let triggered = 0
     let enabled = 0
     for (const account of accounts) {
-      totalBytes += account.cdt_total_bytes
+      totalUsedGb += account.traffic_used_gb
       if (account.enabled) enabled += 1
       if (account.threshold_triggered) triggered += 1
       for (const instance of account.instances) {
@@ -574,7 +435,7 @@ export class App {
     replaceChildren(
       this.summaryGrid,
       metric('账号', `${enabled}`, `/ ${accounts.length}`, icons.server, 'brand'),
-      metric('本月流量', (totalBytes / 1024 ** 3).toFixed(1), 'GB', icons.chart, 'brand'),
+      metric('本月流量', totalUsedGb.toFixed(1), 'GB', icons.chart, 'brand'),
       metric('实例', `${running}`, `运行 / ${stopped} 停止`, icons.serverCog, 'ok'),
       metric(
         '熔断',
@@ -600,68 +461,13 @@ export class App {
     card.classList.toggle('flex', empty)
   }
 
-  private renderChartPanel(state: Readonly<AppState>, accounts: AccountOverview[]): void {
-    const panel = this.chartPanel
-    if (!panel) return
-
-    const visible = accounts.length > 0
-    panel.classList.toggle('hidden', !visible)
-
-    if (!visible) {
-      this.trafficChart?.setData(null, state.chartBucket)
-      return
-    }
-
-    // 账号下拉
-    if (this.chartAccountSelect) {
-      const current = state.chartAccountId
-      const options = accounts.map((account) =>
-        el('option', { value: String(account.id), text: account.name }),
-      )
-      replaceChildren(this.chartAccountSelect, ...options)
-      if (current !== null) {
-        this.chartAccountSelect.value = String(current)
-      }
-    }
-
-    // 粒度按钮高亮
-    for (const button of panel.querySelectorAll<HTMLButtonElement>('[data-bucket]')) {
-      const active = button.dataset.bucket === state.chartBucket
-      button.style.backgroundColor = active ? 'var(--color-brand)' : 'transparent'
-      button.style.color = active ? '#ffffff' : 'var(--color-ink-muted)'
-      button.setAttribute('aria-pressed', String(active))
-    }
-
-    // 熔断提示
-    if (this.chartThresholdRow) {
-      const account = accounts.find((item) => item.id === state.chartAccountId)
-      const triggered = account?.threshold_triggered ?? false
-      this.chartThresholdRow.classList.toggle('hidden', !triggered)
-      this.chartThresholdRow.classList.toggle('flex', triggered)
-      if (triggered && account) {
-        replaceChildren(
-          this.chartThresholdRow,
-          iconSvg(icons.alert, 12),
-          el('span', {
-            text: `${account.name} 本月已熔断（内地 ${account.domestic_limit_gb} GB / 非内地 ${account.overseas_limit_gb} GB）`,
-          }),
-        )
-      }
-    }
-
-    this.trafficChart?.setLoading(state.chartLoading)
-    this.trafficChart?.setData(state.chartData, state.chartBucket)
-  }
-
   // -------------------------------------------------------------------------
   // 清理
   // -------------------------------------------------------------------------
 
   private teardownShell(): void {
-    this.trafficChart?.dispose()
-    this.trafficChart = null
-    this.compareChart?.dispose()
-    this.compareChart = null
+    this.historyModal?.dispose()
+    this.historyModal = null
     this.settingsModal = null
     this.logDrawer = null
     this.shell = null
@@ -669,10 +475,6 @@ export class App {
     this.errorBanner = null
     this.summaryGrid = null
     this.emptyCard = null
-    this.chartPanel = null
-    this.chartAccountSelect = null
-    this.chartThresholdRow = null
-    this.chartSlot = null
     clearToasts()
   }
 }

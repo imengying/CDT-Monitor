@@ -107,11 +107,14 @@ export interface AccountOverview {
   site_type: SiteType
   site_label: string
   access_key_id_masked: string
-  domestic_limit_gb: number
-  overseas_limit_gb: number
+  region_id: string
+  region_name: string
+  instance_id: string | null
+  traffic_threshold_gb: number
+  quota_gb: number
+  quota_label: string
   balance_cash: number | null
   balance_credit: number | null
-  spike_threshold_gb: number | null
   over_limit_action: OverLimitAction
   over_limit_action_label: string
   stop_mode: StopMode
@@ -122,12 +125,10 @@ export interface AccountOverview {
   enabled: boolean
   balance_amount: number | null
   balance_currency: string | null
-  cdt_domestic_bytes: number
-  cdt_overseas_bytes: number
-  cdt_total_bytes: number
-  domestic_percent: number
-  overseas_percent: number
-  total_percent: number
+  traffic_used_gb: number
+  percentage: number
+  threshold_percentage: number
+  over_threshold: boolean
   billing_month: string
   threshold_triggered: boolean
   snapshot_updated_at: number | null
@@ -141,21 +142,22 @@ export interface OverviewResponse {
   generated_at: number
 }
 
-export interface TrafficPoint {
+export interface TrafficSample {
+  /** 桶起始时间（Unix 毫秒） */
   recorded_at: number
-  domestic_bytes: number
-  overseas_bytes: number
-  total_bytes: number
+  /** 当月累计流量（GB） */
+  traffic_gb: number
 }
 
 export interface TrafficHistoryResponse {
-  account_id: number
-  bucket: HistoryBucket
-  domestic_limit_gb: number
-  overseas_limit_gb: number
+  history: {
+    hourly: TrafficSample[]
+    daily: TrafficSample[]
+  }
+  traffic_threshold_gb: number
+  quota_gb: number
   billing_month: string
   threshold_triggered: boolean
-  points: TrafficPoint[]
 }
 
 export interface ActionLog {
@@ -191,10 +193,12 @@ export interface AccountDto {
   site_label: string
   access_key_id: string
   access_key_id_masked: string
-  regions: string[]
-  domestic_limit_gb: number
-  overseas_limit_gb: number
-  spike_threshold_gb: number | null
+  region_id: string
+  region_name: string
+  instance_id: string | null
+  traffic_threshold_gb: number
+  quota_gb: number
+  quota_label: string
   over_limit_action: OverLimitAction
   over_limit_action_label: string
   stop_mode: StopMode
@@ -215,10 +219,9 @@ export interface AccountInput {
   access_key_id: string
   /** 编辑时留空表示沿用原密钥 */
   access_key_secret?: string
-  regions: string[]
-  domestic_limit_gb: number
-  overseas_limit_gb: number
-  spike_threshold_gb: number | null
+  region_id: string
+  instance_id: string | null
+  traffic_threshold_gb: number
   over_limit_action: OverLimitAction
   stop_mode: StopMode
   schedule_start_time: string | null
@@ -490,15 +493,9 @@ export const api = {
     return request<OverviewResponse>('/api/v1/overview')
   },
 
-  history(accountId: number, bucket: HistoryBucket, limit?: number): Promise<TrafficHistoryResponse> {
-    const params = new URLSearchParams({
-      account_id: String(accountId),
-      bucket,
-    })
-    if (limit !== undefined) {
-      params.set('limit', String(limit))
-    }
-    return request<TrafficHistoryResponse>(`/api/v1/history?${params.toString()}`)
+  /** 一次返回小时点与天点两份，由前端切「24 小时 / 30 天」。 */
+  history(accountId: number): Promise<TrafficHistoryResponse> {
+    return request<TrafficHistoryResponse>(`/api/v1/history?account_id=${accountId}`)
   },
 
   logs(limit = 80, options: { accountId?: number; action?: string } = {}): Promise<ActionLog[]> {

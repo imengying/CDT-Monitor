@@ -22,7 +22,7 @@ use worker::{D1Database, D1PreparedStatement, Env, Result};
 
 use crate::models::{
     AccountRow, ActionLog, AdvancedConfig, HistoryBucket, InstanceInfo, JobRow, JobStatus, JobType,
-    LogFilter, SessionRow, SnapshotRow, SnapshotUpdate, TrafficPoint, setting_key,
+    LogFilter, SessionRow, SnapshotRow, SnapshotUpdate, TrafficSample, setting_key,
 };
 
 // ===========================================================================
@@ -267,10 +267,9 @@ impl Db {
         site_type: &str,
         access_key_id: &str,
         encrypted_secret: &str,
-        regions_json: &str,
-        domestic_limit_gb: f64,
-        overseas_limit_gb: f64,
-        spike_threshold_gb: Option<f64>,
+        region_id: &str,
+        instance_id: Option<&str>,
+        traffic_threshold_gb: f64,
         over_limit_action: &str,
         stop_mode: &str,
         schedule_start_time: Option<&str>,
@@ -281,21 +280,20 @@ impl Db {
     ) -> Result<i64> {
         self.insert(
             "INSERT INTO accounts (
-                name, site_type, access_key_id, encrypted_access_key_secret, regions_json,
-                domestic_limit_gb, overseas_limit_gb, spike_threshold_gb,
+                name, site_type, access_key_id, encrypted_access_key_secret,
+                region_id, instance_id, traffic_threshold_gb,
                 over_limit_action, stop_mode,
                 schedule_start_time, schedule_stop_time, spot_keep_alive, enabled,
                 last_schedule_start_date, last_schedule_stop_date, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
             &[
                 j_text(name),
                 j_text(site_type),
                 j_text(access_key_id),
                 j_text(encrypted_secret),
-                j_text(regions_json),
-                j_f64(domestic_limit_gb),
-                j_f64(overseas_limit_gb),
-                j_opt_f64(spike_threshold_gb),
+                j_text(region_id),
+                j_opt_text(instance_id),
+                j_f64(traffic_threshold_gb),
                 j_text(over_limit_action),
                 j_text(stop_mode),
                 j_opt_text(schedule_start_time),
@@ -318,10 +316,9 @@ impl Db {
         site_type: &str,
         access_key_id: &str,
         encrypted_secret: Option<&str>,
-        regions_json: &str,
-        domestic_limit_gb: f64,
-        overseas_limit_gb: f64,
-        spike_threshold_gb: Option<f64>,
+        region_id: &str,
+        instance_id: Option<&str>,
+        traffic_threshold_gb: f64,
         over_limit_action: &str,
         stop_mode: &str,
         schedule_start_time: Option<&str>,
@@ -334,8 +331,7 @@ impl Db {
             Some(_) => {
                 "UPDATE accounts SET
                     name = ?, site_type = ?, access_key_id = ?, encrypted_access_key_secret = ?,
-                    regions_json = ?, domestic_limit_gb = ?, overseas_limit_gb = ?,
-                    spike_threshold_gb = ?,
+                    region_id = ?, instance_id = ?, traffic_threshold_gb = ?,
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
                     enabled = ?, updated_at = ?
@@ -344,8 +340,7 @@ impl Db {
             None => {
                 "UPDATE accounts SET
                     name = ?, site_type = ?, access_key_id = ?,
-                    regions_json = ?, domestic_limit_gb = ?, overseas_limit_gb = ?,
-                    spike_threshold_gb = ?,
+                    region_id = ?, instance_id = ?, traffic_threshold_gb = ?,
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
                     enabled = ?, updated_at = ?
@@ -358,10 +353,9 @@ impl Db {
             params.push(j_text(secret));
         }
         params.extend_from_slice(&[
-            j_text(regions_json),
-            j_f64(domestic_limit_gb),
-            j_f64(overseas_limit_gb),
-            j_opt_f64(spike_threshold_gb),
+            j_text(region_id),
+            j_opt_text(instance_id),
+            j_f64(traffic_threshold_gb),
             j_text(over_limit_action),
             j_text(stop_mode),
             j_opt_text(schedule_start_time),
@@ -385,7 +379,9 @@ impl Db {
     pub async fn delete_account(&self, id: i64) -> Result<()> {
         let db = self.conn()?;
         let statements = vec![
-            db.prepare("DELETE FROM traffic_history WHERE account_id = ?")
+            db.prepare("DELETE FROM traffic_hourly WHERE account_id = ?")
+                .bind(&[j_i64(id)])?,
+            db.prepare("DELETE FROM traffic_daily WHERE account_id = ?")
                 .bind(&[j_i64(id)])?,
             db.prepare("DELETE FROM account_snapshots WHERE account_id = ?")
                 .bind(&[j_i64(id)])?,
@@ -546,161 +542,70 @@ impl Db {
     }
 
     // =======================================================================
-    // traffic_history
+    // traffic_hourly / traffic_daily
     // =======================================================================
 
-    /// 最近一条采样（用于「值没变就不写」的去重）。
-    pub async fn latest_history(&self, account_id: i64) -> Result<Option<TrafficPoint>> {
-        #[derive(Deserialize)]
-        struct Row {
-            recorded_at: i64,
-            domestic_bytes: i64,
-            overseas_bytes: i64,
-            total_bytes: i64,
-        }
-        let row: Option<Row> = self
-            .query_first(
-                "SELECT recorded_at, domestic_bytes, overseas_bytes, total_bytes
-                 FROM traffic_history WHERE account_id = ?
-                 ORDER BY recorded_at DESC LIMIT 1",
-                &[j_i64(account_id)],
-            )
-            .await?;
-        Ok(row.map(|r| TrafficPoint {
-            recorded_at: r.recorded_at,
-            domestic_bytes: r.domestic_bytes,
-            overseas_bytes: r.overseas_bytes,
-            total_bytes: r.total_bytes,
-        }))
-    }
-
-    /// 插入一条采样。
-    pub async fn insert_history(
+    /// 记录一次采样：同一小时内覆盖、同一天内覆盖，存当月累计用量（GB）。
+    ///
+    /// 小时表与日表各写一行，读的时候分开查 —— 小时表只要最近 25 条、
+    /// 日表 31 条，混在一张表里反而要靠时间窗过滤。
+    pub async fn add_traffic_stats(
         &self,
         account_id: i64,
-        recorded_at: i64,
-        domestic_bytes: i64,
-        overseas_bytes: i64,
+        traffic_gb: f64,
+        now_ms: i64,
+        day_start_ms: i64,
     ) -> Result<()> {
-        let total = domestic_bytes.max(0) + overseas_bytes.max(0);
+        let hour = now_ms / 3_600_000 * 3_600_000;
+        let day = day_start_ms;
+        let value = traffic_gb.max(0.0);
+
         self.exec(
-            "INSERT INTO traffic_history
-                (account_id, recorded_at, domestic_bytes, overseas_bytes, total_bytes)
-             VALUES (?, ?, ?, ?, ?)",
-            &[
-                j_i64(account_id),
-                j_i64(recorded_at),
-                j_i64(domestic_bytes.max(0)),
-                j_i64(overseas_bytes.max(0)),
-                j_i64(total),
-            ],
+            "INSERT INTO traffic_hourly (account_id, recorded_at, traffic) VALUES (?, ?, ?)
+             ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic",
+            &[j_i64(account_id), j_i64(hour), j_f64(value)],
+        )
+        .await?;
+        self.exec(
+            "INSERT INTO traffic_daily (account_id, recorded_at, traffic) VALUES (?, ?, ?)
+             ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic",
+            &[j_i64(account_id), j_i64(day), j_f64(value)],
         )
         .await?;
         Ok(())
     }
 
-    /// 有变化才写；`heartbeat_ms` 内数值完全相同的采样会被跳过。
-    ///
-    /// 返回 `true` 表示确实写入了一行。
-    pub async fn sample_history(
-        &self,
-        account_id: i64,
-        recorded_at: i64,
-        domestic_bytes: i64,
-        overseas_bytes: i64,
-        heartbeat_ms: i64,
-    ) -> Result<bool> {
-        let domestic = domestic_bytes.max(0);
-        let overseas = overseas_bytes.max(0);
-        if let Some(last) = self.latest_history(account_id).await? {
-            let unchanged = last.domestic_bytes == domestic && last.overseas_bytes == overseas;
-            let fresh = recorded_at.saturating_sub(last.recorded_at) < heartbeat_ms.max(0);
-            if unchanged && fresh {
-                return Ok(false);
-            }
-        }
-        self.insert_history(account_id, recorded_at, domestic, overseas)
-            .await?;
-        Ok(true)
-    }
-
-    /// 按时间粒度聚合历史流量。
-    ///
-    /// `offset_ms` 为本地时区偏移，用于把「天」桶对齐到本地 00:00
-    /// （否则 UTC+8 的一天会被切成 08:00 → 次日 08:00）。
-    /// 每个桶取 `MAX`——CDT 上报的是账期累计值，单调递增，最大值即桶末值。
-    ///
-    /// 桶宽是编译期常量（来自 `HistoryBucket`），直接内联进 SQL；
-    /// 其余参数用 `CAST(? AS INTEGER)` 强制整数语义，避免 D1 把绑定值
-    /// 当 REAL 参与运算后产生浮点分桶。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn aggregate_history(
+    /// 取最近 N 个小时点 / 天点，按时间升序返回。
+    pub async fn traffic_history(
         &self,
         account_id: i64,
         bucket: HistoryBucket,
-        offset_ms: i64,
-        since_ms: i64,
-        until_ms: i64,
-        limit: u32,
-    ) -> Result<Vec<TrafficPoint>> {
+    ) -> Result<Vec<TrafficSample>> {
+        let (table, limit) = match bucket {
+            HistoryBucket::Hour => ("traffic_hourly", 25i64),
+            HistoryBucket::Day => ("traffic_daily", 31i64),
+        };
         #[derive(Deserialize)]
         struct Row {
-            bucket_start: i64,
-            domestic_bytes: i64,
-            overseas_bytes: i64,
-            total_bytes: i64,
+            traffic: f64,
+            recorded_at: i64,
         }
-
-        let width = bucket.width_ms();
         let sql = format!(
-            "SELECT CAST((recorded_at + CAST(? AS INTEGER)) / {width} AS INTEGER) * {width}
-                    - CAST(? AS INTEGER) AS bucket_start,
-                    MAX(domestic_bytes) AS domestic_bytes,
-                    MAX(overseas_bytes) AS overseas_bytes,
-                    MAX(total_bytes) AS total_bytes
-             FROM traffic_history
-             WHERE account_id = CAST(? AS INTEGER)
-               AND recorded_at >= CAST(? AS INTEGER)
-               AND recorded_at <= CAST(? AS INTEGER)
-             GROUP BY bucket_start
-             ORDER BY bucket_start DESC
-             LIMIT CAST(? AS INTEGER)"
+            "SELECT traffic, recorded_at FROM {table}
+             WHERE account_id = ?
+             ORDER BY recorded_at DESC
+             LIMIT {limit}"
         );
-
-        let rows: Vec<Row> = self
-            .query(
-                &sql,
-                &[
-                    j_i64(offset_ms),
-                    j_i64(offset_ms),
-                    j_i64(account_id),
-                    j_i64(since_ms),
-                    j_i64(until_ms),
-                    j_i64(limit.clamp(1, 720) as i64),
-                ],
-            )
-            .await?;
-
-        let mut points: Vec<TrafficPoint> = rows
+        let rows: Vec<Row> = self.query(&sql, &[j_i64(account_id)]).await?;
+        let mut out: Vec<TrafficSample> = rows
             .into_iter()
-            .map(|r| TrafficPoint {
-                recorded_at: r.bucket_start,
-                domestic_bytes: r.domestic_bytes.max(0),
-                overseas_bytes: r.overseas_bytes.max(0),
-                total_bytes: r.total_bytes.max(0),
+            .map(|r| TrafficSample {
+                recorded_at: r.recorded_at,
+                traffic_gb: r.traffic.max(0.0),
             })
             .collect();
-        points.sort_by_key(|p| p.recorded_at);
-        Ok(points)
-    }
-
-    /// 采样条数（诊断用）。
-    pub async fn history_count(&self, account_id: i64) -> Result<i64> {
-        self.scalar_i64(
-            "SELECT COUNT(*) AS value FROM traffic_history WHERE account_id = ?",
-            &[j_i64(account_id)],
-        )
-        .await
+        out.sort_by_key(|p| p.recorded_at);
+        Ok(out)
     }
 
     // =======================================================================
@@ -1022,11 +927,19 @@ impl Db {
 
     /// 清理过期流量采样。
     pub async fn purge_history(&self, before_ms: i64) -> Result<usize> {
-        self.exec(
-            "DELETE FROM traffic_history WHERE recorded_at < ?",
-            &[j_i64(before_ms)],
-        )
-        .await
+        let hourly = self
+            .exec(
+                "DELETE FROM traffic_hourly WHERE recorded_at < ?",
+                &[j_i64(before_ms)],
+            )
+            .await?;
+        let daily = self
+            .exec(
+                "DELETE FROM traffic_daily WHERE recorded_at < ?",
+                &[j_i64(before_ms)],
+            )
+            .await?;
+        Ok(hourly + daily)
     }
 
     /// 统计各表行数，供设置页「存储」信息展示。
@@ -1035,7 +948,10 @@ impl Db {
             .scalar_i64("SELECT COUNT(*) AS value FROM accounts", &[])
             .await?;
         let samples = self
-            .scalar_i64("SELECT COUNT(*) AS value FROM traffic_history", &[])
+            .scalar_i64(
+                "SELECT (SELECT COUNT(*) FROM traffic_hourly) + (SELECT COUNT(*) FROM traffic_daily) AS value",
+                &[],
+            )
             .await?;
         let logs = self
             .scalar_i64("SELECT COUNT(*) AS value FROM action_logs", &[])

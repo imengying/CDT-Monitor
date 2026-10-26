@@ -59,8 +59,7 @@ use crate::device::{client_ip, client_ua, same_origin_ok, short_device, short_ip
 use crate::http::{query_i64, query_map, query_str, query_u32, read_json};
 use crate::models::{
     AcceptedJob, AccountInput, AdvancedConfig, AdvancedSettingsDto, ApiErrorBody, BarkConfig,
-    BarkSettingsDto, BarkSettingsUpdate, DailyReportConfig, DailyReportDto, HistoryBucket,
-    HistoryQuery, JobDto, JobStatus, JobType, LoginRequest, NotifyChannel, NotifyTestRequest,
+    BarkSettingsDto, BarkSettingsUpdate, DailyReportConfig, DailyReportDto,     JobDto, JobStatus, JobType, LoginRequest, NotifyChannel, NotifyTestRequest,
     SessionResponse, SessionsResponse, SettingsDto, TelegramConfig, TelegramSettingsDto,
     TelegramSettingsUpdate, TrafficHistoryResponse, TurnstileConfig, TurnstileSettingsDto,
     TurnstileSettingsUpdate, build_overview, is_supported_timezone, now_ms, setting_key,
@@ -79,8 +78,6 @@ const LOGIN_FAILURE_DELAY_MS: u64 = 350;
 const MAX_JOBS: u32 = 50;
 /// 单次查询返回的日志数量上限。
 const MAX_LOGS: u32 = 200;
-/// 历史图表的点数上限。
-const MAX_HISTORY_POINTS: u32 = 720;
 
 // ===========================================================================
 // 响应工具
@@ -697,15 +694,11 @@ async fn handle_overview(app: &AppCtx) -> worker::Result<Response> {
     })
 }
 
-/// `GET /api/v1/history?account_id=&bucket=hour|day&limit=`
+/// `GET /api/v1/history?account_id=`
+///
+/// 一次返回小时点（最近 25 个）与天点（最近 31 个），由前端切换展示。
 async fn handle_history(app: &AppCtx, req: &Request) -> worker::Result<Response> {
     let params = query_map(req);
-    let bucket = query_str(&params, "bucket")
-        .map(HistoryBucket::from_query)
-        .unwrap_or(HistoryBucket::Hour);
-    let limit = query_u32(&params, "limit")
-        .unwrap_or_else(|| bucket.default_limit())
-        .clamp(1, MAX_HISTORY_POINTS);
 
     let account_id = match query_i64(&params, "account_id") {
         Some(id) => id,
@@ -724,15 +717,8 @@ async fn handle_history(app: &AppCtx, req: &Request) -> worker::Result<Response>
         .await?
         .ok_or_else(|| worker::Error::RustError("账号不存在".to_string()))?;
 
-    let query = HistoryQuery {
-        account_id: Some(account_id),
-        bucket,
-        limit,
-    };
     let scheduler = Scheduler::with_now(&app.env, app.now).await?;
-    let points = scheduler
-        .traffic_history(account_id, query.bucket, query.limit)
-        .await?;
+    let history = scheduler.traffic_history(account_id).await?;
 
     let billing_month = crate::models::billing_month(app.now, &app.timezone);
     let triggered = app
@@ -743,13 +729,11 @@ async fn handle_history(app: &AppCtx, req: &Request) -> worker::Result<Response>
         .unwrap_or(false);
 
     ok(&TrafficHistoryResponse {
-        account_id,
-        bucket,
-        domestic_limit_gb: account.domestic_limit_gb,
-        overseas_limit_gb: account.overseas_limit_gb,
+        history,
+        traffic_threshold_gb: account.traffic_threshold_gb,
+        quota_gb: account.quota_pool().quota_gb(),
         billing_month,
         threshold_triggered: triggered,
-        points,
     })
 }
 
@@ -820,10 +804,9 @@ async fn handle_create_account(app: &AppCtx, mut req: Request) -> worker::Result
             payload.site_type.as_str(),
             payload.access_key_id.trim(),
             &encrypted,
-            &payload.regions_json(),
-            payload.domestic_limit_gb,
-            payload.overseas_limit_gb,
-            payload.spike_threshold_gb,
+            &payload.normalized_region(),
+            payload.normalized_instance_id().as_deref(),
+            payload.traffic_threshold_gb,
             payload.over_limit_action.as_str(),
             payload.stop_mode.as_str(),
             payload.normalized_schedule_start().as_deref(),
@@ -886,10 +869,9 @@ async fn handle_update_account(
             payload.site_type.as_str(),
             payload.access_key_id.trim(),
             encrypted.as_deref(),
-            &payload.regions_json(),
-            payload.domestic_limit_gb,
-            payload.overseas_limit_gb,
-            payload.spike_threshold_gb,
+            &payload.normalized_region(),
+            payload.normalized_instance_id().as_deref(),
+            payload.traffic_threshold_gb,
             payload.over_limit_action.as_str(),
             payload.stop_mode.as_str(),
             payload.normalized_schedule_start().as_deref(),
@@ -1765,7 +1747,7 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     let report = scheduler.run_cron().await;
     log_info!("Cron 汇总：{}", report.summary());
 
-    if report.accounts_failed > 0 || report.thresholds_fired > 0 || report.spikes_detected > 0 {
+    if report.accounts_failed > 0 || report.thresholds_fired > 0 {
         // 每 6 小时最多一条汇总：持续故障不应该每 15 分钟提醒一次。
         let bucket = crate::models::now_ms() / (6 * 60 * 60 * 1000);
         let _ = scheduler

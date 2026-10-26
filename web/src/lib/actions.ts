@@ -10,7 +10,7 @@
  * * 写操作完成后自动刷新受影响的数据（概览 / 图表 / 设置）。
  */
 
-import { ApiError, api, type HistoryBucket, type NotifyChannel } from '@/api/client'
+import { ApiError, api, type NotifyChannel } from '@/api/client'
 import { store, toast } from '@/lib/store'
 
 /** 会话失效：清空数据并回到登录页。 */
@@ -19,12 +19,9 @@ export function handleUnauthorized(notifyUser = true): void {
     phase: 'unauthenticated',
     overview: null,
     settings: null,
-    chartData: null,
-    chartAccountId: null,
     settingsOpen: false,
     logsOpen: false,
     overviewError: '',
-    chartError: '',
   })
   if (notifyUser) {
     toast('会话已失效，请重新登录', 'warn')
@@ -93,20 +90,6 @@ export async function loadOverview(): Promise<void> {
   try {
     const overview = await api.overview()
     store.patch({ overview, overviewLoading: false })
-
-    // 图表默认选中第一个账号
-    const accounts = overview.accounts
-    const current = store.get().chartAccountId
-    if (accounts.length === 0) {
-      store.patch({ chartAccountId: null, chartData: null })
-      return
-    }
-    const exists = current !== null && accounts.some((account) => account.id === current)
-    if (!exists) {
-      const firstId = accounts[0].id
-      store.patch({ chartAccountId: firstId })
-      await loadChart()
-    }
   } catch (error) {
     store.patch({ overviewLoading: false })
     if (error instanceof ApiError && error.isUnauthorized) {
@@ -137,51 +120,6 @@ export async function loadSettings(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// 图表
-// ---------------------------------------------------------------------------
-
-export async function loadChart(): Promise<void> {
-  const accountId = store.get().chartAccountId
-  if (accountId === null) {
-    store.patch({ chartData: null })
-    return
-  }
-  store.patch({ chartLoading: true, chartError: '' })
-  try {
-    const data = await api.history(accountId, store.get().chartBucket)
-    // 请求期间用户可能已切换账号，避免把过期结果写进 store
-    if (store.get().chartAccountId !== accountId) {
-      store.patch({ chartLoading: false })
-      return
-    }
-    store.patch({ chartData: data, chartLoading: false })
-  } catch (error) {
-    store.patch({ chartLoading: false })
-    if (error instanceof ApiError && error.isUnauthorized) {
-      handleUnauthorized()
-      return
-    }
-    store.patch({
-      chartError: error instanceof ApiError ? error.message : '加载历史流量失败',
-      chartData: null,
-    })
-  }
-}
-
-/** 切换图表账号。 */
-export async function selectChartAccount(accountId: number): Promise<void> {
-  store.patch({ chartAccountId: accountId })
-  await loadChart()
-}
-
-/** 切换图表粒度。 */
-export async function setChartBucket(bucket: HistoryBucket): Promise<void> {
-  if (store.get().chartBucket === bucket) return
-  store.patch({ chartBucket: bucket })
-  await loadChart()
-}
-
-// ---------------------------------------------------------------------------
 // 动作
 // ---------------------------------------------------------------------------
 
@@ -199,26 +137,17 @@ export async function refreshAll(): Promise<void> {
   } finally {
     store.patch({ refreshingAll: false })
     await loadOverview()
-    if (store.get().chartAccountId !== null) {
-      await loadChart()
-    }
   }
 }
 
 /** 设置保存后的统一刷新。 */
 export async function afterSettingsChanged(): Promise<void> {
   await Promise.all([loadSettings(), loadOverview()])
-  if (store.get().chartAccountId !== null) {
-    await loadChart()
-  }
 }
 
 /** 单账号动作后的刷新。 */
 export async function afterAccountChanged(): Promise<void> {
   await loadOverview()
-  if (store.get().chartAccountId !== null) {
-    await loadChart()
-  }
 }
 
 /** 测试通知渠道。 */
