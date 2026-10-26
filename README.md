@@ -309,10 +309,14 @@ bun run dev:web                  # :5173
 
 | 用途 | Action | Version |
 |---|---|---|
-| CDT 流量 | `ListCdtInternetTraffic`（失败回退 `GetCdtInternetTraffic`） | 2021-08-13 |
+| CDT 流量 | `ListCdtInternetTraffic` | 2021-08-13 |
 | ECS 查询 | `DescribeInstances`（自动翻页，上限 2000 台） | 2014-05-26 |
 | ECS 控制 | `StartInstance` / `StopInstance`（含 `StoppedMode`） | 2014-05-26 |
 | 余额 | `QueryAccountBalance` | 2017-12-14 |
+
+`ListCdtInternetTraffic` 返回的 `Traffic` 单位是 **Byte**（与计费项 Code
+`ECS_Out_Bytes` / `Eip_Out_Bytes` 的底层口径一致），控制台与账单才换算成 GB。
+`traffic_unit_is_bytes` 测试钉死这一点。
 
 ### 免费额度与阈值
 
@@ -380,7 +384,7 @@ assert_eq!(sign("testsecret", &to_sign), "OLeaidS1JvxuMvnyHOwuJ+uX5qY=");
 ## 开发与校验
 
 ```bash
-cargo test                                                    # 85 个单元测试
+cargo test                                                    # 86 个单元测试
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 bun run typecheck:web
 bun run check:config

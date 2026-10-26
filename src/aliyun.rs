@@ -592,7 +592,12 @@ pub struct AccountBalance {
 
 /// CDT 流量汇总（字节）。
 ///
-/// 字段结构依据 `ListCdtInternetTraffic` 的实际响应：
+/// `Traffic` 的单位是 **Byte**，不是 GB。依据：
+///
+/// * 阿里云 CDT 计费项 Code 统一以 `_Bytes` 结尾
+///   （`ECS_Out_Bytes` / `Eip_Out_Bytes` / `CDTIR_Out_Bytes`），
+///   底层计量与接口返回同一口径；
+/// * 实际响应里的数值也是字节量级，例如整 GiB 的倍数：
 ///
 /// ```json
 /// { "TrafficDetails": [
@@ -600,6 +605,8 @@ pub struct AccountBalance {
 ///     { "BusinessRegionId": "cn-hongkong", "Traffic": 2147483648 }
 /// ] }
 /// ```
+///
+/// 控制台与账单展示时才换算成 GB，**接口层不做换算**。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CdtTraffic {
     /// 中国内地地域流量。
@@ -907,10 +914,11 @@ fn truncate_json(value: &Value, max_chars: usize) -> String {
 // 便捷封装
 // ===========================================================================
 
-/// 流量合计低于此值时视为「单位可能不是字节」并发告警。
+/// 流量合计低于此值时发告警。
 ///
-/// 取 1 KiB：真实账号只要产生过任何公网流量，累计值都不会这么小；
-/// 而若接口返回的是 GB 数值（如 `0.03`），按字节解释就会落到这个区间。
+/// 单位已由官方口径确认是 Byte（见 [`CdtTraffic`]），这里只是兜底：
+/// 万一哪天接口改成返回 GB，按字节解释会低估 1024³ 倍、熔断永不触发，
+/// 而真实账号只要跑过流量就不会低到 1 KiB 以下，因此这个下限能把它抓出来。
 const MIN_PLAUSIBLE_TRAFFIC_BYTES: i64 = 1024;
 
 /// 一轮账号同步的原始结果（尚未写入 D1）。
@@ -1046,6 +1054,30 @@ mod tests {
         assert_eq!(traffic.items, 4);
         assert_eq!(traffic.unclassified_bytes, 0);
         assert_eq!(traffic.total_bytes(), 8 * 1073741824);
+    }
+
+    /// `Traffic` 单位是 Byte，不是 GB。
+    ///
+    /// 这条测试把单位钉死：若有人把解析改成「按 GB 解释」，
+    /// 20 GiB 会变成 20 字节，熔断将永不触发。
+    #[test]
+    fn cdt_traffic_unit_is_bytes() {
+        // 20 GiB 的免费额度，按字节表示应为 21474836480
+        let value = serde_json::json!({
+            "TrafficDetails": [
+                { "BusinessRegionId": "cn-hongkong", "Traffic": 21_474_836_480i64 }
+            ]
+        });
+        let traffic = CdtTraffic::parse(&value, SiteType::China);
+
+        // 必须正好等于 20 GiB，而不是 20
+        assert_eq!(traffic.overseas_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(traffic.domestic_bytes, 0);
+        assert!(
+            traffic.total_bytes() > crate::models::gb_to_bytes(19.9),
+            "按字节解释应达到 20 GiB，实际 {}",
+            traffic.total_bytes()
+        );
     }
 
     #[test]
