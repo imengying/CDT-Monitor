@@ -52,6 +52,17 @@ function main(): void {
     hint: "否则 API 请求可能被 SPA 回退吞掉",
   });
 
+  // --- Worker 名称 ---
+  //
+  // 名称必须与仓库里其它地方一致（Cargo.toml / package.json / D1 库名）。
+  // 改名后若只改了一处，Cloudflare 会在构建时提示配置不一致，并可能
+  // 自动提 PR 覆盖；这里提前拦住。
+  checks.push({
+    name: 'name = "cdt-monitor"',
+    ok: /^name\s*=\s*"cdt-monitor"\s*$/m.test(raw),
+    hint: "Worker 名需与 Cargo.toml、package.json、D1 database_name 保持一致",
+  });
+
   // --- D1 绑定 ---
   checks.push({
     name: "[[d1_databases]] 绑定名为 DB",
@@ -88,6 +99,34 @@ function main(): void {
     name: "LOG_LEVEL 默认 error",
     ok: /^LOG_LEVEL\s*=\s*"error"/m.test(raw),
     hint: "正常巡检不应输出流程日志",
+  });
+
+  // --- 跨文件名称一致性 ---
+  //
+  // 这三处任一不同步，都会在 Cloudflare 侧表现为「配置与仓库不一致」。
+  const nameIn = (file: string, pattern: RegExp): string | null => {
+    try {
+      const text = readFileSync(file, "utf8");
+      return text.match(pattern)?.[1] ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  const workerName = raw.match(/^name\s*=\s*"([^"]+)"/m)?.[1] ?? null;
+  const crateName =
+    nameIn("Cargo.toml", /^\[package\][\s\S]*?^name\s*=\s*"([^"]+)"/m);
+  const pkgName = nameIn("package.json", /"name"\s*:\s*"([^"]+)"/);
+
+  checks.push({
+    name: "Cargo.toml 的 crate 名与 Worker 名一致",
+    ok: workerName !== null && crateName === workerName,
+    hint: `wrangler.toml=${workerName ?? "?"}，Cargo.toml=${crateName ?? "?"}`,
+  });
+  checks.push({
+    name: "package.json 的 name 与 Worker 名一致",
+    ok: workerName !== null && pkgName === workerName,
+    hint: `wrangler.toml=${workerName ?? "?"}，package.json=${pkgName ?? "?"}`,
   });
 
   let failed = 0;
