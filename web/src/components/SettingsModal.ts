@@ -41,26 +41,63 @@ type Tab = 'accounts' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'system'
 /**
  * 可选地域。
  *
- * 每个地域单独发一次 DescribeInstances，勾选越多刷新越慢，
- * 因此只列常用的几个，够覆盖 CDT 免费额度的主力区域。
+ * 每勾一个地域就要单独发一次 DescribeInstances，勾得越多刷新越慢，
+ * 所以只收录阿里云实际提供的地域。已下线（如南京、福州本地地域）的不列。
+ *
+ * 国内统一用城市名，省得「华南1（深圳）」这种编号占宽度。
  */
-const REGION_OPTIONS: { value: string; label: string }[] = [
-  { value: 'cn-hangzhou', label: '华东 1（杭州）' },
-  { value: 'cn-shanghai', label: '华东 2（上海）' },
-  { value: 'cn-beijing', label: '华北 2（北京）' },
-  { value: 'cn-shenzhen', label: '华南 1（深圳）' },
-  { value: 'cn-hongkong', label: '中国香港' },
-  { value: 'ap-southeast-1', label: '新加坡' },
-  { value: 'ap-northeast-1', label: '日本（东京）' },
-  { value: 'us-west-1', label: '美国（硅谷）' },
-  { value: 'us-east-1', label: '美国（弗吉尼亚）' },
-  { value: 'eu-central-1', label: '德国（法兰克福）' },
+interface RegionOption {
+  value: string
+  label: string
+  /** 面板里的分组标题；空串表示不显示标题（香港单列在最前）。 */
+  group: string
+}
+
+const REGION_OPTIONS: RegionOption[] = [
+  { value: 'cn-hongkong', label: '香港', group: '' },
+
+  { value: 'cn-qingdao', label: '青岛', group: '中国内地' },
+  { value: 'cn-beijing', label: '北京', group: '中国内地' },
+  { value: 'cn-zhangjiakou', label: '张家口', group: '中国内地' },
+  { value: 'cn-huhehaote', label: '呼和浩特', group: '中国内地' },
+  { value: 'cn-wulanchabu', label: '乌兰察布', group: '中国内地' },
+  { value: 'cn-wulanchabu-acdr-1', label: '乌兰察布（专属云）', group: '中国内地' },
+  { value: 'cn-wulanchabu-gic-1', label: '乌兰察布（通用行业云）', group: '中国内地' },
+  { value: 'cn-hangzhou', label: '杭州', group: '中国内地' },
+  { value: 'cn-hangzhou-acdr-ut-1', label: '杭州（专属云）', group: '中国内地' },
+  { value: 'cn-shanghai', label: '上海', group: '中国内地' },
+  { value: 'cn-shanghai-cloudspe', label: '上海（云预发演练）', group: '中国内地' },
+  { value: 'cn-shenzhen', label: '深圳', group: '中国内地' },
+  { value: 'cn-heyuan', label: '河源', group: '中国内地' },
+  { value: 'cn-guangzhou', label: '广州', group: '中国内地' },
+  { value: 'cn-zhongwei', label: '中卫', group: '中国内地' },
+  { value: 'cn-wuhan-lr', label: '武汉（本地地域）', group: '中国内地' },
+  { value: 'cn-chengdu', label: '成都', group: '中国内地' },
+
+  { value: 'ap-northeast-1', label: '日本（东京）', group: '亚太' },
+  { value: 'ap-northeast-2', label: '韩国（首尔）', group: '亚太' },
+  { value: 'ap-southeast-1', label: '新加坡', group: '亚太' },
+  { value: 'ap-southeast-3', label: '马来西亚（吉隆坡）', group: '亚太' },
+  { value: 'ap-southeast-8', label: '马来西亚（柔佛州）', group: '亚太' },
+  { value: 'ap-southeast-5', label: '印度尼西亚（雅加达）', group: '亚太' },
+  { value: 'ap-southeast-6', label: '菲律宾（马尼拉）', group: '亚太' },
+  { value: 'ap-southeast-7', label: '泰国（曼谷）', group: '亚太' },
+
+  { value: 'us-east-1', label: '美国（弗吉尼亚）', group: '北美' },
+  { value: 'us-west-1', label: '美国（硅谷）', group: '北美' },
+  { value: 'us-southeast-1', label: '美国（亚特兰大）', group: '北美' },
+  { value: 'na-south-1', label: '墨西哥', group: '北美' },
+
+  { value: 'eu-west-1', label: '英国（伦敦）', group: '欧洲 / 中东' },
+  { value: 'eu-central-1', label: '德国（法兰克福）', group: '欧洲 / 中东' },
+  { value: 'eu-west-2', label: '法国（巴黎）', group: '欧洲 / 中东' },
+  { value: 'me-east-1', label: '阿联酋（迪拜）', group: '欧洲 / 中东' },
 ]
 
 /** 默认勾选的地域（与后端 `DEFAULT_REGIONS` 保持一致）。 */
 const DEFAULT_REGIONS = ['cn-hangzhou', 'cn-shanghai', 'cn-beijing', 'cn-shenzhen']
 
-/** 地域 → 中文名；不在清单里的原样显示。 */
+/** 地域 → 显示名；不在清单里的原样显示（账号里可能存着已下线的地域）。 */
 function regionLabel(region: string): string {
   return REGION_OPTIONS.find((item) => item.value === region)?.label ?? region
 }
@@ -522,7 +559,7 @@ export class SettingsModal {
       close()
       const rect = trigger.getBoundingClientRect()
       const panel = el('div', {
-        class: 'card absolute z-[70] max-h-64 overflow-y-auto p-2 scroll-thin',
+        class: 'card absolute z-[70] max-h-80 overflow-y-auto p-2 scroll-thin',
         style: {
           left: `${rect.left}px`,
           top: `${rect.bottom + 4}px`,
@@ -532,7 +569,21 @@ export class SettingsModal {
         'aria-label': '选择地域',
       })
 
+      let lastGroup = ''
       for (const option of REGION_OPTIONS) {
+        if (option.group !== lastGroup) {
+          lastGroup = option.group
+          if (option.group) {
+            panel.append(
+              el('div', {
+                class: 'px-2 pt-2 pb-1 text-[0.6875rem] font-semibold tracking-wide',
+                style: { color: 'var(--color-ink-subtle)' },
+                text: option.group,
+              }),
+            )
+          }
+        }
+
         const box = el('input', { type: 'checkbox' }) as HTMLInputElement
         box.checked = selected.includes(option.value)
         box.addEventListener('change', () => {
@@ -541,13 +592,17 @@ export class SettingsModal {
             : selected.filter((item) => item !== option.value)
           selected = next
           onChange(next)
-          replaceChildren(trigger.firstElementChild as HTMLElement, document.createTextNode(this.regionsSummary(next)))
+          replaceChildren(
+            trigger.firstElementChild as HTMLElement,
+            document.createTextNode(this.regionsSummary(next)),
+          )
         })
         panel.append(
           el(
             'label',
             {
-              class: 'flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-[0.8125rem] hover:bg-(--color-surface-muted)',
+              class:
+                'flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-[0.8125rem] hover:bg-(--color-surface-muted)',
               style: { color: 'var(--color-ink)' },
             },
             box,
