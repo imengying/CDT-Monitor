@@ -27,6 +27,7 @@ import {
   setChartBucket,
 } from '@/lib/actions'
 import { AccountList } from '@/components/AccountCard'
+import { AccountCompareChart } from '@/components/AccountCompareChart'
 import { TrafficChart } from '@/components/TrafficChart'
 import { LoginModal } from '@/components/LoginModal'
 import { LogDrawer } from '@/components/LogDrawer'
@@ -43,6 +44,7 @@ export class App {
   private shell: HTMLElement | null = null
   private loginModal: LoginModal | null = null
   private trafficChart: TrafficChart | null = null
+  private compareChart: AccountCompareChart | null = null
   private settingsModal: SettingsModal | null = null
   private logDrawer: LogDrawer | null = null
 
@@ -57,6 +59,8 @@ export class App {
   private chartAccountSelect: HTMLSelectElement | null = null
   private chartThresholdRow: HTMLParagraphElement | null = null
   private chartSlot: HTMLElement | null = null
+  private compareChartSlot: HTMLDivElement | null = null
+  private comparePanel: HTMLElement | null = null
 
   private pollTimer: number | null = null
   private lastPhase: AppState['phase'] | null = null
@@ -152,6 +156,8 @@ export class App {
     this.settingsModal = new SettingsModal()
     this.logDrawer = new LogDrawer()
     this.trafficChart = new TrafficChart()
+    this.compareChart = new AccountCompareChart()
+    this.comparePanel = this.buildComparePanel()
 
     this.refreshButton = el('button', {
       class: 'btn btn-ghost btn-sm',
@@ -184,6 +190,7 @@ export class App {
 
     // 图表容器直接放进占位槽，保证 mount() 时已有可用 DOM
     this.chartSlot?.append(this.trafficChart.element)
+    this.compareChartSlot?.append(this.compareChart.element)
 
     this.shell = el(
       'div',
@@ -196,12 +203,14 @@ export class App {
         this.summaryGrid,
         this.emptyCard,
         this.accountList.element,
+        this.comparePanel,
         this.chartPanel,
       ),
     )
 
     replaceChildren(this.root, this.shell, this.settingsModal.element, this.logDrawer.element)
     this.trafficChart.mount()
+    this.compareChart.mount()
     this.updateShell(state)
   }
 
@@ -303,6 +312,31 @@ export class App {
     )
     card.classList.add('hidden')
     return card
+  }
+
+  /** 多账号对比区块。账号少于 2 个时没有比较意义，整体隐藏。 */
+  private buildComparePanel(): HTMLElement {
+    this.compareChartSlot = el('div', { class: 'px-4 py-3' })
+    const section = el(
+      'section',
+      { class: 'card mt-4 hidden overflow-hidden' },
+      el(
+        'header',
+        {
+          class: 'flex items-center gap-2 border-b px-4 py-2.5',
+          style: { borderColor: 'var(--color-line)' },
+        },
+        iconSvg(icons.chart, 14),
+        el('h2', { class: 'text-sm font-semibold', text: '账号流量对比' }),
+        el('span', {
+          class: 'text-xs',
+          style: { color: 'var(--color-ink-subtle)' },
+          text: '按配额占用比例',
+        }),
+      ),
+      this.compareChartSlot,
+    )
+    return section
   }
 
   private buildChartPanel(): HTMLElement {
@@ -412,6 +446,13 @@ export class App {
     this.renderSummary(accounts)
     this.renderEmptyState(state, accounts)
     this.accountList.render(accounts)
+    // 账号少于 2 个时横向对比没有意义，整块隐藏
+    const comparable = accounts.filter((account) => account.enabled)
+    if (this.comparePanel) {
+      const show = comparable.length >= 2
+      this.comparePanel.classList.toggle('hidden', !show)
+      if (show) this.compareChart?.update(accounts)
+    }
     this.renderChartPanel(state, accounts)
 
     // 图表错误只在变化时提示一次，避免 60 秒轮询反复弹窗
@@ -577,6 +618,8 @@ export class App {
   private teardownShell(): void {
     this.trafficChart?.dispose()
     this.trafficChart = null
+    this.compareChart?.dispose()
+    this.compareChart = null
     this.settingsModal = null
     this.logDrawer = null
     this.shell = null

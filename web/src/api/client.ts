@@ -101,6 +101,15 @@ export interface InstanceInfo {
   keep_alive: boolean
 }
 
+export interface UsageForecast {
+  used_bytes: number
+  projected_bytes: number
+  projected_percent: number
+  exceed_date: string | null
+  days_remaining: number
+  days_elapsed: number
+}
+
 export interface AccountOverview {
   id: number
   name: string
@@ -108,6 +117,7 @@ export interface AccountOverview {
   site_label: string
   access_key_id_masked: string
   traffic_limit_gb: number
+  spike_threshold_gb: number | null
   over_limit_action: OverLimitAction
   over_limit_action_label: string
   stop_mode: StopMode
@@ -128,6 +138,7 @@ export interface AccountOverview {
   threshold_triggered: boolean
   snapshot_updated_at: number | null
   instances: InstanceInfo[]
+  forecast: UsageForecast | null
 }
 
 export interface OverviewResponse {
@@ -188,6 +199,7 @@ export interface AccountDto {
   access_key_id_masked: string
   regions: string[]
   traffic_limit_gb: number
+  spike_threshold_gb: number | null
   over_limit_action: OverLimitAction
   over_limit_action_label: string
   stop_mode: StopMode
@@ -210,6 +222,7 @@ export interface AccountInput {
   access_key_secret?: string
   regions: string[]
   traffic_limit_gb: number
+  spike_threshold_gb: number | null
   over_limit_action: OverLimitAction
   stop_mode: StopMode
   schedule_start_time: string | null
@@ -266,8 +279,14 @@ export interface TurnstileUpdate {
   clear_secret?: boolean
 }
 
+export interface TimeZoneOption {
+  value: string
+  label: string
+}
+
 export interface SettingsResponse {
   timezone: string
+  timezone_options: TimeZoneOption[]
   turnstile: TurnstileSettings
   telegram: TelegramSettings
   bark: BarkSettings
@@ -484,10 +503,13 @@ export const api = {
     return request<TrafficHistoryResponse>(`/api/v1/history?${params.toString()}`)
   },
 
-  logs(limit = 80, accountId?: number): Promise<ActionLog[]> {
+  logs(limit = 80, options: { accountId?: number; action?: string } = {}): Promise<ActionLog[]> {
     const params = new URLSearchParams({ limit: String(limit) })
-    if (accountId !== undefined) {
-      params.set('account_id', String(accountId))
+    if (options.accountId !== undefined) {
+      params.set('account_id', String(options.accountId))
+    }
+    if (options.action) {
+      params.set('action', options.action)
     }
     return request<ActionLog[]>(`/api/v1/logs?${params.toString()}`)
   },
@@ -561,6 +583,19 @@ export const api = {
 
   revokeOtherSessions(): Promise<SessionsResponse> {
     return request<SessionsResponse>('/api/v1/sessions', { method: 'DELETE' })
+  },
+
+  /** 账号内全部实例开关机。 */
+  batchInstances(
+    accountId: number,
+    start: boolean,
+    options: PollOptions = {},
+  ): Promise<JobDto> {
+    return runJob(
+      `/api/v1/accounts/${accountId}/instances/${start ? 'start-all' : 'stop-all'}`,
+      {},
+      options,
+    )
   },
 
   // ---------------------------------------------------------------- 设置

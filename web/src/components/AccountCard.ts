@@ -134,6 +134,9 @@ function signatureOf(account: AccountOverview): string {
     total: account.cdt_total_bytes,
     month: account.billing_month,
     triggered: account.threshold_triggered,
+    forecast: account.forecast
+      ? `${account.forecast.projected_bytes}:${account.forecast.exceed_date ?? ''}`
+      : '',
     instances: account.instances.map((instance) => ({
       id: instance.instance_id,
       name: instance.instance_name,
@@ -426,7 +429,55 @@ export class AccountCard {
           account.overseas_percent,
         ),
         trafficBar('合计', account.cdt_total_bytes, account.traffic_limit_gb, account.total_percent),
+        this.buildForecast(),
       ),
+    )
+  }
+
+  /**
+   * 用量预测。
+   *
+   * 只在本账期已有足够样本（至少一天）时才展示；不足一天时后端返回 null，
+   * 这里不占位，避免卡片上出现一行「暂无预测」的噪音。
+   */
+  private buildForecast(): HTMLElement {
+    const forecast = this.account.forecast
+    if (!forecast) return el('div', { class: 'hidden' })
+
+    const overLimit = forecast.exceed_date !== null
+    const tone = overLimit ? 'var(--color-warn)' : 'var(--color-ink-subtle)'
+
+    const parts: HTMLElement[] = [
+      el('span', { text: '预计月末' }),
+      el('span', {
+        class: 'font-mono font-semibold tabular-nums',
+        style: { color: tone },
+        text: `${(forecast.projected_bytes / 1024 ** 3).toFixed(1)} GB`,
+      }),
+      el('span', {
+        class: 'font-mono tabular-nums',
+        style: { color: 'var(--color-ink-subtle)' },
+        text: `（${forecast.projected_percent.toFixed(1)}%）`,
+      }),
+    ]
+
+    if (overLimit) {
+      parts.push(
+        el('span', {
+          class: 'badge badge-warn',
+          text: `预计 ${forecast.exceed_date} 超限`,
+        }),
+      )
+    }
+
+    return el(
+      'div',
+      {
+        class: 'flex flex-wrap items-center gap-1.5 text-[0.8125rem]',
+        style: { color: 'var(--color-ink-muted)' },
+        title: `已过去 ${forecast.days_elapsed} 天，剩余 ${forecast.days_remaining} 天`,
+      },
+      ...parts,
     )
   }
 
@@ -449,21 +500,31 @@ export class AccountCard {
         ? el('span')
         : el(
             'div',
-            {
-              class: 'flex items-center gap-2 text-[0.8125rem]',
-              style: { color: 'var(--color-ink-subtle)' },
-            },
+            { class: 'flex items-center gap-3' },
             el(
-              'span',
-              { class: 'inline-flex items-center gap-1' },
-              dot('var(--color-ok)'),
-              el('span', { text: `${running} 运行` }),
+              'div',
+              {
+                class: 'hidden items-center gap-2 text-[0.8125rem] sm:flex',
+                style: { color: 'var(--color-ink-subtle)' },
+              },
+              el(
+                'span',
+                { class: 'inline-flex items-center gap-1' },
+                dot('var(--color-ok)'),
+                el('span', { text: `${running} 运行` }),
+              ),
+              el(
+                'span',
+                { class: 'inline-flex items-center gap-1' },
+                dot('var(--color-ink-subtle)'),
+                el('span', { text: `${stopped} 停止` }),
+              ),
             ),
             el(
-              'span',
-              { class: 'inline-flex items-center gap-1' },
-              dot('var(--color-ink-subtle)'),
-              el('span', { text: `${stopped} 停止` }),
+              'div',
+              { class: 'flex items-center gap-1.5' },
+              this.batchButton('全部开机', 'batch-start', true, running === account.instances.length),
+              this.batchButton('全部关机', 'batch-stop', false, stopped === account.instances.length),
             ),
           ),
     )
@@ -688,6 +749,43 @@ export class AccountCard {
       reportError(error, '刷新失败')
     } finally {
       this.markBusy('refresh', false)
+    }
+  }
+
+  /** 批量开关机按钮。无可用实例时禁用，避免点了没反应。 */
+  private batchButton(
+    label: string,
+    key: string,
+    start: boolean,
+    disabled: boolean,
+  ): HTMLButtonElement {
+    const busy = this.busy.has(key)
+    return el(
+      'button',
+      {
+        class: 'btn btn-ghost btn-sm',
+        type: 'button',
+        disabled: disabled || busy,
+        title: disabled ? '没有需要操作的实例' : label,
+        on: { click: () => void this.batchInstances(start, key) },
+      },
+      ...(busy
+        ? [iconSvg(icons.spinner, 12, 'animate-spin')]
+        : [el('span', { text: label })]),
+    ) as HTMLButtonElement
+  }
+
+  private async batchInstances(start: boolean, key: string): Promise<void> {
+    if (this.busy.has(key)) return
+    this.markBusy(key, true)
+    try {
+      const job = await api.batchInstances(this.account.id, start)
+      toast(job.error_msg || (start ? '已提交批量开机' : '已提交批量关机'), 'ok')
+      await afterAccountChanged()
+    } catch (error) {
+      reportError(error, start ? '批量开机失败' : '批量关机失败')
+    } finally {
+      this.markBusy(key, false)
     }
   }
 

@@ -73,6 +73,37 @@ pub fn utc_offset_minutes(tz: &str) -> i32 {
     (sign * total).clamp(-12 * 60, 14 * 60)
 }
 
+/// 可选时区（固定偏移）。
+///
+/// 界面用下拉选择而非自由输入：手填 `UTC+8` 这类字符串格式错了不会报错，
+/// 会被静默按 UTC 处理，导致定时开关机与日报时刻整体偏移。
+pub const TIMEZONE_OPTIONS: &[(&str, &str)] = &[
+    ("UTC-8", "UTC-8 · 美西"),
+    ("UTC-7", "UTC-7 · 美西夏令时"),
+    ("UTC-5", "UTC-5 · 美东"),
+    ("UTC-3", "UTC-3 · 巴西"),
+    ("UTC+0", "UTC+0 · 伦敦"),
+    ("UTC+1", "UTC+1 · 中欧"),
+    ("UTC+3", "UTC+3 · 莫斯科"),
+    ("UTC+4", "UTC+4 · 迪拜"),
+    ("UTC+5:30", "UTC+5:30 · 印度"),
+    ("UTC+6:30", "UTC+6:30 · 缅甸"),
+    ("UTC+7", "UTC+7 · 曼谷 / 雅加达"),
+    ("UTC+8", "UTC+8 · 北京 / 新加坡"),
+    ("UTC+9", "UTC+9 · 东京 / 首尔"),
+    ("UTC+10", "UTC+10 · 悉尼"),
+    ("UTC+12", "UTC+12 · 奥克兰"),
+];
+
+/// 默认时区。
+pub const DEFAULT_TIMEZONE: &str = "UTC+8";
+
+/// 校验是否为受支持的时区取值。
+pub fn is_supported_timezone(tz: &str) -> bool {
+    let tz = tz.trim();
+    TIMEZONE_OPTIONS.iter().any(|(value, _)| *value == tz)
+}
+
 /// 把固定偏移时区转成 `FixedOffset`。
 pub fn fixed_offset(tz: &str) -> FixedOffset {
     let minutes = utc_offset_minutes(tz);
@@ -206,6 +237,121 @@ pub fn human_bytes(bytes: i64) -> String {
         idx += 1;
     }
     format!("{:.2} {}", scaled, units[idx])
+}
+
+// ===========================================================================
+// 用量预测
+// ===========================================================================
+
+/// 用量预测结果。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageForecast {
+    /// 已用量（字节）。
+    pub used_bytes: i64,
+    /// 预计本账期结束时的总量（字节）。
+    pub projected_bytes: i64,
+    /// 相对配额的预计占比（百分比）。
+    pub projected_percent: f64,
+    /// 按当前速率，预计在哪一天超过配额；未超或无法计算时为 `None`。
+    pub exceed_date: Option<String>,
+    /// 距离账期结束的天数（向上取整，至少 0）。
+    pub days_remaining: i64,
+    /// 本账期已过去的天数（至少 1，避免除以 0）。
+    pub days_elapsed: i64,
+}
+
+/// 按线性速率外推本账期总用量。
+///
+/// `elapsed_ms` 为本账期已过去的时长，`total_ms` 为整月时长。
+/// 采样时间过短（不足一天）时不做外推 —— 几个小时的波动会把结果放大到
+/// 荒谬的程度，反而误导判断。
+pub fn forecast_usage(
+    used_bytes: i64,
+    limit_gb: f64,
+    elapsed_ms: i64,
+    total_ms: i64,
+    month_end_date: &str,
+) -> Option<UsageForecast> {
+    if used_bytes <= 0 || elapsed_ms <= 0 || total_ms <= 0 {
+        return None;
+    }
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    let days_elapsed = ((elapsed_ms + DAY_MS - 1) / DAY_MS).max(1);
+    let days_remaining = ((total_ms - elapsed_ms).max(0) + DAY_MS - 1) / DAY_MS;
+
+    // 不足一天不预测
+    if elapsed_ms < DAY_MS {
+        return None;
+    }
+
+    let per_day = used_bytes as f64 / days_elapsed as f64;
+    let projected = (per_day * (total_ms as f64 / DAY_MS as f64)).round() as i64;
+
+    let limit_bytes = gb_to_bytes(limit_gb);
+    let exceed_date = if limit_bytes > 0 && per_day > 0.0 && used_bytes < limit_bytes {
+        let days_to_limit = (limit_bytes - used_bytes) as f64 / per_day;
+        let offset = days_to_limit.ceil() as i64;
+        if offset <= days_remaining {
+            Some(shift_date(month_end_date, -(days_remaining - offset)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Some(UsageForecast {
+        used_bytes,
+        projected_bytes: projected,
+        projected_percent: percent_of_limit(projected, limit_gb),
+        exceed_date,
+        days_remaining,
+        days_elapsed,
+    })
+}
+
+/// 在 `YYYY-MM-DD` 上加减天数（仅用于展示，不处理时区）。
+fn shift_date(date: &str, days: i64) -> String {
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() != 3 {
+        return date.to_string();
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (
+        parts[0].parse::<i32>(),
+        parts[1].parse::<u32>(),
+        parts[2].parse::<u32>(),
+    ) else {
+        return date.to_string();
+    };
+    let Some(base) = chrono::NaiveDate::from_ymd_opt(y, m, d) else {
+        return date.to_string();
+    };
+    base.checked_add_signed(chrono::Duration::days(days))
+        .map(|v| v.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| date.to_string())
+}
+
+/// 判断单次采样是否为异常突变。
+///
+/// 只对「本次比上次增长超过 `threshold_bytes`」告警，且要求距上次采样足够近：
+/// 若上次采样是三天前，增长很大是正常的，不是突变。
+pub fn is_traffic_spike(
+    previous_bytes: i64,
+    current_bytes: i64,
+    since_last_ms: i64,
+    threshold_bytes: i64,
+    max_gap_ms: i64,
+) -> bool {
+    if previous_bytes < 0 || current_bytes <= previous_bytes {
+        return false;
+    }
+    if since_last_ms <= 0 || since_last_ms > max_gap_ms {
+        return false;
+    }
+    if threshold_bytes <= 0 {
+        return false;
+    }
+    current_bytes - previous_bytes >= threshold_bytes
 }
 
 /// 金额文案，例如 `¥ 12.30`。
@@ -502,6 +648,8 @@ pub struct AccountRow {
     pub encrypted_access_key_secret: String,
     pub regions_json: String,
     pub traffic_limit_gb: f64,
+    /// 突变告警阈值（GB）；`None` 表示使用全局默认值。
+    pub spike_threshold_gb: Option<f64>,
     pub over_limit_action: String,
     pub stop_mode: String,
     pub schedule_start_time: Option<String>,
@@ -569,6 +717,7 @@ impl AccountRow {
             access_key_id_masked: mask_secret(&self.access_key_id),
             regions: self.regions(),
             traffic_limit_gb: self.traffic_limit_gb,
+            spike_threshold_gb: self.spike_threshold_gb,
             over_limit_action: self.action(),
             over_limit_action_label: self.action().label().to_string(),
             stop_mode: self.stop_mode(),
@@ -766,6 +915,17 @@ pub struct SessionDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionsResponse {
     pub sessions: Vec<SessionDto>,
+}
+
+/// 操作日志查询条件。
+#[derive(Debug, Clone, Default)]
+pub struct LogFilter {
+    pub account_id: Option<i64>,
+    /// 动作类型前缀，例如 `login` 命中 `login_success` / `login_failed`。
+    pub action_prefix: Option<String>,
+    /// 明细关键字（SQL LIKE，区分大小写）。
+    pub keyword: Option<String>,
+    pub limit: u32,
 }
 
 /// `action_logs` 表行（带账号名，便于界面直接展示）。
@@ -974,6 +1134,8 @@ pub struct AccountDto {
     pub access_key_id_masked: String,
     pub regions: Vec<String>,
     pub traffic_limit_gb: f64,
+    /// 突变告警阈值（GB）；`None` 表示使用默认值。
+    pub spike_threshold_gb: Option<f64>,
     pub over_limit_action: OverLimitAction,
     pub over_limit_action_label: String,
     pub stop_mode: StopMode,
@@ -1000,6 +1162,9 @@ pub struct AccountInput {
     #[serde(default)]
     pub regions: Vec<String>,
     pub traffic_limit_gb: f64,
+    /// 突变告警阈值（GB）；省略或 `null` 用默认值，0 表示关闭。
+    #[serde(default)]
+    pub spike_threshold_gb: Option<f64>,
     pub over_limit_action: OverLimitAction,
     pub stop_mode: StopMode,
     #[serde(default)]
@@ -1107,6 +1272,8 @@ pub struct AccountOverview {
     pub threshold_triggered: bool,
     pub snapshot_updated_at: Option<i64>,
     pub instances: Vec<InstanceInfo>,
+    /// 本账期用量预测；样本不足时为 `None`。
+    pub forecast: Option<UsageForecast>,
 }
 
 /// 首页整体响应。
@@ -1202,6 +1369,24 @@ pub struct BarkSettingsUpdate {
     pub alert_level: PushLevel,
 }
 
+/// 时区下拉项。
+#[derive(Debug, Clone, Serialize)]
+pub struct TimeZoneOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// 时区下拉项全集。
+pub fn timezone_options() -> Vec<TimeZoneOption> {
+    TIMEZONE_OPTIONS
+        .iter()
+        .map(|(value, label)| TimeZoneOption {
+            value: value.to_string(),
+            label: label.to_string(),
+        })
+        .collect()
+}
+
 /// Turnstile 设置（脱敏：私钥只回 `secret_configured`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct TurnstileSettingsDto {
@@ -1237,6 +1422,8 @@ pub struct DailyReportDto {
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsDto {
     pub timezone: String,
+    /// 可选时区（value, label），供界面下拉使用。
+    pub timezone_options: Vec<TimeZoneOption>,
     pub turnstile: TurnstileSettingsDto,
     pub telegram: TelegramSettingsDto,
     pub bark: BarkSettingsDto,
@@ -1298,6 +1485,16 @@ pub fn build_overview(
         None => (0, 0, 0, None, None, None, false, Vec::new()),
     };
 
+    // 用量预测：样本不足一天时不外推
+    let (month_start, month_end) = month_bounds_ms(now, timezone);
+    let forecast = forecast_usage(
+        total,
+        account.traffic_limit_gb,
+        (now - month_start).max(0),
+        (month_end - month_start).max(0),
+        &local_date(month_end - 1, timezone),
+    );
+
     AccountOverview {
         id: account.id,
         name: account.name.clone(),
@@ -1325,6 +1522,7 @@ pub fn build_overview(
         threshold_triggered: triggered,
         snapshot_updated_at: updated_at,
         instances,
+        forecast,
     }
 }
 
@@ -1339,6 +1537,106 @@ mod tests {
         assert_eq!(utc_offset_minutes("GMT+8:00"), 480);
         assert_eq!(utc_offset_minutes(""), 0);
         assert_eq!(utc_offset_minutes("+9"), 540);
+    }
+
+    #[test]
+    fn timezone_options_are_parseable() {
+        // 下拉里的每个取值都必须能被解析器正确理解，
+        // 否则选中后行为会静默退回 UTC。
+        for (value, _label) in TIMEZONE_OPTIONS {
+            let minutes = utc_offset_minutes(value);
+            let expected: i32 = {
+                let body = value.trim_start_matches("UTC");
+                let (sign, rest) = match body.chars().next() {
+                    Some('-') => (-1, &body[1..]),
+                    Some('+') => (1, &body[1..]),
+                    _ => (1, body),
+                };
+                let mut parts = rest.split(':');
+                let h: i32 = parts.next().unwrap().parse().unwrap();
+                let m: i32 = parts.next().map(|v| v.parse().unwrap()).unwrap_or(0);
+                sign * (h * 60 + m)
+            };
+            assert_eq!(minutes, expected, "{value} 解析不一致");
+        }
+    }
+
+    #[test]
+    fn default_timezone_is_supported() {
+        assert!(is_supported_timezone(DEFAULT_TIMEZONE));
+        assert!(is_supported_timezone("UTC+8"));
+        assert!(is_supported_timezone("UTC+5:30"));
+        assert!(!is_supported_timezone("UTC+8:15"), "非白名单取值应被拒绝");
+        assert!(!is_supported_timezone("Asia/Shanghai"), "不支持 IANA 名称");
+        assert!(!is_supported_timezone(""));
+    }
+
+    #[test]
+    fn forecast_skips_short_window() {
+        // 不足一天不预测：样本太少，外推没有意义
+        let day = 24 * 60 * 60 * 1000i64;
+        assert!(forecast_usage(1_000_000, 20.0, day / 2, day * 30, "2026-10-31").is_none());
+        assert!(forecast_usage(0, 20.0, day * 5, day * 30, "2026-10-31").is_none());
+    }
+
+    #[test]
+    fn forecast_extrapolates_linearly() {
+        let day = 24 * 60 * 60 * 1000i64;
+        // 10 天用了 10 GiB，整月 30 天 → 预计 30 GiB
+        let used = gb_to_bytes(10.0);
+        let f = forecast_usage(used, 100.0, day * 10, day * 30, "2026-10-31").expect("应能预测");
+        assert_eq!(f.days_elapsed, 10);
+        assert_eq!(f.days_remaining, 20);
+        // 预计 30 GiB，允许舍入误差
+        let projected_gb = bytes_to_gb(f.projected_bytes);
+        assert!((projected_gb - 30.0).abs() < 0.01, "实际 {projected_gb}");
+        assert!((f.projected_percent - 30.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn forecast_predicts_exceed_date() {
+        let day = 24 * 60 * 60 * 1000i64;
+        // 10 天用 50 GiB，配额 100 GiB → 第 20 天用完
+        let used = gb_to_bytes(50.0);
+        let f = forecast_usage(used, 100.0, day * 10, day * 30, "2026-10-31").expect("应能预测");
+        assert_eq!(f.exceed_date.as_deref(), Some("2026-10-21"));
+    }
+
+    #[test]
+    fn forecast_no_exceed_date_when_under_limit() {
+        let day = 24 * 60 * 60 * 1000i64;
+        // 10 天用 1 GiB，配额 100 GiB → 月底用量远低于配额
+        let used = gb_to_bytes(1.0);
+        let f = forecast_usage(used, 100.0, day * 10, day * 30, "2026-10-31").expect("应能预测");
+        assert!(f.exceed_date.is_none());
+    }
+
+    #[test]
+    fn spike_detection() {
+        let gb = gb_to_bytes(1.0);
+        let one_hour = 60 * 60 * 1000;
+        // 一小时内涨了 2 GiB，阈值 1 GiB → 是突变
+        assert!(is_traffic_spike(gb, gb * 3, one_hour, gb, 2 * one_hour));
+        // 涨得不够多 → 不算
+        assert!(!is_traffic_spike(
+            gb,
+            gb + gb / 2,
+            one_hour,
+            gb,
+            2 * one_hour
+        ));
+        // 时间跨度太长 → 正常增长，不算突变
+        assert!(!is_traffic_spike(
+            gb,
+            gb * 10,
+            48 * one_hour,
+            gb,
+            2 * one_hour
+        ));
+        // 流量下降（账期重置）→ 不算
+        assert!(!is_traffic_spike(gb * 5, gb, one_hour, gb, 2 * one_hour));
+        // 阈值 <= 0 → 关闭
+        assert!(!is_traffic_spike(gb, gb * 100, one_hour, 0, 2 * one_hour));
     }
 
     #[test]

@@ -47,6 +47,8 @@ interface AccountForm {
   accessKeySecret: string
   regionsText: string
   trafficLimitGb: number
+  /** 突变告警阈值（GB）；null 表示使用默认值，0 表示关闭 */
+  spikeThresholdGb: number | null
   overLimitAction: OverLimitAction
   stopMode: StopMode
   scheduleStart: string
@@ -65,6 +67,7 @@ function blankAccountForm(): AccountForm {
     accessKeySecret: '',
     regionsText: 'cn-hangzhou\ncn-shanghai\ncn-beijing\ncn-shenzhen',
     trafficLimitGb: 20,
+    spikeThresholdGb: null,
     overLimitAction: 'stop_and_notify',
     stopMode: 'StopCharging',
     scheduleStart: '',
@@ -116,6 +119,7 @@ function formFromAccount(account: AccountDto): AccountForm {
     accessKeySecret: '',
     regionsText: account.regions.join('\n'),
     trafficLimitGb: account.traffic_limit_gb,
+    spikeThresholdGb: account.spike_threshold_gb,
     overLimitAction: account.over_limit_action,
     stopMode: account.stop_mode,
     scheduleStart: account.schedule_start_time ?? '',
@@ -875,6 +879,13 @@ export class SettingsModal {
           }),
         ),
         this.field(
+          '突变告警阈值（GB）',
+          this.numberInput(form.spikeThresholdGb ?? 0, (value) => {
+            this.form.spikeThresholdGb = value > 0 ? value : null
+          }),
+          '单次采样增长超过此值即告警，填 0 使用默认值',
+        ),
+        this.field(
           '超限动作',
           this.selectInput(
             form.overLimitAction,
@@ -991,6 +1002,7 @@ export class SettingsModal {
       access_key_id: form.accessKeyId.trim(),
       regions: this.parsedRegions(),
       traffic_limit_gb: Number(form.trafficLimitGb),
+      spike_threshold_gb: form.spikeThresholdGb,
       over_limit_action: form.overLimitAction,
       stop_mode: form.stopMode,
       schedule_start_time: form.scheduleStart.trim() || null,
@@ -1553,9 +1565,25 @@ export class SettingsModal {
   // -------------------------------------------------------------------------
 
   private renderSystem(): void {
-    const tzInput = this.textInput(this.timezoneDraft, (value) => {
-      this.timezoneDraft = value
-    }, { placeholder: 'UTC+8' })
+    const tzSelect = el('select', { class: 'input' }) as HTMLSelectElement
+    const options = this.settings?.timezone_options ?? []
+    for (const option of options) {
+      const item = el('option', { value: option.value, text: option.label }) as HTMLOptionElement
+      if (option.value === this.timezoneDraft) item.selected = true
+      tzSelect.append(item)
+    }
+    // 服务端返回的当前值若不在选项内（例如历史配置），补进去以免显示成第一项
+    if (this.timezoneDraft && !options.some((o) => o.value === this.timezoneDraft)) {
+      const legacy = el('option', {
+        value: this.timezoneDraft,
+        text: `${this.timezoneDraft}（当前）`,
+      }) as HTMLOptionElement
+      legacy.selected = true
+      tzSelect.prepend(legacy)
+    }
+    tzSelect.addEventListener('change', () => {
+      this.timezoneDraft = tzSelect.value
+    })
 
     replaceChildren(
       this.content,
@@ -1565,11 +1593,11 @@ export class SettingsModal {
         el(
           'div',
           {},
-          el('h3', { class: 'text-xs font-semibold', text: '时区' }),
+          el('h3', { class: 'text-sm font-semibold', text: '时区' }),
           el('p', {
-            class: 'mt-0.5 text-[0.8125rem]',
+            class: 'mt-1 text-xs leading-relaxed',
             style: { color: 'var(--color-ink-subtle)' },
-            text: '影响账期划分、定时开关机与图表分桶。格式如 UTC+8、UTC-5、UTC+5:30。',
+            text: '影响账期划分、定时开关机、日报与图表。',
           }),
           el(
             'form',
@@ -1582,7 +1610,7 @@ export class SettingsModal {
                 },
               },
             },
-            tzInput,
+            tzSelect,
             el(
               'button',
               { class: 'btn btn-primary shrink-0', type: 'submit' },

@@ -87,6 +87,8 @@ export class LogDrawer {
 
   private logs: ActionLog[] = []
   private filter = ''
+  private actionFilter = ''
+  private readonly actionSelect: HTMLSelectElement
   private loading = false
   private removeEscListener: (() => void) | null = null
 
@@ -109,6 +111,31 @@ export class LogDrawer {
     this.searchInput.addEventListener('input', () => {
       this.filter = this.searchInput.value
       this.renderList()
+    })
+
+    this.actionSelect = el('select', { class: 'input py-1 text-xs' }) as HTMLSelectElement
+    for (const [value, label] of [
+      ['', '全部类型'],
+      ['login', '登录'],
+      ['threshold', '熔断'],
+      ['traffic_spike', '突变'],
+      ['manual', '手动操作'],
+      ['batch', '批量操作'],
+      ['schedule', '定时开关机'],
+      ['spot', '保活'],
+      ['refresh', '采集'],
+      ['settings', '设置变更'],
+      ['notify', '通知'],
+      ['session', '设备'],
+      ['daily_report', '日报'],
+    ]) {
+      this.actionSelect.append(
+        el('option', { value, text: label }) as HTMLOptionElement,
+      )
+    }
+    this.actionSelect.addEventListener('change', () => {
+      this.actionFilter = this.actionSelect.value
+      void this.load()
     })
 
     this.refreshButton = el('button', {
@@ -174,7 +201,11 @@ export class LogDrawer {
         ),
         el(
           'div',
-          { class: 'border-b px-4 py-2', style: { borderColor: 'var(--color-line)' } },
+          {
+            class: 'flex items-center gap-2 border-b px-4 py-2',
+            style: { borderColor: 'var(--color-line)' },
+          },
+          this.actionSelect,
           this.searchInput,
         ),
         this.errorBox,
@@ -189,6 +220,8 @@ export class LogDrawer {
     this.element.classList.remove('hidden')
     this.element.style.display = 'flex'
     this.filter = ''
+    this.actionFilter = ''
+    this.actionSelect.value = ''
     this.searchInput.value = ''
     this.removeEscListener = onEscape(() => this.close())
     void this.load()
@@ -216,7 +249,7 @@ export class LogDrawer {
     }
 
     try {
-      this.logs = await api.logs(200)
+      this.logs = await api.logs(200, { action: this.actionFilter || undefined })
       this.renderList()
     } catch (error) {
       this.errorBox.classList.remove('hidden')

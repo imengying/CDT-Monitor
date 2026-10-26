@@ -21,8 +21,8 @@ use worker::wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement, Env, Result};
 
 use crate::models::{
-    AccountRow, ActionLog, HistoryBucket, InstanceInfo, JobRow, JobStatus, JobType, SessionRow,
-    SnapshotRow, SnapshotUpdate, TrafficPoint, setting_key,
+    AccountRow, ActionLog, HistoryBucket, InstanceInfo, JobRow, JobStatus, JobType, LogFilter,
+    SessionRow, SnapshotRow, SnapshotUpdate, TrafficPoint, setting_key,
 };
 
 // ===========================================================================
@@ -254,6 +254,7 @@ impl Db {
         encrypted_secret: &str,
         regions_json: &str,
         traffic_limit_gb: f64,
+        spike_threshold_gb: Option<f64>,
         over_limit_action: &str,
         stop_mode: &str,
         schedule_start_time: Option<&str>,
@@ -265,10 +266,10 @@ impl Db {
         self.insert(
             "INSERT INTO accounts (
                 name, site_type, access_key_id, encrypted_access_key_secret, regions_json,
-                traffic_limit_gb, over_limit_action, stop_mode,
+                traffic_limit_gb, spike_threshold_gb, over_limit_action, stop_mode,
                 schedule_start_time, schedule_stop_time, spot_keep_alive, enabled,
                 last_schedule_start_date, last_schedule_stop_date, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
             &[
                 j_text(name),
                 j_text(site_type),
@@ -276,6 +277,7 @@ impl Db {
                 j_text(encrypted_secret),
                 j_text(regions_json),
                 j_f64(traffic_limit_gb),
+                j_opt_f64(spike_threshold_gb),
                 j_text(over_limit_action),
                 j_text(stop_mode),
                 j_opt_text(schedule_start_time),
@@ -300,6 +302,7 @@ impl Db {
         encrypted_secret: Option<&str>,
         regions_json: &str,
         traffic_limit_gb: f64,
+        spike_threshold_gb: Option<f64>,
         over_limit_action: &str,
         stop_mode: &str,
         schedule_start_time: Option<&str>,
@@ -312,7 +315,8 @@ impl Db {
             Some(_) => {
                 "UPDATE accounts SET
                     name = ?, site_type = ?, access_key_id = ?, encrypted_access_key_secret = ?,
-                    regions_json = ?, traffic_limit_gb = ?, over_limit_action = ?, stop_mode = ?,
+                    regions_json = ?, traffic_limit_gb = ?, spike_threshold_gb = ?,
+                    over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
                     enabled = ?, updated_at = ?
                  WHERE id = ?"
@@ -320,7 +324,8 @@ impl Db {
             None => {
                 "UPDATE accounts SET
                     name = ?, site_type = ?, access_key_id = ?,
-                    regions_json = ?, traffic_limit_gb = ?, over_limit_action = ?, stop_mode = ?,
+                    regions_json = ?, traffic_limit_gb = ?, spike_threshold_gb = ?,
+                    over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
                     enabled = ?, updated_at = ?
                  WHERE id = ?"
@@ -334,6 +339,7 @@ impl Db {
         params.extend_from_slice(&[
             j_text(regions_json),
             j_f64(traffic_limit_gb),
+            j_opt_f64(spike_threshold_gb),
             j_text(over_limit_action),
             j_text(stop_mode),
             j_opt_text(schedule_start_time),
@@ -807,31 +813,41 @@ impl Db {
     }
 
     /// 读取日志（带账号名）。
-    pub async fn list_logs(&self, account_id: Option<i64>, limit: u32) -> Result<Vec<ActionLog>> {
-        let limit = limit.clamp(1, 500) as i64;
-        match account_id {
-            Some(id) => {
-                self.query(
-                    "SELECT l.id, l.account_id, a.name AS account_name, l.action_type,
-                            l.instance_id, l.detail, l.created_at
-                     FROM action_logs l LEFT JOIN accounts a ON a.id = l.account_id
-                     WHERE l.account_id = ?
-                     ORDER BY l.created_at DESC LIMIT ?",
-                    &[j_i64(id), j_i64(limit)],
-                )
-                .await
-            }
-            None => {
-                self.query(
-                    "SELECT l.id, l.account_id, a.name AS account_name, l.action_type,
-                            l.instance_id, l.detail, l.created_at
-                     FROM action_logs l LEFT JOIN accounts a ON a.id = l.account_id
-                     ORDER BY l.created_at DESC LIMIT ?",
-                    &[j_i64(limit)],
-                )
-                .await
-            }
+    pub async fn list_logs(&self, filter: &LogFilter) -> Result<Vec<ActionLog>> {
+        let limit = filter.limit.clamp(1, 500) as i64;
+
+        // 条件按需拼接，参数顺序与 SQL 占位符保持一致
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut params: Vec<JsValue> = Vec::new();
+
+        if let Some(id) = filter.account_id {
+            clauses.push("l.account_id = ?");
+            params.push(j_i64(id));
         }
+        if let Some(prefix) = filter.action_prefix.as_deref().filter(|v| !v.is_empty()) {
+            clauses.push("l.action_type LIKE ?");
+            params.push(j_text(&format!("{prefix}%")));
+        }
+        if let Some(keyword) = filter.keyword.as_deref().filter(|v| !v.is_empty()) {
+            clauses.push("l.detail LIKE ?");
+            params.push(j_text(&format!("%{keyword}%")));
+        }
+
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+        params.push(j_i64(limit));
+
+        let sql = format!(
+            "SELECT l.id, l.account_id, a.name AS account_name, l.action_type,
+                    l.instance_id, l.detail, l.created_at
+             FROM action_logs l LEFT JOIN accounts a ON a.id = l.account_id
+             {where_sql}
+             ORDER BY l.created_at DESC LIMIT ?"
+        );
+        self.query(&sql, &params).await
     }
 
     /// 清理过期日志。

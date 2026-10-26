@@ -59,8 +59,8 @@ use crate::models::{
     DailyReportConfig, DailyReportDto, HistoryBucket, HistoryQuery, JobDto, JobStatus, JobType,
     LoginRequest, NotifyChannel, NotifyTestRequest, SessionResponse, SessionsResponse, SettingsDto,
     TelegramConfig, TelegramSettingsDto, TelegramSettingsUpdate, TrafficHistoryResponse,
-    TurnstileConfig, TurnstileSettingsDto, TurnstileSettingsUpdate, build_overview, now_ms,
-    setting_key, utc_offset_minutes,
+    TurnstileConfig, TurnstileSettingsDto, TurnstileSettingsUpdate, build_overview,
+    is_supported_timezone, now_ms, setting_key,
 };
 use crate::notify::NotifyLevel;
 use crate::scheduler::Scheduler;
@@ -928,9 +928,14 @@ async fn handle_history(app: &AppCtx, req: &Request) -> worker::Result<Response>
 /// `GET /api/v1/logs?account_id=&limit=`
 async fn handle_logs(app: &AppCtx, req: &Request) -> worker::Result<Response> {
     let params = query_map(req);
-    let account_id = query_i64(&params, "account_id");
     let limit = query_u32(&params, "limit").unwrap_or(80).clamp(1, MAX_LOGS);
-    let logs = app.db.list_logs(account_id, limit).await?;
+    let filter = crate::models::LogFilter {
+        account_id: query_i64(&params, "account_id"),
+        action_prefix: query_str(&params, "action").map(|v| v.to_string()),
+        keyword: query_str(&params, "q").map(|v| v.to_string()),
+        limit,
+    };
+    let logs = app.db.list_logs(&filter).await?;
     ok(&logs)
 }
 
@@ -989,6 +994,7 @@ async fn handle_create_account(app: &AppCtx, mut req: Request) -> worker::Result
             &encrypted,
             &payload.regions_json(),
             payload.traffic_limit_gb,
+            payload.spike_threshold_gb,
             payload.over_limit_action.as_str(),
             payload.stop_mode.as_str(),
             payload.normalized_schedule_start().as_deref(),
@@ -1053,6 +1059,7 @@ async fn handle_update_account(
             encrypted.as_deref(),
             &payload.regions_json(),
             payload.traffic_limit_gb,
+            payload.spike_threshold_gb,
             payload.over_limit_action.as_str(),
             payload.stop_mode.as_str(),
             payload.normalized_schedule_start().as_deref(),
@@ -1124,6 +1131,7 @@ async fn handle_get_settings(app: &AppCtx) -> worker::Result<Response> {
 
     ok(&SettingsDto {
         timezone: timezone.clone(),
+        timezone_options: crate::models::timezone_options(),
         turnstile: TurnstileSettingsDto {
             enabled: turnstile.enabled,
             site_key: turnstile.site_key.clone().unwrap_or_default(),
@@ -1389,34 +1397,15 @@ async fn handle_update_timezone(app: &AppCtx, mut req: Request) -> worker::Resul
         Err(err) => return error_response(400, err),
     };
     let raw = payload.timezone.trim();
-    if raw.is_empty() {
-        return error_response(400, "时区不能为空");
+    if !is_supported_timezone(raw) {
+        return error_response(400, "时区取值不受支持");
     }
-    let minutes = utc_offset_minutes(raw);
-    let normalized = if minutes == 0 {
-        "UTC+0".to_string()
-    } else if minutes > 0 {
-        format!("UTC+{}", format_offset(minutes))
-    } else {
-        format!("UTC-{}", format_offset(-minutes))
-    };
 
     app.db
-        .set_setting(setting_key::TIMEZONE, &normalized, now_ms())
+        .set_setting(setting_key::TIMEZONE, raw, now_ms())
         .await?;
 
     handle_get_settings(app).await
-}
-
-/// `minutes` -> `8` 或 `5:30`。
-fn format_offset(minutes: i32) -> String {
-    let hours = minutes / 60;
-    let mins = minutes % 60;
-    if mins == 0 {
-        format!("{hours}")
-    } else {
-        format!("{hours}:{mins:02}")
-    }
 }
 
 // ===========================================================================
@@ -1438,6 +1427,11 @@ enum JobTask {
         account_id: i64,
         instance_id: String,
     },
+    /// 账号内全部实例的开/关机。
+    InstanceBatch {
+        account_id: i64,
+        start: bool,
+    },
     NotifyTest {
         channel: Option<NotifyChannel>,
     },
@@ -1451,6 +1445,13 @@ impl JobTask {
             JobTask::RefreshAccount { .. } => JobType::RefreshAccount,
             JobTask::StartInstance { .. } => JobType::StartInstance,
             JobTask::StopInstance { .. } => JobType::StopInstance,
+            JobTask::InstanceBatch { start, .. } => {
+                if *start {
+                    JobType::StartInstance
+                } else {
+                    JobType::StopInstance
+                }
+            }
             JobTask::NotifyTest { .. } => JobType::NotifyTest,
             JobTask::DailyReport => JobType::DailyReport,
         }
@@ -1461,7 +1462,8 @@ impl JobTask {
             JobTask::RefreshAll | JobTask::NotifyTest { .. } | JobTask::DailyReport => None,
             JobTask::RefreshAccount { account_id }
             | JobTask::StartInstance { account_id, .. }
-            | JobTask::StopInstance { account_id, .. } => Some(*account_id),
+            | JobTask::StopInstance { account_id, .. }
+            | JobTask::InstanceBatch { account_id, .. } => Some(*account_id),
         }
     }
 
@@ -1576,6 +1578,10 @@ async fn execute_job(env: Env, job_id: String, task: JobTask) {
             .instance_action(account_id, &instance_id, false)
             .await
             .map(|result| result.detail),
+        JobTask::InstanceBatch { account_id, start } => scheduler
+            .instance_batch(account_id, start)
+            .await
+            .map(|summary| summary.detail),
         JobTask::NotifyTest { channel } => {
             let outcome = scheduler.test_notification(channel).await;
             if outcome.results.is_empty() {
@@ -1623,6 +1629,15 @@ async fn release_job_lock(db: &Db, lock_name: Option<&str>, owner: &str) {
 async fn spawn_job(ctx: &Context, app: &AppCtx, task: JobTask) -> worker::Result<Response> {
     let job_type = task.job_type();
     let account_id = task.account_id();
+
+    // 先确认账号存在：jobs 表对 account_id 有外键，直接插入会得到
+    // 「FOREIGN KEY constraint failed」并被翻译成 500，掩盖了真实原因
+    // （账号已被删除或 ID 手误）。在这里提前给出 404。
+    if let Some(id) = account_id
+        && app.db.get_account(id).await?.is_none()
+    {
+        return error_response(404, "账号不存在");
+    }
 
     let job_id =
         crate::crypto::random_id().map_err(|err| worker::Error::RustError(err.to_string()))?;
@@ -1793,6 +1808,34 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
                 Err(_) => error_response(400, "账号 ID 不合法"),
             }
         }
+        (Method::Post, ["accounts", id, "instances", "start-all"]) => match id.parse::<i64>() {
+            Ok(account_id) => {
+                spawn_job(
+                    &ctx,
+                    &app,
+                    JobTask::InstanceBatch {
+                        account_id,
+                        start: true,
+                    },
+                )
+                .await
+            }
+            Err(_) => error_response(400, "账号 ID 不合法"),
+        },
+        (Method::Post, ["accounts", id, "instances", "stop-all"]) => match id.parse::<i64>() {
+            Ok(account_id) => {
+                spawn_job(
+                    &ctx,
+                    &app,
+                    JobTask::InstanceBatch {
+                        account_id,
+                        start: false,
+                    },
+                )
+                .await
+            }
+            Err(_) => error_response(400, "账号 ID 不合法"),
+        },
         (Method::Put, ["accounts", id, "instances", instance_id, "keep-alive"]) => {
             match id.parse::<i64>() {
                 Ok(account_id) => {
@@ -1902,9 +1945,13 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     let report = scheduler.run_cron().await;
     log_info!("Cron 汇总：{}", report.summary());
 
-    if report.accounts_failed > 0 || report.thresholds_fired > 0 {
+    if report.accounts_failed > 0 || report.thresholds_fired > 0 || report.spikes_detected > 0 {
+        // 每 6 小时最多一条汇总：持续故障不应该每 5 分钟提醒一次。
+        let bucket = crate::models::now_ms() / (6 * 60 * 60 * 1000);
         let _ = scheduler
-            .notify(
+            .notify_once(
+                &format!("cron-alert:{bucket}"),
+                6 * 60 * 60 * 1000,
                 crate::notify::Message::new(
                     "CDT-Monitor 巡检异常",
                     report.summary(),
@@ -1920,13 +1967,6 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn offset_formatting() {
-        assert_eq!(format_offset(480), "8");
-        assert_eq!(format_offset(330), "5:30");
-        assert_eq!(format_offset(45), "0:45");
-    }
 
     #[test]
     fn path_segments_strip_empty() {

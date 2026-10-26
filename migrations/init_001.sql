@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   encrypted_access_key_secret TEXT    NOT NULL,
   regions_json                TEXT    NOT NULL DEFAULT '[]',
   traffic_limit_gb            REAL    NOT NULL DEFAULT 20,
+  -- 突变告警阈值（GB）：单次采样增长超过此值即告警。NULL 用全局默认值
+  spike_threshold_gb          REAL,
   over_limit_action           TEXT    NOT NULL DEFAULT 'stop_and_notify'
                               CHECK (over_limit_action IN ('stop_and_notify', 'notify_only')),
   stop_mode                   TEXT    NOT NULL DEFAULT 'StopCharging'

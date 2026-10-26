@@ -36,9 +36,10 @@ use crate::crypto::{Crypto, random_hex};
 use crate::db::Db;
 use crate::models::{
     AccountOverview, AccountRow, BarkConfig, DailyReportConfig, HistoryBucket, InstanceInfo,
-    NotifyChannel, OverLimitAction, SnapshotRow, SnapshotUpdate, TelegramConfig, build_overview,
-    gb_to_bytes, human_amount, human_bytes, local_date, local_minutes_of_day, month_bounds_ms,
-    now_ms, parse_hhmm, percent_of_limit, setting_key, utc_offset_minutes, within_window,
+    NotifyChannel, OverLimitAction, SnapshotRow, SnapshotUpdate, TelegramConfig, TrafficPoint,
+    build_overview, gb_to_bytes, human_amount, human_bytes, local_date, local_minutes_of_day,
+    month_bounds_ms, now_ms, parse_hhmm, percent_of_limit, setting_key, utc_offset_minutes,
+    within_window,
 };
 use crate::notify::{
     BarkChannel, Channels, Message, NotifyLevel, NotifyOutcome, TelegramChannel, dispatch,
@@ -60,6 +61,41 @@ pub const LOG_RETENTION_DAYS: i64 = 30;
 pub const JOB_RETENTION_DAYS: i64 = 7;
 /// 单实例动作锁 TTL（分钟）。
 pub const INSTANCE_LOCK_TTL_MINUTES: i64 = 30;
+/// 突变告警的默认阈值（GiB）：单次采样间隔内增长超过此值即告警。
+pub const DEFAULT_SPIKE_THRESHOLD_GB: f64 = 5.0;
+/// 突变判定允许的最大采样间隔：超过则视为正常增长（例如 Cron 停跑一整天）。
+pub const SPIKE_MAX_GAP_MS: i64 = 2 * 60 * 60 * 1000;
+
+// ===========================================================================
+// 辅助函数
+// ===========================================================================
+
+/// 突变阈值（GB）。账号可覆盖，`None` 用默认值。
+fn spike_threshold_gb(account: &AccountRow) -> f64 {
+    account
+        .spike_threshold_gb
+        .unwrap_or(DEFAULT_SPIKE_THRESHOLD_GB)
+        .max(0.0)
+}
+
+/// 把毫秒间隔转成便于阅读的时长。
+fn human_duration(ms: i64) -> String {
+    let minutes = (ms.max(0) / 60_000).max(1);
+    if minutes < 60 {
+        return format!("{minutes} 分钟");
+    }
+    let hours = minutes / 60;
+    let rest = minutes % 60;
+    if hours < 24 {
+        if rest == 0 {
+            format!("{hours} 小时")
+        } else {
+            format!("{hours} 小时 {rest} 分钟")
+        }
+    } else {
+        format!("{} 天", hours / 24)
+    }
+}
 
 // ===========================================================================
 // 结果结构
@@ -77,6 +113,8 @@ pub struct RefreshOutcome {
     pub overseas_bytes: i64,
     /// 本次刷新是否**新触发**了熔断。
     pub threshold_fired: bool,
+    /// 本次采样是否检测到异常增长（已发出告警）。
+    pub spike_detected: bool,
     /// 局部失败 / 提示信息。
     pub warnings: Vec<String>,
 }
@@ -91,6 +129,7 @@ impl RefreshOutcome {
             domestic_bytes: 0,
             overseas_bytes: 0,
             threshold_fired: false,
+            spike_detected: false,
             warnings: vec![error],
         }
     }
@@ -103,6 +142,7 @@ pub struct CronReport {
     pub accounts_refreshed: usize,
     pub accounts_failed: usize,
     pub thresholds_fired: usize,
+    pub spikes_detected: usize,
     pub instances_started: usize,
     pub instances_stopped: usize,
     pub keep_alive_started: usize,
@@ -115,11 +155,12 @@ impl CronReport {
     /// 单行摘要。
     pub fn summary(&self) -> String {
         format!(
-            "账号 {}/{} 刷新成功，失败 {}，熔断 {}，停机 {}，开机 {}，保活 {}，日报 {}",
+            "账号 {}/{} 刷新成功，失败 {}，熔断 {}，突变 {}，停机 {}，开机 {}，保活 {}，日报 {}",
             self.accounts_refreshed,
             self.accounts_total,
             self.accounts_failed,
             self.thresholds_fired,
+            self.spikes_detected,
             self.instances_stopped,
             self.instances_started,
             self.keep_alive_started,
@@ -137,6 +178,16 @@ impl CronReport {
 pub struct InstanceActionResult {
     pub instance_id: String,
     pub ok: bool,
+    pub detail: String,
+}
+
+/// 账号内批量开关机的结果。
+#[derive(Debug, Clone)]
+pub struct InstanceBatchSummary {
+    pub started: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    /// 人类可读的汇总文案。
     pub detail: String,
 }
 
@@ -277,6 +328,29 @@ impl Scheduler {
             log_warn!("通知发送失败：{failure}");
         }
         outcome
+    }
+
+    /// 同一「去重键」在窗口内只发送一次的通知。
+    ///
+    /// 用于周期性巡检产生的告警：Cron 每 5 分钟一轮，若不加抑制，
+    /// 一次持续异常会连续轰炸。去重键应包含「异常主体 + 时间片」，
+    /// 例如 `spike:3:4850000`。
+    pub async fn notify_once(
+        &self,
+        dedup_key: &str,
+        window_ms: i64,
+        message: Message,
+    ) -> Option<NotifyOutcome> {
+        let owner = random_hex(8).ok()?;
+        let acquired = self
+            .db
+            .acquire_lock(dedup_key, &owner, now_ms(), window_ms)
+            .await
+            .ok()?;
+        if !acquired {
+            return None;
+        }
+        Some(self.notify(message).await)
     }
 
     /// 通知渠道测试。
@@ -424,6 +498,10 @@ impl Scheduler {
             .await?;
 
         // 采样历史（数值不变时按心跳去重）。
+        //
+        // 写入前先取上一次采样，用于突变检测：CDT 上报的是账期累计值，
+        // 两条相邻记录的增长量即这段时间消耗的流量。
+        let previous_sample = self.db.latest_history(account.id).await.ok().flatten();
         self.db
             .sample_history(
                 account.id,
@@ -448,6 +526,12 @@ impl Scheduler {
                 .await?;
         }
 
+        // 突变告警：相邻两次采样之间增长过多，说明流量正在被快速消耗。
+        // 与阈值熔断互补 —— 熔断是「到上限才管」，突变是「刚发生就知道」。
+        let spike_detected = self
+            .check_spike(account, previous_sample.as_ref(), total_bytes)
+            .await;
+
         for warning in &sync.warnings {
             let _ = self
                 .db
@@ -466,8 +550,78 @@ impl Scheduler {
             domestic_bytes,
             overseas_bytes,
             threshold_fired,
+            spike_detected,
             warnings: sync.warnings,
         })
+    }
+
+    /// 检测单次采样是否异常增长，命中则记录日志并推送告警。
+    ///
+    /// 返回是否发出了告警。用幂等锁按「账号 + 小时」去重，避免同一波流量
+    /// 在每次 Cron 都重复通知。
+    async fn check_spike(
+        &self,
+        account: &AccountRow,
+        previous: Option<&TrafficPoint>,
+        current_total: i64,
+    ) -> bool {
+        let Some(prev) = previous else {
+            return false;
+        };
+
+        let threshold_bytes = gb_to_bytes(spike_threshold_gb(account));
+        let gap = self.now.saturating_sub(prev.recorded_at);
+        if !crate::models::is_traffic_spike(
+            prev.total_bytes,
+            current_total,
+            gap,
+            threshold_bytes,
+            SPIKE_MAX_GAP_MS,
+        ) {
+            return false;
+        }
+
+        let increase = current_total - prev.total_bytes;
+        let detail = format!(
+            "{} 内增长 {}（{} → {}），超过突变阈值 {}",
+            human_duration(gap),
+            human_bytes(increase),
+            human_bytes(prev.total_bytes),
+            human_bytes(current_total),
+            human_bytes(threshold_bytes)
+        );
+
+        let _ = self
+            .db
+            .add_log(Some(account.id), "traffic_spike", None, &detail, now_ms())
+            .await;
+
+        let message = Message::new(
+            format!("流量异常增长 · {}", account.name),
+            format!("{detail}，请确认是否有预期外的流量消耗。"),
+            NotifyLevel::Alert,
+        )
+        .with_details(vec![
+            format!(
+                "当前已用 {}（配额 {:.0} GB 的 {:.1}%）",
+                human_bytes(current_total),
+                account.traffic_limit_gb,
+                percent_of_limit(current_total, account.traffic_limit_gb)
+            ),
+            format!(
+                "账期 {}",
+                crate::models::billing_month(self.now, &self.timezone)
+            ),
+        ])
+        .with_group("CDT-Spike");
+
+        // 同一账号同一小时内只告警一次：Cron 每 5 分钟一轮，
+        // 一次持续的大流量会连续触发几十条通知。
+        let hour_key = self.now / (60 * 60 * 1000);
+        let dedup_key = format!("spike:{}:{}", account.id, hour_key);
+        self.notify_once(&dedup_key, 60 * 60 * 1000, message)
+            .await
+            .is_some()
     }
 
     /// 刷新全部启用账号。
@@ -1258,6 +1412,98 @@ impl Scheduler {
         Ok(detail)
     }
 
+    /// 对账号内全部实例执行开/关机。
+    ///
+    /// 逐个执行而非并发：阿里云对单账号有 QPS 限制，并发容易触发限流；
+    /// 且失败需要逐个记录，串行更容易给出准确的汇总。
+    pub async fn instance_batch(
+        &self,
+        account_id: i64,
+        start: bool,
+    ) -> worker::Result<InstanceBatchSummary> {
+        let account = self
+            .db
+            .get_account(account_id)
+            .await?
+            .ok_or_else(|| worker::Error::RustError(format!("账号 {account_id} 不存在")))?;
+
+        // 熔断开机闸门：批量开机同样受约束
+        if start && self.threshold_blocked(&account).await? {
+            return Err(worker::Error::RustError(
+                "本月已触发流量熔断停机，禁止开机；请提升阈值或等待下个账期".to_string(),
+            ));
+        }
+
+        let instances = self.db.snapshot_instances(account_id).await?;
+        if instances.is_empty() {
+            return Ok(InstanceBatchSummary {
+                started: 0,
+                skipped: 0,
+                failed: 0,
+                detail: "没有可操作的实例".to_string(),
+            });
+        }
+
+        let mut ok_count = 0usize;
+        let mut skipped = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
+        for instance in &instances {
+            // 先按快照状态预判，避免对已处于目标状态的实例发起请求
+            if start && instance.is_running() {
+                skipped += 1;
+                continue;
+            }
+            if !start && instance.is_stopped() {
+                skipped += 1;
+                continue;
+            }
+
+            match self
+                .instance_action(account_id, &instance.instance_id, start)
+                .await
+            {
+                Ok(_) => ok_count += 1,
+                Err(err) => failures.push(format!("{}：{err}", instance.instance_id)),
+            }
+        }
+
+        let action = if start { "开机" } else { "关机" };
+        let mut detail = format!("{action}完成 {ok_count} 台");
+        if skipped > 0 {
+            detail.push_str(&format!("，跳过 {skipped} 台（已在目标状态）"));
+        }
+        if !failures.is_empty() {
+            detail.push_str(&format!("，失败 {} 台", failures.len()));
+        }
+        if !failures.is_empty() {
+            detail.push_str(&format!("（{}）", failures.join("；")));
+        }
+
+        self.db
+            .add_log(
+                Some(account_id),
+                if start { "batch_start" } else { "batch_stop" },
+                None,
+                &detail,
+                now_ms(),
+            )
+            .await
+            .ok();
+
+        // 全部失败才报错，部分成功仍算完成（细节已在文案里）
+        if ok_count == 0 && !failures.is_empty() {
+            return Err(worker::Error::RustError(detail));
+        }
+
+        Ok(InstanceBatchSummary {
+            started: ok_count,
+            skipped,
+            failed: failures.len(),
+            detail,
+        })
+    }
+
     /// 切换逐实例抢占式保活开关。
     pub async fn set_instance_keep_alive(
         &self,
@@ -1520,6 +1766,7 @@ mod tests {
             encrypted_access_key_secret: "cipher".to_string(),
             regions_json: "[]".to_string(),
             traffic_limit_gb: 20.0,
+            spike_threshold_gb: None,
             over_limit_action: "stop_and_notify".to_string(),
             stop_mode: "StopCharging".to_string(),
             schedule_start_time: start.map(|s| s.to_string()),
@@ -1628,6 +1875,7 @@ mod tests {
             accounts_refreshed: 2,
             accounts_failed: 1,
             thresholds_fired: 1,
+            spikes_detected: 0,
             instances_started: 2,
             instances_stopped: 1,
             keep_alive_started: 1,
