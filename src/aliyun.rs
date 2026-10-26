@@ -25,9 +25,7 @@
 //! | 账户余额 | `business.aliyuncs.com` | 2017-12-14 | `QueryAccountBalance` |
 //!
 //! 国际站把域名换成 `*.ap-southeast-1.aliyuncs.com`（BSS 为
-//! `business.ap-southeast-1.aliyuncs.com`）。三种域名都允许通过 Worker
-//! 环境变量覆盖（`ALIYUN_CDT_ENDPOINT` / `ALIYUN_ECS_ENDPOINT` /
-//! `ALIYUN_BSS_ENDPOINT`），便于私有网关或排障。
+//! `business.ap-southeast-1.aliyuncs.com`）。
 //!
 //! ## 重试
 //!
@@ -153,9 +151,9 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
-    /// 按站点生成默认端点，并叠加 `ALIYUN_*_ENDPOINT` 覆盖。
-    pub fn resolve(env: Option<&worker::Env>, site: SiteType) -> Self {
-        let defaults = match site {
+    /// 按站点返回端点。
+    pub fn for_site(site: SiteType) -> Self {
+        match site {
             SiteType::China => Self {
                 cdt: "https://cdt.aliyuncs.com".to_string(),
                 ecs: "https://ecs.aliyuncs.com".to_string(),
@@ -166,25 +164,7 @@ impl Endpoints {
                 ecs: "https://ecs.ap-southeast-1.aliyuncs.com".to_string(),
                 bss: "https://business.ap-southeast-1.aliyuncs.com".to_string(),
             },
-        };
-
-        let override_of = |name: &str| -> Option<String> {
-            env.and_then(|e| e.var(name).ok())
-                .map(|v| v.to_string())
-                .map(|v| v.trim().trim_end_matches('/').to_string())
-                .filter(|v| !v.is_empty())
-        };
-
-        Self {
-            cdt: override_of("ALIYUN_CDT_ENDPOINT").unwrap_or(defaults.cdt),
-            ecs: override_of("ALIYUN_ECS_ENDPOINT").unwrap_or(defaults.ecs),
-            bss: override_of("ALIYUN_BSS_ENDPOINT").unwrap_or(defaults.bss),
         }
-    }
-
-    /// 默认中国站端点（无 Env 时使用，单元测试友好）。
-    pub fn china() -> Self {
-        Self::resolve(None, SiteType::China)
     }
 }
 
@@ -290,12 +270,12 @@ impl AliyunClient {
     }
 
     /// 由账号行 + 解密后的 Secret 构造。
-    pub fn from_account(account: &AccountRow, secret: String, env: Option<&worker::Env>) -> Self {
+    pub fn from_account(account: &AccountRow, secret: String) -> Self {
         Self::new(
             account.access_key_id.clone(),
             secret,
             account.site(),
-            Endpoints::resolve(env, account.site()),
+            Endpoints::for_site(account.site()),
         )
     }
 
@@ -1388,11 +1368,11 @@ mod tests {
 
     #[test]
     fn endpoints_by_site() {
-        let china = Endpoints::resolve(None, SiteType::China);
+        let china = Endpoints::for_site(SiteType::China);
         assert_eq!(china.cdt, "https://cdt.aliyuncs.com");
         assert_eq!(china.bss, "https://business.aliyuncs.com");
 
-        let intl = Endpoints::resolve(None, SiteType::Intl);
+        let intl = Endpoints::for_site(SiteType::Intl);
         assert_eq!(intl.ecs, "https://ecs.ap-southeast-1.aliyuncs.com");
         assert_eq!(intl.bss, "https://business.ap-southeast-1.aliyuncs.com");
     }

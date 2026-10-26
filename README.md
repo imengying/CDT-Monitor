@@ -78,56 +78,49 @@ cdt-monitor/
 
 ---
 
-## 部署（Cloudflare 连接 GitHub，推送即发布）
+## 部署
 
-全部在 Cloudflare 网页完成，本机无需安装 Rust 或 wrangler。
+### 1. 连接仓库
 
-### 1. 连接 GitHub 仓库
+**Workers & Pages → Create → Workers → Connect to Git**，选中本仓库。
 
-**Workers & Pages → Create → Workers → Connect to Git**，选中本仓库，根目录 `/`。
-
-| 构建配置 | 值 |
+| 项 | 值 |
 |---|---|
 | Build command | `bun run build` |
 | Deploy command | `bun run deploy` |
-| Build variable | `BUN_VERSION=1.4.4`（可选，默认即此值） |
+| Build variable | `BUN_VERSION=1.4.4` |
 
-构建前 `scripts/check-config.ts` 校验 `wrangler.toml` 的必需段落（`[assets]`、
-D1 绑定、Cron、`main`、日志默认值），任一项缺失即中止构建。
+`BUN_VERSION` **必须配置**。构建镜像预装 Bun 1.2.5，不指定会用它编译。
+`build-ci.sh` 检测到版本不符时会安装指定版本，未设置则直接失败。
 
-`scripts/deploy.ts` 负责首次部署的自动化：创建 D1 库（已存在则跳过）、
-应用 `migrations/` 下未执行的 SQL、上传 Worker。D1 绑定通过
-`database_name = "cdt-monitor"` 解析，`wrangler.toml` 不写 `database_id`。
+`deploy.ts` 完成首次部署：创建 D1 库、应用 `migrations/` 下未执行的 SQL、
+上传 Worker。`wrangler.toml` 不写 `database_id`，由 `database_name` 解析。
 
-### 2. 配 3 个 Secret
+### 2. Secret
 
-**Settings → Variables and Secrets**（运行时变量），全部选 **Secret**：
+**Settings → Variables and Secrets**，三项均选 **Secret**：
 
 | 名称 | 说明 |
 |---|---|
-| `MASTER_KEY` | `openssl rand -hex 32`。轮换会导致已存密文全部失效 |
+| `MASTER_KEY` | `openssl rand -hex 32` |
 | `ADMIN_USERNAME` | 管理员用户名 |
-| `ADMIN_PASSWORD` | 管理员密码，建议 16 位以上 |
+| `ADMIN_PASSWORD` | 管理员密码 |
 
-其余配置均在网页「设置」中维护，存于 D1，即时生效：
+`MASTER_KEY` 轮换会使已存密文全部失效。凭证不落库，后台无改密入口，
+修改后需重新部署。
+
+### 3. 登录
+
+访问 Worker 域名，使用上述凭证登录。其余配置在「设置」中维护：
 
 | 配置 | 位置 |
 |---|---|
-| 阿里云账号（AccessKey、阈值、停机策略、定时、保活） | 设置 → 阿里云账号 |
-| 人机校验（Turnstile Site Key / Secret Key） | 设置 → 人机校验 |
-| Telegram（Bot Token / Chat ID / 反代） | 设置 → Telegram |
-| Bark（Server / Device Key / 推送级别） | 设置 → Bark |
-| 日报推送时间 | 设置 → 日报 |
+| 阿里云账号、阈值、停机策略、定时、保活 | 设置 → 阿里云账号 |
+| Turnstile | 设置 → 人机校验 |
+| Telegram | 设置 → Telegram |
+| Bark | 设置 → Bark |
+| 日报时间 | 设置 → 日报 |
 | 时区、日志级别、任务锁窗口、会话有效期 | 设置 → 系统 |
-
-### 3. 首次登录
-
-打开 Worker 域名，使用第 2 步的 `ADMIN_USERNAME` 与 `ADMIN_PASSWORD` 登录。
-
-管理员凭证只读取环境变量，数据库不存储任何密码材料，后台不提供改密入口；
-更换用户名或密码即修改对应 Secret 后重新部署。
-
-此后每次 `git push` 触发自动构建与发布。
 
 ---
 
@@ -170,22 +163,15 @@ bun run dev:web                  # :5173
 
 ---
 
-## 环境变量
+## 配置分布
 
-| 名称 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `MASTER_KEY` | Secret | ✅ | 32 字节主密钥。加密 AK Secret / TG Token / Bark Key / Turnstile 私钥，并作为会话 Token 的 HMAC 密钥 |
-| `ADMIN_USERNAME` | Secret | ✅ | 管理员用户名 |
-| `ADMIN_PASSWORD` | Secret | ✅ | 管理员密码，每次登录对照校验，不落库 |
-运行时只读取以上三个 Secret，`wrangler.toml` 不含 `[vars]` 段。
+| 类别 | 存放位置 | 内容 |
+|---|---|---|
+| Secret | Cloudflare 控制台 | `MASTER_KEY`、`ADMIN_USERNAME`、`ADMIN_PASSWORD` |
+| 构建变量 | Settings → Build | `BUN_VERSION` |
+| 业务配置 | D1，设置页面 | 阿里云账号、Turnstile、Telegram、Bark、日报、时区、日志级别等 |
 
-日志级别、任务锁窗口、会话有效期、时区、Turnstile、通知、日报等
-全部存 D1，在网页「设置」里改，即时生效。
-
-排障时若需让请求走私有网关，可临时在控制台加 `ALIYUN_CDT_ENDPOINT` /
-`ALIYUN_ECS_ENDPOINT` / `ALIYUN_BSS_ENDPOINT`。
-
-构建期变量位于 **Settings → Build → Build variables**：`BUN_VERSION`（默认 `1.4.4`）。
+`wrangler.toml` 不含 `[vars]` 段。业务配置改动即时生效，无需重新部署。
 
 ---
 
@@ -235,6 +221,7 @@ bun run dev:web                  # :5173
 5. 定时开机（同窗口，受熔断闸门约束）
 6. 抢占式保活（受熔断闸门与夜间停机窗口约束）
 7. 每日日报（40 分钟窗口，当天仅一次）
+8. 突变检测：单次采样增长超过阈值即告警（按账号小时去重）
 ```
 
 ### 优先级
@@ -276,16 +263,19 @@ bun run dev:web                  # :5173
 | POST | `/api/v1/auth/logout` | 退出 |
 | GET | `/api/v1/overview` | 首页数据（读快照表） |
 | GET | `/api/v1/history?account_id&bucket=hour\|day&limit` | 流量历史 |
-| GET | `/api/v1/logs?account_id&limit` | 操作日志 |
+| GET | `/api/v1/logs?account_id&action&q&limit` | 操作日志（类型前缀 + 关键字） |
 | GET | `/api/v1/jobs[/{id}]` | 任务状态 |
 | POST | `/api/v1/refresh` | 刷新全部 → 202 |
 | POST | `/api/v1/accounts` | 新增账号 |
 | PUT/DELETE | `/api/v1/accounts/{id}` | 修改 / 删除账号 |
 | POST | `/api/v1/accounts/{id}/refresh` | 刷新单账号 → 202 |
 | POST | `/api/v1/accounts/{id}/instances/{iid}/start\|stop` | 开机 / 关机 → 202 |
+| POST | `/api/v1/accounts/{id}/instances/start-all\|stop-all` | 批量开关机 → 202 |
 | PUT | `/api/v1/accounts/{id}/instances/{iid}/keep-alive` | 逐实例保活开关 |
 | GET | `/api/v1/settings` | 全部设置（脱敏） |
-| PUT | `/api/v1/settings/turnstile\|telegram\|bark\|daily-report\|timezone` | 更新设置 |
+| PUT | `/api/v1/settings/turnstile\|telegram\|bark\|daily-report\|timezone\|advanced` | 更新设置 |
+| GET | `/api/v1/sessions` | 登录设备 |
+| DELETE | `/api/v1/sessions[/{sid}]` | 踢下线（指定 / 其它全部） |
 | POST | `/api/v1/settings/notify-test` | 测试通知 → 202 |
 | POST | `/api/v1/reports/daily` | 立即推送日报 → 202 |
 
@@ -307,6 +297,7 @@ bun run dev:web                  # :5173
 | `traffic_history` | 流量采样（账期累计值），索引 `(account_id, recorded_at)` |
 | `jobs` | 异步任务状态 |
 | `action_logs` | 自动化动作 / 告警 / 登录审计 |
+| `sessions` | 登录设备，用于踢下线 |
 | `locks` | 幂等锁，TTL 到期可抢占 |
 
 时间戳统一 Unix 毫秒 `INTEGER`；布尔存 `0/1`（Rust 侧以 `i64` 承载后转换，
@@ -338,7 +329,7 @@ assert_eq!(sign("testsecret", &to_sign), "OLeaidS1JvxuMvnyHOwuJ+uX5qY=");
 ## 开发与校验
 
 ```bash
-cargo test                                                    # 70 个单元测试
+cargo test                                                    # 79 个单元测试
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 bun run typecheck:web
 bun run check:config
@@ -350,22 +341,3 @@ bun run build
 ```bash
 curl http://localhost:8787/cdn-cgi/local/scheduled
 ```
-
----
-
-## 与原版的差异
-
-| 项 | 原版 | 本项目 |
-|---|---|---|
-| 运行时 | PHP 常驻 + MySQL + Cron | Cloudflare Workers + D1 + Cron Triggers |
-| 凭据加密 | `master.key` + AES-GCM | `MASTER_KEY` + XChaCha20-Poly1305 |
-| 管理员认证 | Argon2id + Session 表 | 环境变量凭证 + HMAC 无状态 Token |
-| 登录防护 | — | Turnstile（含 `remoteip`），默认关闭 |
-| 通知 | SMTP / 通用 Webhook / TG / Bark | Telegram（支持反代）+ Bark（三级推送） |
-| API Key / Scope | 有 | 无 |
-| 桌面小组件接口 | `/api/v1/widget/*` | 无 |
-| `/healthz` `/readyz` `/monitor.php` | 有 | 无 |
-| 前端 | — | 纯 TypeScript + DOM + ECharts + Tailwind v4 |
-| 部署 | 手工建库、粘 SQL | 连接 GitHub 推送即发布 |
-| 管理员账号 | 仅密码 | 用户名 + 密码 |
-| 日志 | 常开 | 默认仅 error |

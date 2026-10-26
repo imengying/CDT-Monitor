@@ -9,8 +9,9 @@
 #   1. Dashboard → Settings → Build → Build command
 #   2. wrangler.toml 的 [build] command（wrangler deploy 时）
 #
-# 构建期变量（Settings → Build → Build variables）：
-#   BUN_VERSION   Bun 版本，默认 1.4.4
+# 必需构建期变量（Settings → Build → Build variables）：
+#   BUN_VERSION   Bun 版本，例如 1.4.4
+#                 不指定会使用镜像预装的旧版本（1.2.5），构建可能失败
 #
 # 构建期变量仅在构建阶段可见。运行时变量 MASTER_KEY / ADMIN_USERNAME /
 # ADMIN_PASSWORD 需配置在 Settings → Variables and Secrets 并选择 Secret。
@@ -48,12 +49,27 @@ fi
 # ---------------------------------------------------------------------------
 # 1. Bun
 # ---------------------------------------------------------------------------
-BUN_VERSION="${BUN_VERSION:-1.4.4}"
 export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
 export PATH="$BUN_INSTALL/bin:$PATH"
 
-if ! command -v bun >/dev/null 2>&1; then
-  log "安装 Bun $BUN_VERSION"
+# 版本不匹配（含镜像预装旧版）时安装指定版本。
+# 不能只在「未安装」时装：构建镜像自带 Bun 1.2.5，跳过安装会让 BUN_VERSION 失效。
+installed="$(bun --version 2>/dev/null || true)"
+
+if [ -z "${BUN_VERSION:-}" ]; then
+  if [ -n "$installed" ]; then
+    # 本地开发未指定版本：用现有版本，避免每次构建都下载
+    warn "未设置 BUN_VERSION，使用当前 Bun $installed"
+    BUN_VERSION="$installed"
+  else
+    echo "错误：未设置 BUN_VERSION，且环境中没有 Bun。" >&2
+    echo "Cloudflare 构建需在 Settings → Build → Build variables 配置 BUN_VERSION。" >&2
+    exit 1
+  fi
+fi
+
+if [ "$installed" != "$BUN_VERSION" ]; then
+  log "安装 Bun $BUN_VERSION（当前 ${installed:-未安装}）"
   curl -fsSL https://bun.sh/install | bash -s "bun-v$BUN_VERSION"
   export PATH="$BUN_INSTALL/bin:$PATH"
 fi

@@ -409,7 +409,7 @@ impl Scheduler {
 
     async fn refresh_account_inner(&self, account: &AccountRow) -> worker::Result<RefreshOutcome> {
         let secret = self.account_secret(account)?;
-        let client = AliyunClient::from_account(account, secret, Some(&self.env));
+        let client = AliyunClient::from_account(account, secret);
         let regions = account.regions();
         let (month_start, month_end) = month_bounds_ms(self.now, &self.timezone);
 
@@ -699,7 +699,7 @@ impl Scheduler {
                 details.push("没有运行中的实例需要停机".to_string());
             } else {
                 let secret = self.account_secret(account)?;
-                let client = AliyunClient::from_account(account, secret, Some(&self.env));
+                let client = AliyunClient::from_account(account, secret);
                 for instance in &running {
                     match client
                         .stop_instance(
@@ -838,7 +838,7 @@ impl Scheduler {
         let mut ok_count = 0usize;
         if !running.is_empty() {
             let secret = self.account_secret(account)?;
-            let client = AliyunClient::from_account(account, secret, Some(&self.env));
+            let client = AliyunClient::from_account(account, secret);
             for instance in &running {
                 match client
                     .stop_instance(
@@ -963,7 +963,7 @@ impl Scheduler {
         let mut ok_count = 0usize;
         if !stopped.is_empty() {
             let secret = self.account_secret(account)?;
-            let client = AliyunClient::from_account(account, secret, Some(&self.env));
+            let client = AliyunClient::from_account(account, secret);
             for instance in &stopped {
                 match client
                     .start_instance(&instance.instance_id, &instance.region_id)
@@ -1068,7 +1068,7 @@ impl Scheduler {
         }
 
         let secret = self.account_secret(account)?;
-        let client = AliyunClient::from_account(account, secret, Some(&self.env));
+        let client = AliyunClient::from_account(account, secret);
 
         for instance in &candidates {
             let lock_name = format!("keepalive:{}:{}", account.id, instance.instance_id);
@@ -1351,7 +1351,7 @@ impl Scheduler {
         }
 
         let secret = self.account_secret(&account)?;
-        let client = AliyunClient::from_account(&account, secret, Some(&self.env));
+        let client = AliyunClient::from_account(&account, secret);
 
         let result = if start {
             client.start_instance(instance_id, &region_id).await
