@@ -13,7 +13,7 @@
 │         ▼                                                         │
 │  Worker (Rust → Wasm)                                             │
 │    ├─ fetch:     路由 + 登录 + Cookie 鉴权                         │
-│    ├─ scheduled: */30 * * * * 巡检                                 │
+│    ├─ scheduled: */15 * * * * 巡检                                 │
 │    └─ wait_until: 异步 Job（刷新 / 开关机 / 通知测试 / 日报）        │
 │         │                                                         │
 │         ├─ D1：accounts / snapshots / history / jobs / logs        │
@@ -209,7 +209,7 @@ bun run dev:web                  # :5173
 
 ## 业务逻辑
 
-### Cron（`*/30 * * * *`）
+### Cron（`*/15 * * * *`）
 
 ```
 1. housekeeping（每日一次，锁保护）

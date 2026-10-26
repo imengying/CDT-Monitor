@@ -193,7 +193,7 @@ pub fn minutes_to_hhmm(minutes: u32) -> String {
 }
 
 /// 判断当前本地时间是否落在 `target` 分钟之后 `window` 分钟的短窗口内。
-/// Cron 每 30 分钟触发一次，窗口用于兜住边缘抖动（不至于整天错过）。
+/// Cron 每 15 分钟触发一次，窗口用于兜住边缘抖动（不至于整天错过）。
 pub fn within_window(now_minutes: u32, target_minutes: u32, window: u32) -> bool {
     now_minutes >= target_minutes && now_minutes < target_minutes.saturating_add(window)
 }

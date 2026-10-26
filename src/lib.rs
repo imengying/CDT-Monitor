@@ -1744,7 +1744,7 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
     }
 }
 
-/// Cron 入口：`*/30 * * * *`。
+/// Cron 入口：`*/15 * * * *`。
 #[event(scheduled)]
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let log_level = Db::new(&env)
@@ -1766,7 +1766,7 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     log_info!("Cron 汇总：{}", report.summary());
 
     if report.accounts_failed > 0 || report.thresholds_fired > 0 || report.spikes_detected > 0 {
-        // 每 6 小时最多一条汇总：持续故障不应该每 30 分钟提醒一次。
+        // 每 6 小时最多一条汇总：持续故障不应该每 15 分钟提醒一次。
         let bucket = crate::models::now_ms() / (6 * 60 * 60 * 1000);
         let _ = scheduler
             .notify_once(
