@@ -38,6 +38,33 @@ import { toast } from '@/lib/store'
 
 type Tab = 'accounts' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'system'
 
+/**
+ * 可选地域。
+ *
+ * 每个地域单独发一次 DescribeInstances，勾选越多刷新越慢，
+ * 因此只列常用的几个，够覆盖 CDT 免费额度的主力区域。
+ */
+const REGION_OPTIONS: { value: string; label: string }[] = [
+  { value: 'cn-hangzhou', label: '华东 1（杭州）' },
+  { value: 'cn-shanghai', label: '华东 2（上海）' },
+  { value: 'cn-beijing', label: '华北 2（北京）' },
+  { value: 'cn-shenzhen', label: '华南 1（深圳）' },
+  { value: 'cn-hongkong', label: '中国香港' },
+  { value: 'ap-southeast-1', label: '新加坡' },
+  { value: 'ap-northeast-1', label: '日本（东京）' },
+  { value: 'us-west-1', label: '美国（硅谷）' },
+  { value: 'us-east-1', label: '美国（弗吉尼亚）' },
+  { value: 'eu-central-1', label: '德国（法兰克福）' },
+]
+
+/** 默认勾选的地域（与后端 `DEFAULT_REGIONS` 保持一致）。 */
+const DEFAULT_REGIONS = ['cn-hangzhou', 'cn-shanghai', 'cn-beijing', 'cn-shenzhen']
+
+/** 地域 → 中文名；不在清单里的原样显示。 */
+function regionLabel(region: string): string {
+  return REGION_OPTIONS.find((item) => item.value === region)?.label ?? region
+}
+
 /** 账号表单。 */
 interface AccountForm {
   id: number | null
@@ -45,7 +72,7 @@ interface AccountForm {
   siteType: SiteType
   accessKeyId: string
   accessKeySecret: string
-  regionsText: string
+  regions: string[]
   trafficLimitGb: number
   /** 突变告警阈值（GB）；null 表示使用默认值，0 表示关闭 */
   spikeThresholdGb: number | null
@@ -65,7 +92,7 @@ function blankAccountForm(): AccountForm {
     siteType: 'china',
     accessKeyId: '',
     accessKeySecret: '',
-    regionsText: 'cn-hangzhou\ncn-shanghai\ncn-beijing\ncn-shenzhen',
+    regions: [...DEFAULT_REGIONS],
     trafficLimitGb: 20,
     spikeThresholdGb: null,
     overLimitAction: 'stop_and_notify',
@@ -117,7 +144,7 @@ function formFromAccount(account: AccountDto): AccountForm {
     siteType: account.site_type,
     accessKeyId: account.access_key_id,
     accessKeySecret: '',
-    regionsText: account.regions.join('\n'),
+    regions: [...account.regions],
     trafficLimitGb: account.traffic_limit_gb,
     spikeThresholdGb: account.spike_threshold_gb,
     overLimitAction: account.over_limit_action,
@@ -155,14 +182,12 @@ export class SettingsModal {
     enabled: false,
     chatId: '',
     token: '',
-    clearToken: false,
   }
 
   private barkDraft = {
     enabled: false,
     serverUrl: 'https://api.day.app',
     deviceKey: '',
-    clearDeviceKey: false,
     normalLevel: 'active' as PushLevel,
     alertLevel: 'critical' as PushLevel,
   }
@@ -179,6 +204,8 @@ export class SettingsModal {
   private kicking: string | null = null
   /** 设备列表容器。数据更新时只替换内部节点，不重渲染整个设置页。 */
   private deviceListHost: HTMLDivElement | null = null
+  /** 地域多选浮层（挂在 body 上，需手动清理）。 */
+  private regionPanel: HTMLDivElement | null = null
 
   private removeEscListener: (() => void) | null = null
 
@@ -258,6 +285,8 @@ export class SettingsModal {
     this.element.classList.add('hidden')
     this.element.style.display = 'none'
     document.body.style.overflow = ''
+    this.regionPanel?.remove()
+    this.regionPanel = null
     this.removeEscListener?.()
     this.removeEscListener = null
   }
@@ -291,14 +320,12 @@ export class SettingsModal {
       enabled: settings.telegram.enabled,
       chatId: settings.telegram.chat_id ?? '',
       token: '',
-      clearToken: false,
     }
 
     this.barkDraft = {
       enabled: settings.bark.enabled,
       serverUrl: settings.bark.server_url,
       deviceKey: '',
-      clearDeviceKey: false,
       normalLevel: settings.bark.normal_level,
       alertLevel: settings.bark.alert_level,
     }
@@ -462,6 +489,99 @@ export class SettingsModal {
     return node
   }
 
+  /**
+   * 地域多选。
+   *
+   * 触发器长得像下拉框，点开后在 body 上挂一个浮层放复选框 —— 挂 body 是因为
+   * 设置页里任何 `renderContent()` 都会重建表单节点，浮层若在表单内部会被
+   * 连带销毁（此前下拉框「自己闭合」就是这个原因）。
+   */
+  private regionMultiSelect(
+    selected: string[],
+    onChange: (value: string[]) => void,
+  ): HTMLElement {
+    const trigger = el(
+      'button',
+      {
+        class: 'input flex items-center justify-between gap-2 text-left',
+        type: 'button',
+        'aria-haspopup': 'true',
+        'aria-expanded': 'false',
+      },
+      el('span', { class: 'truncate', text: this.regionsSummary(selected) }),
+      iconSvg(icons.chevronDown, 14),
+    ) as HTMLButtonElement
+
+    const close = (): void => {
+      this.regionPanel?.remove()
+      this.regionPanel = null
+      trigger.setAttribute('aria-expanded', 'false')
+    }
+
+    trigger.addEventListener('click', () => {
+      close()
+      const rect = trigger.getBoundingClientRect()
+      const panel = el('div', {
+        class: 'card absolute z-[70] max-h-64 overflow-y-auto p-2 scroll-thin',
+        style: {
+          left: `${rect.left}px`,
+          top: `${rect.bottom + 4}px`,
+          width: `${rect.width}px`,
+        },
+        role: 'group',
+        'aria-label': '选择地域',
+      })
+
+      for (const option of REGION_OPTIONS) {
+        const box = el('input', { type: 'checkbox' }) as HTMLInputElement
+        box.checked = selected.includes(option.value)
+        box.addEventListener('change', () => {
+          const next = box.checked
+            ? [...selected, option.value]
+            : selected.filter((item) => item !== option.value)
+          selected = next
+          onChange(next)
+          replaceChildren(trigger.firstElementChild as HTMLElement, document.createTextNode(this.regionsSummary(next)))
+        })
+        panel.append(
+          el(
+            'label',
+            {
+              class: 'flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-[0.8125rem] hover:bg-(--color-surface-muted)',
+              style: { color: 'var(--color-ink)' },
+            },
+            box,
+            el('span', { text: option.label }),
+          ),
+        )
+      }
+
+      document.body.append(panel)
+      this.regionPanel = panel
+      trigger.setAttribute('aria-expanded', 'true')
+
+      // 点空白处关闭：延迟注册，避免这次点击立刻把自己关掉
+      window.setTimeout(() => {
+        const onDocClick = (event: MouseEvent): void => {
+          const target = event.target as Node
+          if (panel.contains(target) || trigger.contains(target)) return
+          close()
+          document.removeEventListener('click', onDocClick, true)
+        }
+        document.addEventListener('click', onDocClick, true)
+      }, 0)
+    })
+
+    return el('div', { class: 'relative' }, trigger)
+  }
+
+  /** 已选地域的摘要文案。 */
+  private regionsSummary(selected: string[]): string {
+    if (selected.length === 0) return '未选择'
+    if (selected.length <= 2) return selected.map(regionLabel).join('、')
+    return `${regionLabel(selected[0]!)} 等 ${selected.length} 个地域`
+  }
+
   /** 开关。 */
   private switchControl(
     label: string,
@@ -499,20 +619,6 @@ export class SettingsModal {
   }
 
   /** 复选框行。 */
-  private checkboxRow(label: string, onChange: (checked: boolean) => void): HTMLElement {
-    const box = el('input', { type: 'checkbox' }) as HTMLInputElement
-    box.addEventListener('change', () => onChange(box.checked))
-    return el(
-      'label',
-      {
-        class: 'flex cursor-pointer items-center gap-2 text-[0.8125rem]',
-        style: { color: 'var(--color-ink-muted)' },
-      },
-      box,
-      el('span', { text: label }),
-    )
-  }
-
   /** 表单提交按钮。 */
   private submitButton(label: string): HTMLButtonElement {
     return el(
@@ -761,13 +867,8 @@ export class SettingsModal {
   private buildAccountForm(): HTMLElement {
     const form = this.form
 
-    const regionsTextarea = el('textarea', {
-      class: 'input scroll-thin font-mono',
-      rows: '3',
-    }) as HTMLTextAreaElement
-    regionsTextarea.value = form.regionsText
-    regionsTextarea.addEventListener('input', () => {
-      this.form.regionsText = regionsTextarea.value
+    const regionsSelect = this.regionMultiSelect(form.regions, (value) => {
+      this.form.regions = value
     })
 
     const scheduleStart = this.textInput(form.scheduleStart, (value) => {
@@ -854,7 +955,24 @@ export class SettingsModal {
         ),
       ),
 
-      this.field('地域列表', regionsTextarea, '每行一个地域 ID，留空使用默认四个'),
+      el(
+        'div',
+        { class: 'grid gap-3 sm:grid-cols-2' },
+        this.field('地域', regionsSelect, '勾选需要管理实例的地域'),
+        this.field(
+          '停机模式',
+          this.selectInput(
+            form.stopMode,
+            [
+              { value: 'StopCharging', label: '节省停机' },
+              { value: 'KeepCharging', label: '普通停机' },
+            ],
+            (value) => {
+              this.form.stopMode = value
+            },
+          ),
+        ),
+      ),
 
       el(
         'div',
@@ -882,19 +1000,6 @@ export class SettingsModal {
             ],
             (value) => {
               this.form.overLimitAction = value
-            },
-          ),
-        ),
-        this.field(
-          '停机模式',
-          this.selectInput(
-            form.stopMode,
-            [
-              { value: 'StopCharging', label: '节省停机' },
-              { value: 'KeepCharging', label: '普通停机' },
-            ],
-            (value) => {
-              this.form.stopMode = value
             },
           ),
         ),
@@ -954,18 +1059,6 @@ export class SettingsModal {
   }
 
   /** 解析地域文本。 */
-  private parsedRegions(): string[] {
-    const seen = new Set<string>()
-    const out: string[] = []
-    for (const raw of this.form.regionsText.split(/[\s,，]+/)) {
-      const region = raw.trim()
-      if (!region || seen.has(region)) continue
-      seen.add(region)
-      out.push(region)
-    }
-    return out
-  }
-
   private async submitAccount(): Promise<void> {
     if (this.saving) return
     const form = this.form
@@ -987,7 +1080,7 @@ export class SettingsModal {
       name: form.name.trim(),
       site_type: form.siteType,
       access_key_id: form.accessKeyId.trim(),
-      regions: this.parsedRegions(),
+      regions: [...form.regions],
       traffic_limit_gb: Number(form.trafficLimitGb),
       spike_threshold_gb: form.spikeThresholdGb,
       over_limit_action: form.overLimitAction,
@@ -1244,14 +1337,6 @@ export class SettingsModal {
       ),
     ]
 
-    if (configured) {
-      children.push(
-        this.checkboxRow('清除已保存的 Token', (checked) => {
-          this.telegramDraft.clearToken = checked
-        }),
-      )
-    }
-
     children.push(
       el(
         'div',
@@ -1288,7 +1373,6 @@ export class SettingsModal {
     const payload: TelegramUpdate = {
       enabled: this.telegramDraft.enabled,
       chat_id: this.telegramDraft.chatId.trim() || null,
-      clear_token: this.telegramDraft.clearToken,
     }
     if (this.telegramDraft.token.trim()) {
       payload.token = this.telegramDraft.token.trim()
@@ -1385,14 +1469,6 @@ export class SettingsModal {
       ),
     ]
 
-    if (configured) {
-      children.push(
-        this.checkboxRow('清除已保存的 Device Key', (checked) => {
-          this.barkDraft.clearDeviceKey = checked
-        }),
-      )
-    }
-
     children.push(
       el(
         'div',
@@ -1431,7 +1507,6 @@ export class SettingsModal {
       server_url: this.barkDraft.serverUrl.trim(),
       normal_level: this.barkDraft.normalLevel,
       alert_level: this.barkDraft.alertLevel,
-      clear_device_key: this.barkDraft.clearDeviceKey,
     }
     if (this.barkDraft.deviceKey.trim()) {
       payload.device_key = this.barkDraft.deviceKey.trim()
@@ -1733,9 +1808,10 @@ export class SettingsModal {
     }
 
     const others = this.devices.filter((device) => !device.current)
+    const nodes: HTMLElement[] = []
 
     if (others.length > 0) {
-      wrapper.append(
+      nodes.push(
         el(
           'div',
           { class: 'flex justify-end' },
@@ -1754,8 +1830,12 @@ export class SettingsModal {
     }
 
     for (const device of this.devices) {
-      wrapper.append(this.buildDeviceRow(device))
+      nodes.push(this.buildDeviceRow(device))
     }
+
+    // 容器是复用的，必须先清空再写入。此前直接 append，导致每次重绘都把
+    // 整份列表再叠一遍，表现为「本机」重复出现且越刷越多。
+    replaceChildren(wrapper, ...nodes)
 
     return wrapper
   }

@@ -36,7 +36,6 @@ export class LoginModal {
   private readonly submitButton: HTMLButtonElement
   private readonly widgetHost: HTMLDivElement
   private readonly errorBox: HTMLDivElement
-  private readonly statusHint: HTMLParagraphElement
 
   private widgetId: string | null = null
   private token = ''
@@ -78,11 +77,6 @@ export class LoginModal {
         backgroundColor: 'var(--color-danger-soft)',
         color: 'var(--color-danger)',
       },
-    })
-
-    this.statusHint = el('p', {
-      class: 'mt-2 hidden items-center gap-1.5 text-xs',
-      style: { color: 'var(--color-ink-subtle)' },
     })
 
     this.card = el(
@@ -186,7 +180,6 @@ export class LoginModal {
       'div',
       { class: 'mb-5', dataset: { role: 'turnstile-section' } },
       this.widgetHost,
-      this.statusHint,
     )
   }
 
@@ -219,18 +212,14 @@ export class LoginModal {
 
   /** 渲染小组件。 */
   private async renderWidget(): Promise<void> {
-    this.showStatus('正在加载人机校验…', true)
-
     const ready = await this.waitForTurnstile()
     if (this.disposed) return
 
     if (!ready || !window.turnstile) {
-      this.showStatus('人机校验组件加载失败，请检查网络后刷新页面', false)
       this.showError('人机校验组件加载失败，请刷新页面重试')
       return
     }
 
-    this.showStatus('', false)
 
     if (this.widgetId !== null) return
 
@@ -247,18 +236,14 @@ export class LoginModal {
       callback: (token: string) => {
         this.token = token
         this.hideError()
-        this.showStatus('', false)
         this.syncSubmitState()
       },
 
-      // 只有被判定需要人工确认时，Turnstile 自己会把复选框画出来，
-      // 我们只需在下方补一句说明。
+      // Turnstile 在需要人工确认时会自己画出复选框，无需额外文字说明。
       'before-interactive-callback': () => {
-        this.showStatus('请完成下方的人机校验', true)
       },
 
       'after-interactive-callback': () => {
-        this.showStatus('', false)
       },
 
       'expired-callback': () => {
@@ -268,20 +253,17 @@ export class LoginModal {
 
       'error-callback': () => {
         this.token = ''
-        this.showStatus('', false)
         this.syncSubmitState()
         this.showError('人机校验出错，请重试')
       },
 
       'timeout-callback': () => {
         this.token = ''
-        this.showStatus('', false)
         this.syncSubmitState()
       },
 
       'unsupported-callback': () => {
         // 浏览器不支持 / 站点配置异常：明确提示，别留下静默失败的卡片
-        this.showStatus('', false)
         this.showError('当前浏览器不支持人机校验组件，请更换浏览器后重试')
       },
     })
@@ -290,7 +272,6 @@ export class LoginModal {
   /** 重置小组件（token 一次性，失败后必须重置）。 */
   private resetWidget(): void {
     this.token = ''
-    this.showStatus('', false)
     if (this.widgetId !== null && window.turnstile) {
       window.turnstile.reset(this.widgetId)
     }
@@ -336,18 +317,6 @@ export class LoginModal {
         ? [iconSvg(icons.spinner, 15, 'animate-spin'), el('span', { text: '验证中…' })]
         : [el('span', { text: '登录' })]),
     )
-  }
-
-  private showStatus(text: string, visible: boolean): void {
-    if (!visible || !text) {
-      this.statusHint.classList.add('hidden')
-      this.statusHint.classList.remove('flex')
-      this.statusHint.replaceChildren()
-      return
-    }
-    this.statusHint.classList.remove('hidden')
-    this.statusHint.classList.add('flex')
-    replaceChildren(this.statusHint, iconSvg(icons.spinner, 12, 'animate-spin'), el('span', { text }))
   }
 
   private showError(message: string): void {

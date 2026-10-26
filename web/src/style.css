@@ -22,8 +22,6 @@
   --color-brand-soft: light-dark(#eff6ff, #172554);
   --color-ok: light-dark(#059669, #34d399);
   --color-ok-soft: light-dark(#ecfdf5, #052e26);
-  --color-info: light-dark(#0891b2, #67e8f9);
-  --color-info-soft: light-dark(#ecfeff, #083344);
   --color-warn: light-dark(#d97706, #fbbf24);
   --color-warn-soft: light-dark(#fffbeb, #422006);
   --color-danger: light-dark(#dc2626, #f87171);

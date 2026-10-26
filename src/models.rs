@@ -1298,9 +1298,6 @@ pub struct TelegramSettingsUpdate {
     pub chat_id: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
-    /// 显式清除已保存的 Token。
-    #[serde(default)]
-    pub clear_token: bool,
 }
 
 /// Bark 设置（脱敏）。
@@ -1321,8 +1318,6 @@ pub struct BarkSettingsUpdate {
     pub server_url: String,
     #[serde(default)]
     pub device_key: Option<String>,
-    #[serde(default)]
-    pub clear_device_key: bool,
     #[serde(default = "default_normal_level")]
     pub normal_level: PushLevel,
     #[serde(default = "default_alert_level")]

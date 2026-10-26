@@ -983,6 +983,19 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// 删除同一设备的旧会话（同 UA + 同 IP），返回删除条数。
+    ///
+    /// 同一个浏览器反复登录会不断新建 `sid`，旧记录要等过期才被清理，
+    /// 「登录设备」里就会堆出一串一模一样的条目。登录前先清掉同设备旧会话，
+    /// 让列表始终「一台设备一条」。
+    pub async fn delete_sessions_of_device(&self, ua: &str, ip: &str) -> Result<usize> {
+        self.exec(
+            "DELETE FROM sessions WHERE ua = ? AND ip = ?",
+            &[j_text(ua), j_text(ip)],
+        )
+        .await
+    }
+
     /// 清理过期会话。
     pub async fn purge_sessions(&self, now_ms: i64) -> Result<usize> {
         self.exec(

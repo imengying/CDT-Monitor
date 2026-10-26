@@ -517,12 +517,11 @@ export class App {
       value: string,
       hint: string,
       icon: typeof icons.dashboard,
-      tone: 'brand' | 'ok' | 'info' | 'warn' | 'danger' | 'muted',
+      tone: 'brand' | 'ok' | 'warn' | 'danger' | 'muted',
     ): HTMLElement => {
       const toneMap = {
         brand: ['var(--color-brand)', 'var(--color-brand-soft)'],
         ok: ['var(--color-ok)', 'var(--color-ok-soft)'],
-        info: ['var(--color-info)', 'var(--color-info-soft)'],
         warn: ['var(--color-warn)', 'var(--color-warn-soft)'],
         danger: ['var(--color-danger)', 'var(--color-danger-soft)'],
         muted: ['var(--color-ink-muted)', 'var(--color-surface-muted)'],
@@ -570,7 +569,7 @@ export class App {
     replaceChildren(
       this.summaryGrid,
       metric('账号', `${enabled}`, `/ ${accounts.length}`, icons.server, 'brand'),
-      metric('本月流量', (totalBytes / 1024 ** 3).toFixed(1), 'GB', icons.chart, 'info'),
+      metric('本月流量', (totalBytes / 1024 ** 3).toFixed(1), 'GB', icons.chart, 'brand'),
       metric('实例', `${running}`, `运行 / ${stopped} 停止`, icons.serverCog, 'ok'),
       metric(
         '熔断',

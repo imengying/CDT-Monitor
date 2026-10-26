@@ -538,6 +538,12 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
     let ua = client_ua(&req);
     let ip = client_ip(&req).unwrap_or_default();
 
+    // 同一设备（同 UA + 同 IP）重新登录时先顶掉旧会话，否则每登录一次
+    // 就多一条记录，「登录设备」会堆出一串重复条目。
+    if let Err(err) = app.db.delete_sessions_of_device(&ua, &ip).await {
+        log_error!("清理同设备旧会话失败：{err}");
+    }
+
     app.db
         .create_session(&crate::models::SessionRow {
             sid: sid.clone(),
@@ -1006,9 +1012,7 @@ async fn handle_update_telegram(app: &AppCtx, mut req: Request) -> worker::Resul
 
     let mut config: TelegramConfig = app.db.get_json_setting(setting_key::TELEGRAM).await?;
 
-    if payload.clear_token {
-        config.token_enc = None;
-    } else if let Some(token) = payload
+    if let Some(token) = payload
         .token
         .as_deref()
         .map(str::trim)
@@ -1066,9 +1070,7 @@ async fn handle_update_bark(app: &AppCtx, mut req: Request) -> worker::Result<Re
 
     let mut config: BarkConfig = app.db.get_json_setting(setting_key::BARK).await?;
 
-    if payload.clear_device_key {
-        config.device_key_enc = None;
-    } else if let Some(key) = payload
+    if let Some(key) = payload
         .device_key
         .as_deref()
         .map(str::trim)

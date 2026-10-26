@@ -293,14 +293,12 @@ export interface TelegramUpdate {
   enabled: boolean
   chat_id: string | null
   token?: string
-  clear_token?: boolean
 }
 
 export interface BarkUpdate {
   enabled: boolean
   server_url: string
   device_key?: string
-  clear_device_key?: boolean
   normal_level: PushLevel
   alert_level: PushLevel
 }
