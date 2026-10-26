@@ -1221,6 +1221,83 @@ mod tests {
     }
 
     #[test]
+    fn cn_hongkong_counts_as_overseas() {
+        // CDT 的计费口径是「中国内地」vs「非中国内地」。
+        // cn-hongkong 以 cn- 开头，若先匹配 cn- 前缀就会被错算成内地，
+        // 这是本模块最容易出错的一处，单独覆盖。
+        let value = serde_json::json!({
+            "TrafficDetails": [
+                { "RegionId": "cn-hangzhou", "Traffic": 100 },
+                { "RegionId": "cn-hongkong", "Traffic": 200 },
+                { "RegionId": "cn-shanghai", "Traffic": 50 },
+                { "RegionId": "ap-southeast-1", "Traffic": 30 }
+            ]
+        });
+        let traffic = CdtTraffic::parse(&value, SiteType::China);
+        assert_eq!(
+            traffic.domestic_bytes, 150,
+            "内地应只含 cn-hangzhou + cn-shanghai"
+        );
+        assert_eq!(traffic.overseas_bytes, 230, "香港应计入非内地");
+        assert_eq!(traffic.unclassified_bytes, 0);
+    }
+
+    #[test]
+    fn classify_region_boundaries() {
+        assert_eq!(
+            classify_region(Some("cn-hongkong"), SiteType::China),
+            RegionClass::Overseas
+        );
+        assert_eq!(
+            classify_region(Some("CN-HongKong"), SiteType::China),
+            RegionClass::Overseas
+        );
+        assert_eq!(
+            classify_region(Some("cn-hangzhou"), SiteType::China),
+            RegionClass::Domestic
+        );
+        assert_eq!(
+            classify_region(Some("cn-beijing"), SiteType::China),
+            RegionClass::Domestic
+        );
+        assert_eq!(
+            classify_region(Some("ap-southeast-1"), SiteType::China),
+            RegionClass::Overseas
+        );
+        assert_eq!(
+            classify_region(Some("us-west-1"), SiteType::China),
+            RegionClass::Overseas
+        );
+        // 文案标签
+        assert_eq!(
+            classify_region(Some("International"), SiteType::China),
+            RegionClass::Overseas
+        );
+        assert_eq!(
+            classify_region(Some("Domestic"), SiteType::China),
+            RegionClass::Domestic
+        );
+        assert_eq!(
+            classify_region(Some("中国内地"), SiteType::China),
+            RegionClass::Domestic
+        );
+        assert_eq!(
+            classify_region(Some("香港"), SiteType::China),
+            RegionClass::Overseas
+        );
+        // 无法识别
+        assert_eq!(
+            classify_region(Some("xyz"), SiteType::China),
+            RegionClass::Unknown
+        );
+        assert_eq!(classify_region(None, SiteType::China), RegionClass::Unknown);
+        assert_eq!(
+            classify_region(Some("  "), SiteType::China),
+            RegionClass::Unknown
+        );
+    }
+
+    #[test]
     fn cdt_parse_empty() {
         let traffic = CdtTraffic::parse(&serde_json::json!({ "RequestId": "x" }), SiteType::China);
         assert_eq!(traffic, CdtTraffic::default());
