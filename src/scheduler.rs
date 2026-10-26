@@ -180,16 +180,6 @@ pub struct InstanceActionResult {
     pub detail: String,
 }
 
-/// 账号内批量开关机的结果。
-#[derive(Debug, Clone)]
-pub struct InstanceBatchSummary {
-    pub started: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    /// 人类可读的汇总文案。
-    pub detail: String,
-}
-
 // ===========================================================================
 // Scheduler
 // ===========================================================================
@@ -1162,7 +1152,18 @@ impl Scheduler {
         }
 
         let message = self.build_daily_report(&tz).await?;
-        self.notify(message).await;
+        let outcome = self.notify(message).await;
+
+        // 只在真的送达后才标记「今天已推送」，否则下次 Cron 会重试。
+        // 之前无条件标记，一次通知失败就会让当天的日报永久丢失。
+        if !outcome.any_success() {
+            let reason = outcome.failures().join("；");
+            let _ = self.db.release_lock(&lock_name, &owner).await;
+            report
+                .notes
+                .push(format!("日报推送失败，稍后重试：{reason}"));
+            return Ok(false);
+        }
 
         config.last_sent_date = Some(today.clone());
         self.db
@@ -1401,98 +1402,6 @@ impl Scheduler {
         }
 
         Ok(detail)
-    }
-
-    /// 对账号内全部实例执行开/关机。
-    ///
-    /// 逐个执行而非并发：阿里云对单账号有 QPS 限制，并发容易触发限流；
-    /// 且失败需要逐个记录，串行更容易给出准确的汇总。
-    pub async fn instance_batch(
-        &self,
-        account_id: i64,
-        start: bool,
-    ) -> worker::Result<InstanceBatchSummary> {
-        let account = self
-            .db
-            .get_account(account_id)
-            .await?
-            .ok_or_else(|| worker::Error::RustError(format!("账号 {account_id} 不存在")))?;
-
-        // 熔断开机闸门：批量开机同样受约束
-        if start && self.threshold_blocked(&account).await? {
-            return Err(worker::Error::RustError(
-                "本月已触发流量熔断停机，禁止开机；请提升阈值或等待下个账期".to_string(),
-            ));
-        }
-
-        let instances = self.db.snapshot_instances(account_id).await?;
-        if instances.is_empty() {
-            return Ok(InstanceBatchSummary {
-                started: 0,
-                skipped: 0,
-                failed: 0,
-                detail: "没有可操作的实例".to_string(),
-            });
-        }
-
-        let mut ok_count = 0usize;
-        let mut skipped = 0usize;
-        let mut failures: Vec<String> = Vec::new();
-
-        for instance in &instances {
-            // 先按快照状态预判，避免对已处于目标状态的实例发起请求
-            if start && instance.is_running() {
-                skipped += 1;
-                continue;
-            }
-            if !start && instance.is_stopped() {
-                skipped += 1;
-                continue;
-            }
-
-            match self
-                .instance_action(account_id, &instance.instance_id, start)
-                .await
-            {
-                Ok(_) => ok_count += 1,
-                Err(err) => failures.push(format!("{}：{err}", instance.instance_id)),
-            }
-        }
-
-        let action = if start { "开机" } else { "关机" };
-        let mut detail = format!("{action}完成 {ok_count} 台");
-        if skipped > 0 {
-            detail.push_str(&format!("，跳过 {skipped} 台（已在目标状态）"));
-        }
-        if !failures.is_empty() {
-            detail.push_str(&format!("，失败 {} 台", failures.len()));
-        }
-        if !failures.is_empty() {
-            detail.push_str(&format!("（{}）", failures.join("；")));
-        }
-
-        self.db
-            .add_log(
-                Some(account_id),
-                if start { "batch_start" } else { "batch_stop" },
-                None,
-                &detail,
-                now_ms(),
-            )
-            .await
-            .ok();
-
-        // 全部失败才报错，部分成功仍算完成（细节已在文案里）
-        if ok_count == 0 && !failures.is_empty() {
-            return Err(worker::Error::RustError(detail));
-        }
-
-        Ok(InstanceBatchSummary {
-            started: ok_count,
-            skipped,
-            failed: failures.len(),
-            detail,
-        })
     }
 
     /// 切换逐实例抢占式保活开关。

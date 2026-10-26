@@ -9,10 +9,11 @@
 //!    （`ADMIN_USERNAME` / `ADMIN_PASSWORD`），**不支持**在后台改，
 //!    也不写进 D1。这样「谁能登录」这件事只有一个来源，轮换就是改环境变量。
 //!    用常量时间比较，避免通过响应时间差推断密码。
-//! 3. **无状态会话 Token**：`v1.<payload_b64url>.<sig_b64url>`，签名算法
-//!    `HMAC-SHA256`，密钥直接使用 `MASTER_KEY`，payload 里带过期时间与随机 jti。
-//!    服务端不落库，只验签 + 比对时间；配合 `HttpOnly; Secure; SameSite=Strict`
-//!    Cookie 使用。
+//! 3. **会话 Token**：`v1.<payload_b64url>.<sig_b64url>`，签名算法
+//!    `HMAC-SHA256`，密钥直接使用 `MASTER_KEY`，payload 里带过期时间、随机
+//!    jti 与会话 ID（sid）。Token 本身无需查库即可验签；`sid` 用于回查
+//!    `sessions` 表判断会话是否已被吊销（踢下线）。配合
+//!    `HttpOnly; Secure; SameSite=Strict` Cookie 使用。
 //!
 //! `MASTER_KEY` 的解析容错：64 字符 Hex、44 字符 Base64、或恰好 32 字节的
 //! 原始字符串都接受；其它形式会经 `blake3::derive_key` 拉伸成 32 字节，

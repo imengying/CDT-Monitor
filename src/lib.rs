@@ -435,6 +435,12 @@ async fn handle_session(app: &AppCtx, req: &Request) -> worker::Result<Response>
 
 /// `POST /api/v1/auth/login`（公开，但必须先过 Turnstile）
 async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response> {
+    // 登录也必须校验来源：否则第三方页面可诱导管理员提交凭证，
+    // 把攻击者的会话写进受害者浏览器（login CSRF）。
+    if !same_origin_ok(&req) {
+        return error_response_with_code(403, "跨站请求被拒绝", "cross_origin");
+    }
+
     let payload: LoginRequest = match read_json(&mut req).await {
         Ok(payload) => payload,
         Err(err) => return error_response(400, err),
@@ -1271,11 +1277,6 @@ enum JobTask {
         account_id: i64,
         instance_id: String,
     },
-    /// 账号内全部实例的开/关机。
-    InstanceBatch {
-        account_id: i64,
-        start: bool,
-    },
     NotifyTest {
         channel: Option<NotifyChannel>,
     },
@@ -1289,13 +1290,6 @@ impl JobTask {
             JobTask::RefreshAccount { .. } => JobType::RefreshAccount,
             JobTask::StartInstance { .. } => JobType::StartInstance,
             JobTask::StopInstance { .. } => JobType::StopInstance,
-            JobTask::InstanceBatch { start, .. } => {
-                if *start {
-                    JobType::StartInstance
-                } else {
-                    JobType::StopInstance
-                }
-            }
             JobTask::NotifyTest { .. } => JobType::NotifyTest,
             JobTask::DailyReport => JobType::DailyReport,
         }
@@ -1306,8 +1300,7 @@ impl JobTask {
             JobTask::RefreshAll | JobTask::NotifyTest { .. } | JobTask::DailyReport => None,
             JobTask::RefreshAccount { account_id }
             | JobTask::StartInstance { account_id, .. }
-            | JobTask::StopInstance { account_id, .. }
-            | JobTask::InstanceBatch { account_id, .. } => Some(*account_id),
+            | JobTask::StopInstance { account_id, .. } => Some(*account_id),
         }
     }
 
@@ -1422,10 +1415,6 @@ async fn execute_job(env: Env, job_id: String, task: JobTask) {
             .instance_action(account_id, &instance_id, false)
             .await
             .map(|result| result.detail),
-        JobTask::InstanceBatch { account_id, start } => scheduler
-            .instance_batch(account_id, start)
-            .await
-            .map(|summary| summary.detail),
         JobTask::NotifyTest { channel } => {
             let outcome = scheduler.test_notification(channel).await;
             if outcome.results.is_empty() {
@@ -1652,34 +1641,6 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
                 Err(_) => error_response(400, "账号 ID 不合法"),
             }
         }
-        (Method::Post, ["accounts", id, "instances", "start-all"]) => match id.parse::<i64>() {
-            Ok(account_id) => {
-                spawn_job(
-                    &ctx,
-                    &app,
-                    JobTask::InstanceBatch {
-                        account_id,
-                        start: true,
-                    },
-                )
-                .await
-            }
-            Err(_) => error_response(400, "账号 ID 不合法"),
-        },
-        (Method::Post, ["accounts", id, "instances", "stop-all"]) => match id.parse::<i64>() {
-            Ok(account_id) => {
-                spawn_job(
-                    &ctx,
-                    &app,
-                    JobTask::InstanceBatch {
-                        account_id,
-                        start: false,
-                    },
-                )
-                .await
-            }
-            Err(_) => error_response(400, "账号 ID 不合法"),
-        },
         (Method::Put, ["accounts", id, "instances", instance_id, "keep-alive"]) => {
             match id.parse::<i64>() {
                 Ok(account_id) => {

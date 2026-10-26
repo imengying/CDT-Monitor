@@ -580,19 +580,6 @@ export const api = {
     return request<SessionsResponse>('/api/v1/sessions', { method: 'DELETE' })
   },
 
-  /** 账号内全部实例开关机。 */
-  batchInstances(
-    accountId: number,
-    start: boolean,
-    options: PollOptions = {},
-  ): Promise<JobDto> {
-    return runJob(
-      `/api/v1/accounts/${accountId}/instances/${start ? 'start-all' : 'stop-all'}`,
-      {},
-      options,
-    )
-  },
-
   // ---------------------------------------------------------------- 设置
   settings(): Promise<SettingsResponse> {
     return request<SettingsResponse>('/api/v1/settings')
