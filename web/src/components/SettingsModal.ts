@@ -49,30 +49,34 @@ type Tab = 'accounts' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'system'
 interface RegionOption {
   value: string
   label: string
-  /** 面板里的分组标题；空串表示不显示标题（香港单列在最前）。 */
+  /** 所属大区，与 `REGION_GROUPS` 中的名称对应。 */
   group: string
 }
 
-const REGION_OPTIONS: RegionOption[] = [
-  { value: 'cn-hongkong', label: '香港', group: '' },
+/** 「地区」下拉的选项；决定「地域」列出哪一批城市。 */
+const REGION_GROUPS = ['中国', '亚太', '北美', '中欧'] as const
 
-  { value: 'cn-qingdao', label: '青岛', group: '中国内地' },
-  { value: 'cn-beijing', label: '北京', group: '中国内地' },
-  { value: 'cn-zhangjiakou', label: '张家口', group: '中国内地' },
-  { value: 'cn-huhehaote', label: '呼和浩特', group: '中国内地' },
-  { value: 'cn-wulanchabu', label: '乌兰察布', group: '中国内地' },
-  { value: 'cn-wulanchabu-acdr-1', label: '乌兰察布（专属云）', group: '中国内地' },
-  { value: 'cn-wulanchabu-gic-1', label: '乌兰察布（通用行业云）', group: '中国内地' },
-  { value: 'cn-hangzhou', label: '杭州', group: '中国内地' },
-  { value: 'cn-hangzhou-acdr-ut-1', label: '杭州（专属云）', group: '中国内地' },
-  { value: 'cn-shanghai', label: '上海', group: '中国内地' },
-  { value: 'cn-shanghai-cloudspe', label: '上海（云预发演练）', group: '中国内地' },
-  { value: 'cn-shenzhen', label: '深圳', group: '中国内地' },
-  { value: 'cn-heyuan', label: '河源', group: '中国内地' },
-  { value: 'cn-guangzhou', label: '广州', group: '中国内地' },
-  { value: 'cn-zhongwei', label: '中卫', group: '中国内地' },
-  { value: 'cn-wuhan-lr', label: '武汉（本地地域）', group: '中国内地' },
-  { value: 'cn-chengdu', label: '成都', group: '中国内地' },
+const REGION_OPTIONS: RegionOption[] = [
+  // 香港在计费上属非中国内地，但按使用习惯与国内地域放在一起，并排在最前
+  { value: 'cn-hongkong', label: '香港', group: '中国' },
+
+  { value: 'cn-qingdao', label: '青岛', group: '中国' },
+  { value: 'cn-beijing', label: '北京', group: '中国' },
+  { value: 'cn-zhangjiakou', label: '张家口', group: '中国' },
+  { value: 'cn-huhehaote', label: '呼和浩特', group: '中国' },
+  { value: 'cn-wulanchabu', label: '乌兰察布', group: '中国' },
+  { value: 'cn-wulanchabu-acdr-1', label: '乌兰察布（专属云）', group: '中国' },
+  { value: 'cn-wulanchabu-gic-1', label: '乌兰察布（通用行业云）', group: '中国' },
+  { value: 'cn-hangzhou', label: '杭州', group: '中国' },
+  { value: 'cn-hangzhou-acdr-ut-1', label: '杭州（专属云）', group: '中国' },
+  { value: 'cn-shanghai', label: '上海', group: '中国' },
+  { value: 'cn-shanghai-cloudspe', label: '上海（云预发演练）', group: '中国' },
+  { value: 'cn-shenzhen', label: '深圳', group: '中国' },
+  { value: 'cn-heyuan', label: '河源', group: '中国' },
+  { value: 'cn-guangzhou', label: '广州', group: '中国' },
+  { value: 'cn-zhongwei', label: '中卫', group: '中国' },
+  { value: 'cn-wuhan-lr', label: '武汉（本地地域）', group: '中国' },
+  { value: 'cn-chengdu', label: '成都', group: '中国' },
 
   { value: 'ap-northeast-1', label: '日本（东京）', group: '亚太' },
   { value: 'ap-northeast-2', label: '韩国（首尔）', group: '亚太' },
@@ -88,10 +92,10 @@ const REGION_OPTIONS: RegionOption[] = [
   { value: 'us-southeast-1', label: '美国（亚特兰大）', group: '北美' },
   { value: 'na-south-1', label: '墨西哥', group: '北美' },
 
-  { value: 'eu-west-1', label: '英国（伦敦）', group: '欧洲 / 中东' },
-  { value: 'eu-central-1', label: '德国（法兰克福）', group: '欧洲 / 中东' },
-  { value: 'eu-west-2', label: '法国（巴黎）', group: '欧洲 / 中东' },
-  { value: 'me-east-1', label: '阿联酋（迪拜）', group: '欧洲 / 中东' },
+  { value: 'eu-west-1', label: '英国（伦敦）', group: '中欧' },
+  { value: 'eu-central-1', label: '德国（法兰克福）', group: '中欧' },
+  { value: 'eu-west-2', label: '法国（巴黎）', group: '中欧' },
+  { value: 'me-east-1', label: '阿联酋（迪拜）', group: '中欧' },
 ]
 
 /** 默认勾选的地域（与后端 `DEFAULT_REGIONS` 保持一致）。 */
@@ -102,6 +106,11 @@ function regionLabel(region: string): string {
   return REGION_OPTIONS.find((item) => item.value === region)?.label ?? region
 }
 
+/** 地域所属大区；未知地域返回第一个分组，避免「地区」下拉出现空值。 */
+function groupOfRegion(region: string): string {
+  return REGION_OPTIONS.find((item) => item.value === region)?.group ?? REGION_GROUPS[0]
+}
+
 /** 账号表单。 */
 interface AccountForm {
   id: number | null
@@ -110,6 +119,8 @@ interface AccountForm {
   accessKeyId: string
   accessKeySecret: string
   regions: string[]
+  /** 「地区」下拉的当前选择，仅用于筛选地域清单，不提交。 */
+  regionGroup: string
   trafficLimitGb: number
   /** 突变告警阈值（GB）；null 表示使用默认值，0 表示关闭 */
   spikeThresholdGb: number | null
@@ -130,6 +141,7 @@ function blankAccountForm(): AccountForm {
     accessKeyId: '',
     accessKeySecret: '',
     regions: [...DEFAULT_REGIONS],
+    regionGroup: REGION_GROUPS[0],
     trafficLimitGb: 20,
     spikeThresholdGb: null,
     overLimitAction: 'stop_and_notify',
@@ -182,6 +194,7 @@ function formFromAccount(account: AccountDto): AccountForm {
     accessKeyId: account.access_key_id,
     accessKeySecret: '',
     regions: [...account.regions],
+    regionGroup: groupOfRegion(account.regions[0] ?? ''),
     trafficLimitGb: account.traffic_limit_gb,
     spikeThresholdGb: account.spike_threshold_gb,
     overLimitAction: account.over_limit_action,
@@ -529,11 +542,15 @@ export class SettingsModal {
   /**
    * 地域多选。
    *
+   * 只列 `group` 对应大区的地域 —— 一个账号可以横跨多个大区，所以「地区」
+   * 只是一层筛选，真正的配置是勾选出来的地域集合。
+   *
    * 触发器长得像下拉框，点开后在 body 上挂一个浮层放复选框 —— 挂 body 是因为
    * 设置页里任何 `renderContent()` 都会重建表单节点，浮层若在表单内部会被
    * 连带销毁（此前下拉框「自己闭合」就是这个原因）。
    */
   private regionMultiSelect(
+    group: string,
     selected: string[],
     onChange: (value: string[]) => void,
   ): HTMLElement {
@@ -545,7 +562,7 @@ export class SettingsModal {
         'aria-haspopup': 'true',
         'aria-expanded': 'false',
       },
-      el('span', { class: 'truncate', text: this.regionsSummary(selected) }),
+      el('span', { class: 'truncate', text: this.regionsSummary(group, selected) }),
       iconSvg(icons.chevronDown, 14),
     ) as HTMLButtonElement
 
@@ -569,20 +586,8 @@ export class SettingsModal {
         'aria-label': '选择地域',
       })
 
-      let lastGroup = ''
       for (const option of REGION_OPTIONS) {
-        if (option.group !== lastGroup) {
-          lastGroup = option.group
-          if (option.group) {
-            panel.append(
-              el('div', {
-                class: 'px-2 pt-2 pb-1 text-[0.6875rem] font-semibold tracking-wide',
-                style: { color: 'var(--color-ink-subtle)' },
-                text: option.group,
-              }),
-            )
-          }
-        }
+        if (option.group !== group) continue
 
         const box = el('input', { type: 'checkbox' }) as HTMLInputElement
         box.checked = selected.includes(option.value)
@@ -594,7 +599,7 @@ export class SettingsModal {
           onChange(next)
           replaceChildren(
             trigger.firstElementChild as HTMLElement,
-            document.createTextNode(this.regionsSummary(next)),
+            document.createTextNode(this.regionsSummary(group, next)),
           )
         })
         panel.append(
@@ -608,6 +613,16 @@ export class SettingsModal {
             box,
             el('span', { text: option.label }),
           ),
+        )
+      }
+
+      if (!panel.firstElementChild) {
+        panel.append(
+          el('p', {
+            class: 'px-2 py-1.5 text-[0.8125rem]',
+            style: { color: 'var(--color-ink-subtle)' },
+            text: '该地区暂无可选地域。',
+          }),
         )
       }
 
@@ -631,10 +646,22 @@ export class SettingsModal {
   }
 
   /** 已选地域的摘要文案。 */
-  private regionsSummary(selected: string[]): string {
+  /**
+   * 触发器上的摘要。
+   *
+   * 显示当前大区已选的地域；若总选择里还有别的区，补一句总数，
+   * 否则切到「中国」看不到已勾的香港会以为丢了。
+   */
+  private regionsSummary(group: string, selected: string[]): string {
+    const inGroup = selected.filter((item) => groupOfRegion(item) === group)
     if (selected.length === 0) return '未选择'
-    if (selected.length <= 2) return selected.map(regionLabel).join('、')
-    return `${regionLabel(selected[0]!)} 等 ${selected.length} 个地域`
+    if (inGroup.length === 0) return `本区未选 · 共 ${selected.length} 个`
+    if (inGroup.length <= 2) {
+      const text = inGroup.map(regionLabel).join('、')
+      return inGroup.length === selected.length ? text : `${text} · 共 ${selected.length} 个`
+    }
+    const text = `${regionLabel(inGroup[0]!)} 等 ${inGroup.length} 个`
+    return inGroup.length === selected.length ? text : `${text} · 共 ${selected.length} 个`
   }
 
   /** 开关。 */
@@ -922,9 +949,11 @@ export class SettingsModal {
   private buildAccountForm(): HTMLElement {
     const form = this.form
 
-    const regionsSelect = this.regionMultiSelect(form.regions, (value) => {
+    // 地域控件放在一个稳定的容器里：切换「地区」时只替换容器内容，
+    // 不重建整张表单（否则同行的下拉框会被销毁）。
+    const regionsHost = el('div', {}, this.regionMultiSelect(form.regionGroup, form.regions, (value) => {
       this.form.regions = value
-    })
+    }))
 
     const scheduleStart = this.textInput(form.scheduleStart, (value) => {
       this.form.scheduleStart = value
@@ -1012,8 +1041,25 @@ export class SettingsModal {
 
       el(
         'div',
-        { class: 'grid gap-3 sm:grid-cols-2' },
-        this.field('地域', regionsSelect, '勾选需要管理实例的地域'),
+        { class: 'grid gap-3 sm:grid-cols-3' },
+        this.field('地域', regionsHost),
+        this.field(
+          '地区',
+          this.selectInput(
+            form.regionGroup,
+            REGION_GROUPS.map((name) => ({ value: name, label: name })),
+            (value) => {
+              this.form.regionGroup = value
+              // 只重建地域控件，「地区」「停机模式」保持不动，避免下拉被销毁
+              replaceChildren(
+                regionsHost,
+                this.regionMultiSelect(value, this.form.regions, (next) => {
+                  this.form.regions = next
+                }),
+              )
+            },
+          ),
+        ),
         this.field(
           '停机模式',
           this.selectInput(
