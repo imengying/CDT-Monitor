@@ -109,7 +109,11 @@ if ! command -v worker-build >/dev/null 2>&1; then
   log "安装 worker-build 0.8.7（首次约 3-5 分钟）"
   # 在临时目录里安装：避免 rust-toolchain.toml 覆盖工具链导致
   # "default toolchain implicitly overridden by rustup toolchain file"。
-  ( cd "$(mktemp -d)" && cargo +stable install worker-build --version 0.8.7 --locked )
+  #
+  # 不加 --locked：crate 自带的 Cargo.lock 会锁定依赖的精确版本，
+  # 一旦其中某个版本被 crates.io yank，安装就会失败或告警
+  # （曾出现 yoke-derive 0.8.3 被 yank）。交给 cargo 自行解析版本。
+  ( cd "$(mktemp -d)" && cargo +stable install worker-build --version 0.8.7 )
 fi
 log "worker-build: $(command -v worker-build)"
 
