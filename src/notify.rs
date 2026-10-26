@@ -336,7 +336,7 @@ async fn post_with_timeout(
         .set("Accept", "application/json")
         .map_err(|e| format!("设置请求头失败：{e}"))?;
     headers
-        .set("User-Agent", "cdt-monitor-worker/0.1")
+        .set("User-Agent", "cdt-monitor/0.1")
         .map_err(|e| format!("设置请求头失败：{e}"))?;
 
     let mut init = RequestInit::new();

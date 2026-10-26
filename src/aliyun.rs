@@ -378,7 +378,7 @@ impl AliyunClient {
             .set("Accept", "application/json")
             .map_err(|e| AliyunError::Local(format!("设置请求头失败：{e}")))?;
         headers
-            .set("User-Agent", "cdt-monitor-worker/0.1 (+workers-rs)")
+            .set("User-Agent", "cdt-monitor/0.1 (+workers-rs)")
             .map_err(|e| AliyunError::Local(format!("设置请求头失败：{e}")))?;
         headers
             .set("x-acs-action", action)

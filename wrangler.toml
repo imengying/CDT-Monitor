@@ -26,7 +26,7 @@
 #      Settings → Variables and Secrets     → MASTER_KEY 等（选 Secret）
 # ============================================================================
 
-name = "cdt-monitor-worker"
+name = "cdt-monitor"
 
 # 由 [build] 生成，不要手改
 main = "build/worker/shim.mjs"

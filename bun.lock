@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "cdt-monitor-worker",
+      "name": "cdt-monitor",
       "devDependencies": {
         "wrangler": "^4.40.0",
       },

@@ -1,5 +1,5 @@
 [package]
-name = "cdt-monitor-worker"
+name = "cdt-monitor"
 version = "0.1.0"
 edition = "2024"
 description = "阿里云 CDT 流量监控与 ECS 自动化控制（Cloudflare Workers + Rust/Wasm）"

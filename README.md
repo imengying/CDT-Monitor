@@ -27,7 +27,7 @@
 ## 目录结构
 
 ```
-cdt-monitor-worker/
+cdt-monitor/
 ├── Cargo.toml                  Rust 2024，cdylib → wasm32
 ├── wrangler.toml               D1 / Assets / Cron / 变量
 ├── package.json                根脚本（Bun）
