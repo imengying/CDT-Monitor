@@ -534,7 +534,7 @@ export class AccountCard {
         ? el('div', {
             class: 'px-5 pb-5 text-center text-[0.8125rem]',
             style: { color: 'var(--color-ink-subtle)' },
-            text: '暂无实例数据，点击卡片右上角「刷新」采集一次。',
+            text: '暂无实例数据。',
           })
         : el(
             'ul',
@@ -695,7 +695,7 @@ export class AccountCard {
       iconSvg(icons.alert, 13),
       el('span', {
         class: 'leading-relaxed',
-        text: '本月流量已超阈值并触发熔断：停机与保活均已禁止再次拉起实例，需等待下个账期或提升阈值。',
+        text: '本月已触发流量熔断，禁止拉起实例。',
       }),
     )
   }

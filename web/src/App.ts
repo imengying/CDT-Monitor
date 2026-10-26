@@ -304,10 +304,10 @@ export class App {
         {
           class: 'btn btn-primary',
           type: 'button',
-          on: { click: () => this.settingsModal?.open(store.get().settings) },
+          on: { click: () => this.settingsModal?.open(store.get().settings, true) },
         },
-        iconSvg(icons.settings, 13),
-        el('span', { text: '打开设置添加账号' }),
+        iconSvg(icons.plus, 13),
+        el('span', { text: '添加账号' }),
       ),
     )
     card.classList.add('hidden')

@@ -180,6 +180,8 @@ export class SettingsModal {
   private devices: SessionDevice[] = []
   private devicesLoaded = false
   private kicking: string | null = null
+  /** 设备列表容器。数据更新时只替换内部节点，不重渲染整个设置页。 */
+  private deviceListHost: HTMLDivElement | null = null
 
   private removeEscListener: (() => void) | null = null
 
@@ -224,12 +226,17 @@ export class SettingsModal {
   // 打开 / 关闭 / 同步
   // -------------------------------------------------------------------------
 
-  /** 打开弹窗。 */
-  open(settings: SettingsResponse | null): void {
+  /**
+   * 打开弹窗。
+   *
+   * `startWithNewAccount` 打开后直接进入新增账号表单，供空状态的
+   * 「添加账号」按钮使用，省掉一次多余的点击。
+   */
+  open(settings: SettingsResponse | null, startWithNewAccount = false): void {
     this.settings = settings
     this.syncDrafts()
     this.activeTab = 'accounts'
-    this.formOpen = false
+    this.formOpen = startWithNewAccount
     this.form = blankAccountForm()
     this.confirmDeleteId = null
     this.hideNotice()
@@ -622,7 +629,7 @@ export class SettingsModal {
         el('p', {
           class: 'mt-0.5 text-[0.8125rem]',
           style: { color: 'var(--color-ink-subtle)' },
-          text: 'AccessKey Secret 使用 XChaCha20-Poly1305 加密后存入 D1，永不回显。',
+          text: 'AccessKey Secret 使用 XChaCha20-Poly1305 加密。',
         }),
       ),
       this.formOpen
@@ -657,7 +664,7 @@ export class SettingsModal {
           borderColor: 'var(--color-line)',
           color: 'var(--color-ink-subtle)',
         },
-        text: '还没有添加阿里云账号，点击右上角「新增」开始。',
+        text: '尚未添加账号。',
       })
     }
 
@@ -737,7 +744,7 @@ export class SettingsModal {
                 color: 'var(--color-danger)',
               },
             },
-            el('span', { text: '删除后该账号的快照与流量历史会一并清除，操作不可恢复。' }),
+            el('span', { text: '快照与流量历史将一并删除。' }),
             el(
               'div',
               { class: 'flex gap-1.5' },
@@ -1098,7 +1105,7 @@ export class SettingsModal {
         el('p', {
           class: 'mt-0.5 text-[0.8125rem] leading-relaxed',
           style: { color: 'var(--color-ink-subtle)' },
-          text: '登录时的人机校验。不填就是不启用 —— 只校验用户名与密码。',
+          text: '配置登录时的人机校验。',
         }),
       ),
       // 仅启用时显示状态；未启用是默认状态，无需额外说明
@@ -1116,7 +1123,7 @@ export class SettingsModal {
               iconSvg(icons.shield, 13),
               el('span', {
                 class: 'leading-relaxed',
-                text: '已启用：登录时浏览器会静默完成校验，判定可疑时才弹出复选框。',
+                text: '已启用。',
               }),
             ),
           ]
@@ -1165,7 +1172,7 @@ export class SettingsModal {
         {
           class: 'text-[0.8125rem] leading-relaxed',
           style: { color: 'var(--color-ink-subtle)' },
-          text: '密钥在 Cloudflare 控制台 → Turnstile → 添加站点 获取。私钥以 XChaCha20-Poly1305 加密后存入 D1，不再以明文下发。',
+          text: '私钥使用 XChaCha20-Poly1305 加密。',
         },
       ),
       el(
@@ -1260,7 +1267,7 @@ export class SettingsModal {
         el('p', {
           class: 'mt-0.5 text-[0.8125rem]',
           style: { color: 'var(--color-ink-subtle)' },
-          text: 'Worker 运行在海外边缘节点，可直连 api.telegram.org；必要时可填自定义反代域名。',
+          text: '可填写自定义 API Host 作为反代。',
         }),
       ),
       el(
@@ -1390,7 +1397,7 @@ export class SettingsModal {
         el('p', {
           class: 'mt-0.5 text-[0.8125rem]',
           style: { color: 'var(--color-ink-subtle)' },
-          text: '通过 HTTPS POST JSON 推送；普通通知与熔断告警可分别设置推送级别。',
+          text: '普通通知与告警可分别设置推送级别。',
         }),
       ),
       this.field('Server URL', serverInput),
@@ -1525,7 +1532,7 @@ export class SettingsModal {
           el('p', {
             class: 'mt-0.5 text-[0.8125rem]',
             style: { color: 'var(--color-ink-subtle)' },
-            text: '到达设定时间后的 40 分钟窗口内推送一次，当天不会重复推送。',
+            text: '每日推送一次。',
           }),
         ),
         this.field('推送时间（HH:MM，按账号时区）', timeInput),
@@ -1607,7 +1614,7 @@ export class SettingsModal {
           el('p', {
             class: 'mt-1 text-xs leading-relaxed',
             style: { color: 'var(--color-ink-subtle)' },
-            text: '影响账期划分、定时开关机、日报与图表。',
+            text: '影响账期、定时开关机、日报与图表。',
           }),
           el(
             'form',
@@ -1649,9 +1656,9 @@ export class SettingsModal {
           el('p', {
             class: 'mt-1 text-xs leading-relaxed',
             style: { color: 'var(--color-ink-subtle)' },
-            text: '记录登录时使用的浏览器与来源地址，可随时让其它设备下线。',
+            text: '可让其它设备下线。',
           }),
-          this.buildDeviceList(),
+          el('div', { class: 'mt-3 space-y-2' }, this.buildDeviceList()),
         ),
         el(
           'div',
@@ -1660,7 +1667,7 @@ export class SettingsModal {
           el('p', {
             class: 'mt-1 text-xs leading-relaxed',
             style: { color: 'var(--color-ink-subtle)' },
-            text: '这些参数存于数据库，改完即时生效，不需要重新部署。',
+            text: '存于 D1，即时生效。',
           }),
           el(
             'form',
@@ -1737,9 +1744,21 @@ export class SettingsModal {
     }
   }
 
-  /** 登录设备列表。 */
+  /**
+   * 登录设备列表。
+   *
+   * 返回一个稳定的容器：数据变化时只替换内部节点。此前直接 `renderContent()`
+   * 重建整个设置页，会把正在展开的 `<select>` 一并销毁 —— 表现为下拉框
+   * 展开一会儿就自己闭合。
+   */
   private buildDeviceList(): HTMLElement {
-    const wrapper = el('div', { class: 'mt-3 space-y-2', dataset: { role: 'device-list' } })
+    if (!this.deviceListHost) {
+      this.deviceListHost = el('div', {
+        class: 'space-y-2',
+        dataset: { role: 'device-list' },
+      })
+    }
+    const wrapper = this.deviceListHost
 
     if (!this.devicesLoaded) {
       replaceChildren(
@@ -1839,16 +1858,21 @@ export class SettingsModal {
     )
   }
 
+  /** 只重绘设备列表，不触碰页面其它部分。 */
+  private refreshDeviceList(): void {
+    if (this.activeTab === 'system') this.buildDeviceList()
+  }
+
   private async loadDevices(notify: boolean): Promise<void> {
     try {
       const data = await api.sessions()
       this.devices = data.sessions
       this.devicesLoaded = true
-      if (this.activeTab === 'system') this.renderContent()
+      this.refreshDeviceList()
       if (notify) this.showNotice('设备列表已刷新', 'ok')
     } catch (error) {
       this.devicesLoaded = true
-      if (this.activeTab === 'system') this.renderContent()
+      this.refreshDeviceList()
       this.showNotice(error instanceof ApiError ? error.message : '读取登录设备失败', 'danger')
     }
   }
@@ -1864,7 +1888,7 @@ export class SettingsModal {
       this.showNotice(error instanceof ApiError ? error.message : '下线失败', 'danger')
     } finally {
       this.kicking = null
-      this.renderContent()
+      this.refreshDeviceList()
     }
   }
 
@@ -1879,7 +1903,7 @@ export class SettingsModal {
       this.showNotice(error instanceof ApiError ? error.message : '下线失败', 'danger')
     } finally {
       this.kicking = null
-      this.renderContent()
+      this.refreshDeviceList()
     }
   }
 
