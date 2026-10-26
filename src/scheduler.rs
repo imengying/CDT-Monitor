@@ -38,8 +38,7 @@ use crate::models::{
     AccountOverview, AccountRow, BarkConfig, DailyReportConfig, HistoryBucket, InstanceInfo,
     NotifyChannel, OverLimitAction, SnapshotRow, SnapshotUpdate, TelegramConfig, TrafficPoint,
     build_overview, gb_to_bytes, human_amount, human_bytes, local_date, local_minutes_of_day,
-    month_bounds_ms, now_ms, parse_hhmm, percent_of_limit, setting_key, utc_offset_minutes,
-    within_window,
+    now_ms, parse_hhmm, percent_of_limit, setting_key, utc_offset_minutes, within_window,
 };
 use crate::notify::{
     BarkChannel, Channels, Message, NotifyLevel, NotifyOutcome, TelegramChannel, dispatch,
@@ -405,9 +404,7 @@ impl Scheduler {
         let secret = self.account_secret(account)?;
         let client = AliyunClient::from_account(account, secret);
         let regions = account.regions();
-        let (month_start, month_end) = month_bounds_ms(self.now, &self.timezone);
-
-        let sync = crate::aliyun::sync_account(&client, &regions, month_start, month_end).await;
+        let sync = crate::aliyun::sync_account(&client, &regions).await;
 
         let previous = self.db.get_snapshot(account.id).await?;
         let billing_month = crate::models::billing_month(self.now, &self.timezone);
