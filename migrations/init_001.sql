@@ -16,6 +16,7 @@ PRAGMA foreign_keys = ON;
 --   telegram              Telegram 配置 JSON：{enabled,token_enc,chat_id,api_host}
 --   bark                  Bark 配置 JSON：{enabled,server_url,device_key_enc,normal_level,alert_level}
 --   turnstile             Turnstile 配置 JSON：{enabled,site_key,secret_enc}
+--   advanced              高级配置 JSON：{log_level,job_lock_ttl_ms,session_ttl_ms}
 --
 -- 注意：管理员账号与密码**不在**本表，它们只来自 Worker 环境变量
 -- （ADMIN_USERNAME / ADMIN_PASSWORD），数据库里没有任何密码材料。
@@ -165,5 +166,6 @@ INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES
   ('schema_version', '1', CAST(strftime('%s', 'now') AS INTEGER) * 1000),
   ('timezone', 'UTC+8', CAST(strftime('%s', 'now') AS INTEGER) * 1000),
   ('daily_report', '{"enabled":false,"time":"09:00","timezone":"UTC+8"}', CAST(strftime('%s', 'now') AS INTEGER) * 1000),
+  ('advanced', '{"log_level":"error","job_lock_ttl_ms":600000,"session_ttl_ms":604800000}', CAST(strftime('%s', 'now') AS INTEGER) * 1000),
   ('telegram', '{"enabled":false,"token_enc":null,"chat_id":null,"api_host":null}', CAST(strftime('%s', 'now') AS INTEGER) * 1000),
   ('bark', '{"enabled":false,"server_url":"https://api.day.app","device_key_enc":null,"normal_level":"active","alert_level":"critical"}', CAST(strftime('%s', 'now') AS INTEGER) * 1000);

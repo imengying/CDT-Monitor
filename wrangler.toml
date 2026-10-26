@@ -94,17 +94,13 @@ crons = ["*/5 * * * *"]
 [observability]
 enabled = false
 
-[vars]
-# 日志级别：error（默认，只输出错误）| warn | info | debug
-# 默认安静：正常巡检不产生任何日志；失败才有输出。
-LOG_LEVEL = "error"
+# ---------------------------------------------------------------------------
+# 无 [vars] 段
+#
+# 运行时只读取三个 Secret：MASTER_KEY / ADMIN_USERNAME / ADMIN_PASSWORD。
+# 日志级别、任务锁窗口、会话有效期、时区、通知、Turnstile 等全部存 D1，
+# 在网页「设置」里改，改完即时生效，不需要重新部署。
+# ---------------------------------------------------------------------------
 
-# 刷新任务的跨实例互斥窗口（毫秒），默认 10 分钟
-JOB_LOCK_TTL_MS = "600000"
-# 会话有效期（毫秒），默认 7 天
-SESSION_TTL_MS = "604800000"
-
-# 可选端点覆盖（私有网关 / 排障用，留空则用官方默认）
-# ALIYUN_CDT_ENDPOINT = "https://cdt.aliyuncs.com"
-# ALIYUN_ECS_ENDPOINT = "https://ecs.aliyuncs.com"
-# ALIYUN_BSS_ENDPOINT = "https://business.aliyuncs.com"
+# 排障用：如需让请求走私有网关，临时在控制台加 ALIYUN_CDT_ENDPOINT /
+# ALIYUN_ECS_ENDPOINT / ALIYUN_BSS_ENDPOINT 三个变量即可，不必改本文件。

@@ -32,6 +32,8 @@ pub mod setting_key {
     pub const BARK: &str = "bark";
     /// Turnstile 配置 JSON（site_key + 加密的 secret_key + 开关）。
     pub const TURNSTILE: &str = "turnstile";
+    /// 高级配置 JSON（日志级别、任务锁 TTL、会话有效期）。
+    pub const ADVANCED: &str = "advanced";
 }
 
 // ===========================================================================
@@ -1032,6 +1034,60 @@ impl TurnstileConfig {
     }
 }
 
+/// 高级配置。存 D1，后台可改，不需要重新部署。
+///
+/// 这些是"调优参数"而非机密：日志级别、任务锁窗口、会话有效期。
+/// 放环境变量会导致改一个数字就要重新部署，因此挪到设置表。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvancedConfig {
+    /// 日志级别：error / warn / info / debug。
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    /// 刷新任务互斥窗口（毫秒）。
+    #[serde(default = "default_job_lock_ttl")]
+    pub job_lock_ttl_ms: i64,
+    /// 会话有效期（毫秒）。
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_ms: i64,
+}
+
+fn default_log_level() -> String {
+    "error".to_string()
+}
+
+fn default_job_lock_ttl() -> i64 {
+    10 * 60 * 1000
+}
+
+fn default_session_ttl() -> i64 {
+    7 * 24 * 60 * 60 * 1000
+}
+
+impl Default for AdvancedConfig {
+    fn default() -> Self {
+        Self {
+            log_level: default_log_level(),
+            job_lock_ttl_ms: default_job_lock_ttl(),
+            session_ttl_ms: default_session_ttl(),
+        }
+    }
+}
+
+impl AdvancedConfig {
+    /// 归一化：限制取值范围，避免后台填出离谱的值。
+    pub fn normalized(mut self) -> Self {
+        self.log_level = match self.log_level.trim().to_ascii_lowercase().as_str() {
+            "warn" => "warn".to_string(),
+            "info" => "info".to_string(),
+            "debug" => "debug".to_string(),
+            _ => "error".to_string(),
+        };
+        self.job_lock_ttl_ms = self.job_lock_ttl_ms.clamp(30_000, 60 * 60 * 1000);
+        self.session_ttl_ms = self.session_ttl_ms.clamp(60_000, 30 * 24 * 60 * 60 * 1000);
+        self
+    }
+}
+
 /// 日报配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyReportConfig {
@@ -1369,6 +1425,35 @@ pub struct BarkSettingsUpdate {
     pub alert_level: PushLevel,
 }
 
+/// 高级配置 DTO（后台可改）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvancedSettingsDto {
+    pub log_level: String,
+    pub job_lock_ttl_ms: i64,
+    pub session_ttl_ms: i64,
+}
+
+impl From<&AdvancedConfig> for AdvancedSettingsDto {
+    fn from(config: &AdvancedConfig) -> Self {
+        Self {
+            log_level: config.log_level.clone(),
+            job_lock_ttl_ms: config.job_lock_ttl_ms,
+            session_ttl_ms: config.session_ttl_ms,
+        }
+    }
+}
+
+impl From<&AdvancedSettingsDto> for AdvancedConfig {
+    fn from(dto: &AdvancedSettingsDto) -> Self {
+        AdvancedConfig {
+            log_level: dto.log_level.clone(),
+            job_lock_ttl_ms: dto.job_lock_ttl_ms,
+            session_ttl_ms: dto.session_ttl_ms,
+        }
+        .normalized()
+    }
+}
+
 /// 时区下拉项。
 #[derive(Debug, Clone, Serialize)]
 pub struct TimeZoneOption {
@@ -1424,6 +1509,7 @@ pub struct SettingsDto {
     pub timezone: String,
     /// 可选时区（value, label），供界面下拉使用。
     pub timezone_options: Vec<TimeZoneOption>,
+    pub advanced: AdvancedSettingsDto,
     pub turnstile: TurnstileSettingsDto,
     pub telegram: TelegramSettingsDto,
     pub bark: BarkSettingsDto,

@@ -79,16 +79,9 @@ pub fn enabled(level: Level) -> bool {
     self::level() >= level
 }
 
-/// 从 Worker 环境初始化级别。缺失或非法时保持 `Error`（默认安静）。
-pub fn init_from_env(env: &worker::Env) {
-    let raw = env
-        .var("LOG_LEVEL")
-        .ok()
-        .map(|v| v.to_string())
-        .or_else(|| env.secret("LOG_LEVEL").ok().map(|v| v.to_string()));
-    if let Some(raw) = raw {
-        set_level(Level::parse(&raw));
-    }
+/// 按配置值初始化级别。非法值退回 `Error`（默认安静）。
+pub fn init_from_config(raw: Option<&str>) {
+    set_level(raw.map(Level::parse).unwrap_or(Level::Error));
 }
 
 // ===========================================================================

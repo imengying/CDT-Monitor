@@ -118,7 +118,7 @@ D1 绑定、Cron、`main`、日志默认值），任一项缺失即中止构建�
 | Telegram（Bot Token / Chat ID / 反代） | 设置 → Telegram |
 | Bark（Server / Device Key / 推送级别） | 设置 → Bark |
 | 日报推送时间 | 设置 → 日报 |
-| 时区 | 设置 → 系统 |
+| 时区、日志级别、任务锁窗口、会话有效期 | 设置 → 系统 |
 
 ### 3. 首次登录
 
@@ -135,7 +135,7 @@ D1 绑定、Cron、`main`、日志默认值），任一项缺失即中止构建�
 
 | 项目 | 默认 | 调整方式 |
 |---|---|---|
-| 应用日志 | 仅 `error` | Worker 变量 `LOG_LEVEL` |
+| 应用日志 | 仅 `error` | 设置 → 系统 → 日志级别 |
 | Workers Logs | 关闭 | `wrangler.toml` 的 `[observability] enabled`，或控制台开关 |
 
 ```text
@@ -177,12 +177,13 @@ bun run dev:web                  # :5173
 | `MASTER_KEY` | Secret | ✅ | 32 字节主密钥。加密 AK Secret / TG Token / Bark Key / Turnstile 私钥，并作为会话 Token 的 HMAC 密钥 |
 | `ADMIN_USERNAME` | Secret | ✅ | 管理员用户名 |
 | `ADMIN_PASSWORD` | Secret | ✅ | 管理员密码，每次登录对照校验，不落库 |
-| `LOG_LEVEL` | 变量 | — | `error`（默认）/ `warn` / `info` / `debug` |
-| `JOB_LOCK_TTL_MS` | 变量 | — | 刷新任务跨实例互斥窗口，默认 `600000` |
-| `SESSION_TTL_MS` | 变量 | — | 会话有效期，默认 `604800000`（7 天） |
-| `ALIYUN_CDT_ENDPOINT` | 变量 | — | CDT 端点覆盖 |
-| `ALIYUN_ECS_ENDPOINT` | 变量 | — | ECS 端点覆盖 |
-| `ALIYUN_BSS_ENDPOINT` | 变量 | — | BSS 端点覆盖 |
+运行时只读取以上三个 Secret，`wrangler.toml` 不含 `[vars]` 段。
+
+日志级别、任务锁窗口、会话有效期、时区、Turnstile、通知、日报等
+全部存 D1，在网页「设置」里改，即时生效。
+
+排障时若需让请求走私有网关，可临时在控制台加 `ALIYUN_CDT_ENDPOINT` /
+`ALIYUN_ECS_ENDPOINT` / `ALIYUN_BSS_ENDPOINT`。
 
 构建期变量位于 **Settings → Build → Build variables**：`BUN_VERSION`（默认 `1.4.4`）。
 

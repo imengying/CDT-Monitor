@@ -284,9 +284,16 @@ export interface TimeZoneOption {
   label: string
 }
 
+export interface AdvancedSettings {
+  log_level: string
+  job_lock_ttl_ms: number
+  session_ttl_ms: number
+}
+
 export interface SettingsResponse {
   timezone: string
   timezone_options: TimeZoneOption[]
+  advanced: AdvancedSettings
   turnstile: TurnstileSettings
   telegram: TelegramSettings
   bark: BarkSettings
@@ -620,6 +627,10 @@ export const api = {
       method: 'PUT',
       body: { enabled, time, timezone: '' },
     })
+  },
+
+  updateAdvanced(input: AdvancedSettings): Promise<SettingsResponse> {
+    return request<SettingsResponse>('/api/v1/settings/advanced', { method: 'PUT', body: input })
   },
 
   updateTimezone(timezone: string): Promise<SettingsResponse> {

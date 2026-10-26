@@ -105,10 +105,12 @@ function main(): void {
     ok: /^\[observability\][\s\S]*?^enabled\s*=\s*false/m.test(raw),
     hint: "按需打开，避免持续产生日志费用",
   });
+  // 运行时只应有三个 Secret，其余配置都在 D1。若再次引入 [vars]，
+  // 说明有配置被放回了需要重新部署才能改的地方。
   checks.push({
-    name: "LOG_LEVEL 默认 error",
-    ok: /^LOG_LEVEL\s*=\s*"error"/m.test(raw),
-    hint: "正常巡检不应输出流程日志",
+    name: "无 [vars] 段（配置全部存 D1）",
+    ok: !/^\[vars\]/m.test(raw),
+    hint: "只有 MASTER_KEY / ADMIN_USERNAME / ADMIN_PASSWORD 走 Secret，其余在后台设置",
   });
 
   // --- 跨文件名称一致性 ---

@@ -21,8 +21,8 @@ use worker::wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement, Env, Result};
 
 use crate::models::{
-    AccountRow, ActionLog, HistoryBucket, InstanceInfo, JobRow, JobStatus, JobType, LogFilter,
-    SessionRow, SnapshotRow, SnapshotUpdate, TrafficPoint, setting_key,
+    AccountRow, ActionLog, AdvancedConfig, HistoryBucket, InstanceInfo, JobRow, JobStatus, JobType,
+    LogFilter, SessionRow, SnapshotRow, SnapshotUpdate, TrafficPoint, setting_key,
 };
 
 // ===========================================================================
@@ -212,6 +212,21 @@ impl Db {
         let raw = serde_json::to_string(value)
             .map_err(|e| worker::Error::RustError(format!("配置序列化失败：{e}")))?;
         self.set_setting(key, &raw, now_ms).await
+    }
+
+    /// 读取高级配置；缺失或解析失败时返回默认值。
+    pub async fn get_advanced_config(&self) -> Result<AdvancedConfig> {
+        let config: AdvancedConfig = self
+            .get_json_setting(setting_key::ADVANCED)
+            .await
+            .unwrap_or_default();
+        Ok(config.normalized())
+    }
+
+    /// 写入高级配置。
+    pub async fn set_advanced_config(&self, config: &AdvancedConfig, now_ms: i64) -> Result<()> {
+        self.set_json_setting(setting_key::ADVANCED, config, now_ms)
+            .await
     }
 
     /// 读取全局时区（`UTC+8` 形式）。

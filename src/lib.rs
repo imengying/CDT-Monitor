@@ -34,6 +34,8 @@ use std::collections::HashMap;
 // 子模块（scheduler 等）直接 `log_info!` 而无需逐个 `use`。
 #[macro_use]
 pub mod logging;
+pub mod device;
+pub mod http;
 
 pub mod aliyun;
 pub mod crypto;
@@ -43,24 +45,25 @@ pub mod notify;
 pub mod scheduler;
 
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use worker::{
     Context, Env, Fetch, Headers, Method, Request, Response, ResponseBuilder, ScheduleContext,
     ScheduledEvent, event,
 };
 
 use crate::crypto::{
-    Crypto, DEFAULT_SESSION_TTL_MS, MasterKey, SessionToken, TokenState, constant_time_eq,
-    random_hex, session_cookie, session_token_from_cookie,
+    Crypto, MasterKey, SessionToken, TokenState, constant_time_eq, random_hex, session_cookie,
+    session_token_from_cookie,
 };
 use crate::db::Db;
+use crate::device::{client_ip, client_ua, same_origin_ok, short_device, short_ip};
+use crate::http::{query_i64, query_map, query_str, query_u32, read_json};
 use crate::models::{
-    AcceptedJob, AccountInput, ApiErrorBody, BarkConfig, BarkSettingsDto, BarkSettingsUpdate,
-    DailyReportConfig, DailyReportDto, HistoryBucket, HistoryQuery, JobDto, JobStatus, JobType,
-    LoginRequest, NotifyChannel, NotifyTestRequest, SessionResponse, SessionsResponse, SettingsDto,
-    TelegramConfig, TelegramSettingsDto, TelegramSettingsUpdate, TrafficHistoryResponse,
-    TurnstileConfig, TurnstileSettingsDto, TurnstileSettingsUpdate, build_overview,
-    is_supported_timezone, now_ms, setting_key,
+    AcceptedJob, AccountInput, AdvancedConfig, AdvancedSettingsDto, ApiErrorBody, BarkConfig,
+    BarkSettingsDto, BarkSettingsUpdate, DailyReportConfig, DailyReportDto, HistoryBucket,
+    HistoryQuery, JobDto, JobStatus, JobType, LoginRequest, NotifyChannel, NotifyTestRequest,
+    SessionResponse, SessionsResponse, SettingsDto, TelegramConfig, TelegramSettingsDto,
+    TelegramSettingsUpdate, TrafficHistoryResponse, TurnstileConfig, TurnstileSettingsDto,
+    TurnstileSettingsUpdate, build_overview, is_supported_timezone, now_ms, setting_key,
 };
 use crate::notify::NotifyLevel;
 use crate::scheduler::Scheduler;
@@ -72,8 +75,6 @@ use crate::scheduler::Scheduler;
 /// 登录接口的固定延迟（毫秒）。Turnstile token 一次性，暴力破解必须每次重算，
 /// 这个延迟主要用来钝化自动化脚本的探测节奏。
 const LOGIN_FAILURE_DELAY_MS: u64 = 350;
-/// 默认 Job 锁 TTL（毫秒）。
-const DEFAULT_JOB_LOCK_TTL_MS: i64 = 10 * 60 * 1000;
 /// 单次查询返回的 Job 数量上限。
 const MAX_JOBS: u32 = 50;
 /// 单次查询返回的日志数量上限。
@@ -139,193 +140,6 @@ fn error_response_with_code(
 }
 
 // ===========================================================================
-// 请求解析工具
-// ===========================================================================
-
-/// 读取并反序列化 JSON 请求体。
-async fn read_json<T: DeserializeOwned>(req: &mut Request) -> Result<T, String> {
-    req.json::<T>()
-        .await
-        .map_err(|err| format!("请求体不是合法 JSON：{err}"))
-}
-
-/// 解析 URL 查询参数（重复键取第一个）。
-fn query_map(req: &Request) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    if let Ok(url) = req.url()
-        && let Some(query) = url.query()
-    {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            out.entry(key.to_string()).or_insert(value.to_string());
-        }
-    }
-    out
-}
-
-/// 取查询参数并解析成 `i64`。
-fn query_i64(params: &HashMap<String, String>, key: &str) -> Option<i64> {
-    params.get(key).and_then(|v| v.trim().parse().ok())
-}
-
-/// 取查询参数并解析成 `u32`。
-fn query_u32(params: &HashMap<String, String>, key: &str) -> Option<u32> {
-    params.get(key).and_then(|v| v.trim().parse().ok())
-}
-
-/// 取查询参数原始文本。
-fn query_str<'a>(params: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
-    params
-        .get(key)
-        .map(|v| v.as_str())
-        .filter(|v| !v.is_empty())
-}
-
-/// 请求的客户端 IP（Cloudflare 提供）。
-fn client_ip(req: &Request) -> Option<String> {
-    for header in ["CF-Connecting-IP", "X-Forwarded-For"] {
-        if let Ok(Some(value)) = req.headers().get(header) {
-            let first = value.split(',').next().unwrap_or("").trim();
-            if !first.is_empty() {
-                return Some(first.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 取 `User-Agent`，截断到 512 字节避免超长入库。
-fn client_ua(req: &Request) -> String {
-    req.headers()
-        .get("User-Agent")
-        .ok()
-        .flatten()
-        .map(|v| v.chars().take(512).collect::<String>())
-        .unwrap_or_default()
-}
-
-/// 生成会话 ID（128 位随机，十六进制）。
-fn random_sid() -> worker::Result<String> {
-    random_hex(16).map_err(|err| worker::Error::RustError(err.to_string()))
-}
-
-/// 从 UA 里提炼可读的设备名，用于列表展示。
-///
-/// 只做粗粒度识别：浏览器 + 平台足够区分多台设备，不必引入 UA 解析库。
-fn short_device(ua: &str) -> String {
-    let lower = ua.to_ascii_lowercase();
-
-    let browser = if lower.contains("edg/") {
-        "Edge"
-    } else if lower.contains("chrome/") && !lower.contains("chromium") {
-        "Chrome"
-    } else if lower.contains("firefox/") {
-        "Firefox"
-    } else if lower.contains("safari/") {
-        "Safari"
-    } else if lower.contains("curl/") {
-        "curl"
-    } else if lower.contains("python") {
-        "Python"
-    } else if lower.is_empty() {
-        "未知客户端"
-    } else {
-        "其他"
-    };
-
-    let platform = if lower.contains("iphone") {
-        "iPhone"
-    } else if lower.contains("ipad") {
-        "iPad"
-    } else if lower.contains("android") {
-        "Android"
-    } else if lower.contains("mac os x") || lower.contains("macintosh") {
-        "macOS"
-    } else if lower.contains("windows") {
-        "Windows"
-    } else if lower.contains("linux") {
-        "Linux"
-    } else {
-        ""
-    };
-
-    if platform.is_empty() {
-        browser.to_string()
-    } else {
-        format!("{browser} · {platform}")
-    }
-}
-
-/// 掩码 IP：保留前两段，其余用 `*`，避免在界面上完整暴露来源地址。
-fn short_ip(ip: &str) -> String {
-    if ip.is_empty() {
-        return "未知来源".to_string();
-    }
-    if ip.contains(':') {
-        // IPv6 只留前 4 组
-        let head: Vec<&str> = ip.split(':').filter(|s| !s.is_empty()).take(2).collect();
-        return format!("{}::*", head.join(":"));
-    }
-    let parts: Vec<&str> = ip.split('.').collect();
-    if parts.len() == 4 {
-        format!("{}.{}.*.*", parts[0], parts[1])
-    } else {
-        ip.to_string()
-    }
-}
-
-/// 取 `Origin` 的 host 部分。
-fn origin_host(req: &Request) -> Option<String> {
-    let origin = req.headers().get("Origin").ok().flatten()?;
-    url::Url::parse(origin.trim())
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(|h| h.to_ascii_lowercase()))
-}
-
-/// 取 `Referer` 的 host 部分。
-fn referer_host(req: &Request) -> Option<String> {
-    let referer = req.headers().get("Referer").ok().flatten()?;
-    url::Url::parse(referer.trim())
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(|h| h.to_ascii_lowercase()))
-}
-
-/// 请求自身的 host。
-fn request_host(req: &Request) -> Option<String> {
-    req.url()
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(|h| h.to_ascii_lowercase()))
-}
-
-/// 写接口的纵深防御：拒绝跨站来源。
-///
-/// `SameSite=Strict` 已经挡住浏览器发起的跨站 Cookie，这里再挡一层，
-/// 覆盖老浏览器与 `SameSite` 被忽略的场景。
-fn same_origin_ok(req: &Request) -> bool {
-    if let Ok(Some(site)) = req.headers().get("Sec-Fetch-Site") {
-        let site = site.trim().to_ascii_lowercase();
-        if site == "cross-site" {
-            return false;
-        }
-    }
-
-    let Some(host) = request_host(req) else {
-        return true;
-    };
-    if let Some(origin) = origin_host(req)
-        && origin != host
-    {
-        return false;
-    }
-    if origin_host(req).is_none()
-        && let Some(referer) = referer_host(req)
-        && referer != host
-    {
-        return false;
-    }
-    true
-}
-
-// ===========================================================================
 // 应用上下文
 // ===========================================================================
 
@@ -345,6 +159,8 @@ struct AppCtx {
     db: Db,
     crypto: Crypto,
     timezone: String,
+    /// 高级配置（日志级别 / 锁窗口 / 会话有效期），来自 D1。
+    advanced: AdvancedConfig,
     now: i64,
 }
 
@@ -360,11 +176,15 @@ impl AppCtx {
             Ok(timezone) => timezone,
             Err(err) => return Err(worker::Error::RustError(migration_hint(&err))),
         };
+        // 高级配置同样来自 D1；读失败时用默认值，不阻断请求
+        let advanced = db.get_advanced_config().await.unwrap_or_default();
+
         Ok(Self {
             env: env.clone(),
             db,
             crypto: Crypto::new(master),
             timezone,
+            advanced,
             now: now_ms(),
         })
     }
@@ -420,24 +240,14 @@ impl AppCtx {
         }
     }
 
-    /// Job 锁 TTL。
+    /// Job 锁 TTL（已在 `AdvancedConfig::normalized` 中限制范围）。
     fn job_lock_ttl_ms(&self) -> i64 {
-        self.env
-            .var("JOB_LOCK_TTL_MS")
-            .ok()
-            .and_then(|v| v.to_string().trim().parse::<i64>().ok())
-            .map(|v| v.clamp(30_000, 60 * 60 * 1000))
-            .unwrap_or(DEFAULT_JOB_LOCK_TTL_MS)
+        self.advanced.job_lock_ttl_ms
     }
 
-    /// 会话有效期。
+    /// 会话有效期（同上）。
     fn session_ttl_ms(&self) -> i64 {
-        self.env
-            .var("SESSION_TTL_MS")
-            .ok()
-            .and_then(|v| v.to_string().trim().parse::<i64>().ok())
-            .map(|v| v.clamp(60_000, 30 * 24 * 60 * 60 * 1000))
-            .unwrap_or(DEFAULT_SESSION_TTL_MS)
+        self.advanced.session_ttl_ms
     }
 
     /// 从请求中取出已验签的会话（不查库）。
@@ -465,6 +275,11 @@ impl AppCtx {
             }
         }
     }
+}
+
+/// 生成会话 ID（128 位随机，十六进制）。
+fn random_sid() -> worker::Result<String> {
+    random_hex(16).map_err(|err| worker::Error::RustError(err.to_string()))
 }
 
 /// 会话声明（验签通过 + 库中存在）。
@@ -1127,11 +942,13 @@ async fn handle_get_settings(app: &AppCtx) -> worker::Result<Response> {
         .map(|account| account.to_dto())
         .collect();
 
+    let advanced = app.db.get_advanced_config().await.unwrap_or_default();
     let turnstile = app.turnstile_config().await;
 
     ok(&SettingsDto {
         timezone: timezone.clone(),
         timezone_options: crate::models::timezone_options(),
+        advanced: AdvancedSettingsDto::from(&advanced),
         turnstile: TurnstileSettingsDto {
             enabled: turnstile.enabled,
             site_key: turnstile.site_key.clone().unwrap_or_default(),
@@ -1352,6 +1169,40 @@ async fn handle_update_turnstile(app: &AppCtx, mut req: Request) -> worker::Resu
             } else {
                 "人机校验已关闭"
             },
+            now_ms(),
+        )
+        .await?;
+
+    handle_get_settings(app).await
+}
+
+/// `PUT /api/v1/settings/advanced`
+///
+/// 日志级别、任务锁窗口、会话有效期。这些值不影响已签发的会话，
+/// 下次请求起按新配置执行。
+async fn handle_update_advanced(app: &AppCtx, mut req: Request) -> worker::Result<Response> {
+    let payload: AdvancedSettingsDto = match read_json(&mut req).await {
+        Ok(payload) => payload,
+        Err(err) => return error_response(400, err),
+    };
+
+    let config = AdvancedConfig::from(&payload);
+    app.db.set_advanced_config(&config, now_ms()).await?;
+
+    // 立即生效，无需等下一次请求
+    logging::init_from_config(Some(&config.log_level));
+
+    app.db
+        .add_log(
+            None,
+            "settings_advanced",
+            None,
+            &format!(
+                "高级配置已更新（日志 {}，锁 {} 分钟，会话 {} 天）",
+                config.log_level,
+                config.job_lock_ttl_ms / 60_000,
+                config.session_ttl_ms / (24 * 60 * 60 * 1000)
+            ),
             now_ms(),
         )
         .await?;
@@ -1870,6 +1721,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
         (Method::Put, ["settings", "bark"]) => handle_update_bark(&app, req).await,
         (Method::Put, ["settings", "daily-report"]) => handle_update_report(&app, req).await,
         (Method::Put, ["settings", "timezone"]) => handle_update_timezone(&app, req).await,
+        (Method::Put, ["settings", "advanced"]) => handle_update_advanced(&app, req).await,
         (Method::Post, ["settings", "notify-test"]) => {
             let payload: NotifyTestRequest = match read_json(&mut req).await {
                 Ok(payload) => payload,
@@ -1908,8 +1760,14 @@ async fn serve_asset(env: &Env, req: Request) -> worker::Result<Response> {
 /// HTTP 入口。
 #[event(fetch, respond_with_errors)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
-    // 日志默认只输出 error（见 src/logging.rs）；排障时把 LOG_LEVEL 调成 info
-    logging::init_from_env(&env);
+    // 日志级别来自 D1（后台「设置 → 系统」），因此要先读配置再决定级别。
+    // 读失败时保持默认的 error，不影响请求处理。
+    let log_level = Db::new(&env)
+        .get_advanced_config()
+        .await
+        .ok()
+        .map(|config| config.log_level);
+    logging::init_from_config(log_level.as_deref());
 
     let path = req.path();
 
@@ -1932,7 +1790,12 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
 /// Cron 入口：`*/5 * * * *`。
 #[event(scheduled)]
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    logging::init_from_env(&env);
+    let log_level = Db::new(&env)
+        .get_advanced_config()
+        .await
+        .ok()
+        .map(|config| config.log_level);
+    logging::init_from_config(log_level.as_deref());
 
     let scheduler = match Scheduler::new(&env).await {
         Ok(scheduler) => scheduler,
@@ -2105,31 +1968,6 @@ mod tests {
         // 配置仍然是 enabled + complete，说明闸门会判定为 Broken 而非 Disabled
         config.enabled = true;
         assert!(config.enabled && config.is_complete());
-    }
-
-    #[test]
-    fn device_name_from_user_agent() {
-        let chrome_mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-                          (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-        assert_eq!(short_device(chrome_mac), "Chrome · macOS");
-
-        let safari_iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) \
-                             AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
-        assert_eq!(short_device(safari_iphone), "Safari · iPhone");
-
-        let edge_win = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                        (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0";
-        assert_eq!(short_device(edge_win), "Edge · Windows");
-
-        assert_eq!(short_device("curl/8.4.0"), "curl");
-        assert_eq!(short_device(""), "未知客户端");
-    }
-
-    #[test]
-    fn ip_is_masked() {
-        assert_eq!(short_ip("203.0.113.42"), "203.0.*.*");
-        assert_eq!(short_ip("2001:db8:85a3::8a2e:370:7334"), "2001:db8::*");
-        assert_eq!(short_ip(""), "未知来源");
     }
 
     #[test]

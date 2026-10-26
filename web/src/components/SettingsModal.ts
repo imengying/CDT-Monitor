@@ -172,6 +172,11 @@ export class SettingsModal {
 
   private reportDraft = { enabled: false, time: '09:00' }
   private timezoneDraft = 'UTC+8'
+  private advancedDraft = {
+    logLevel: 'error',
+    jobLockMinutes: 10,
+    sessionDays: 7,
+  }
   private devices: SessionDevice[] = []
   private devicesLoaded = false
   private kicking: string | null = null
@@ -298,6 +303,11 @@ export class SettingsModal {
       time: settings.daily_report.time,
     }
     this.timezoneDraft = settings.timezone
+    this.advancedDraft = {
+      logLevel: settings.advanced.log_level,
+      jobLockMinutes: Math.round(settings.advanced.job_lock_ttl_ms / 60_000),
+      sessionDays: Math.round(settings.advanced.session_ttl_ms / (24 * 60 * 60 * 1000)),
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1643,10 +1653,88 @@ export class SettingsModal {
           }),
           this.buildDeviceList(),
         ),
+        el(
+          'div',
+          { class: 'border-t pt-4', style: { borderColor: 'var(--color-line)' } },
+          el('h3', { class: 'text-sm font-semibold', text: '高级' }),
+          el('p', {
+            class: 'mt-1 text-xs leading-relaxed',
+            style: { color: 'var(--color-ink-subtle)' },
+            text: '这些参数存于数据库，改完即时生效，不需要重新部署。',
+          }),
+          el(
+            'form',
+            {
+              class: 'mt-3 space-y-3',
+              on: {
+                submit: (event) => {
+                  event.preventDefault()
+                  void this.saveAdvanced()
+                },
+              },
+            },
+            el(
+              'div',
+              { class: 'grid gap-3 sm:grid-cols-3' },
+              this.field(
+                '日志级别',
+                this.selectInput(
+                  this.advancedDraft.logLevel,
+                  [
+                    { value: 'error', label: 'error · 仅错误' },
+                    { value: 'warn', label: 'warn · 含警告' },
+                    { value: 'info', label: 'info · 含流程' },
+                    { value: 'debug', label: 'debug' },
+                  ],
+                  (value) => {
+                    this.advancedDraft.logLevel = value
+                  },
+                ),
+              ),
+              this.field(
+                '任务锁窗口（分钟）',
+                this.numberInput(this.advancedDraft.jobLockMinutes, (value) => {
+                  this.advancedDraft.jobLockMinutes = value
+                }),
+              ),
+              this.field(
+                '会话有效期（天）',
+                this.numberInput(this.advancedDraft.sessionDays, (value) => {
+                  this.advancedDraft.sessionDays = value
+                }),
+              ),
+            ),
+            el(
+              'div',
+              { class: 'flex justify-end border-t pt-3', style: { borderColor: 'var(--color-line)' } },
+              this.submitButton('保存'),
+            ),
+          ),
+        ),
       ),
     )
 
     void this.loadDevices(false)
+  }
+
+  private async saveAdvanced(): Promise<void> {
+    if (this.saving) return
+    this.saving = true
+    try {
+      await api.updateAdvanced({
+        log_level: this.advancedDraft.logLevel,
+        job_lock_ttl_ms: Math.round(this.advancedDraft.jobLockMinutes * 60_000),
+        session_ttl_ms: Math.round(this.advancedDraft.sessionDays * 24 * 60 * 60 * 1000),
+      })
+      this.showNotice('高级配置已保存', 'ok')
+      await afterSettingsChanged()
+      this.syncDrafts()
+      this.renderContent()
+    } catch (error) {
+      this.showNotice(error instanceof ApiError ? error.message : '保存高级配置失败', 'danger')
+    } finally {
+      this.saving = false
+    }
   }
 
   /** 登录设备列表。 */
