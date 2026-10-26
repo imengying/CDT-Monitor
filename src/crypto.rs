@@ -322,12 +322,15 @@ struct TokenPayload {
     exp: i64,
     /// 随机 ID，避免同一秒内签发的 Token 完全相同。
     jti: String,
+    /// 会话 ID，对应 `sessions` 表主键；服务端据此吊销会话。
+    #[serde(default)]
+    sid: String,
 }
 
 /// 验签结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenState {
-    Valid { expires_at: i64 },
+    Valid { expires_at: i64, sid: String },
     Expired { expires_at: i64 },
     Invalid,
 }
@@ -350,14 +353,15 @@ impl<'a> SessionToken<'a> {
         mac.finalize().into_bytes().into()
     }
 
-    /// 签发 Token，`ttl_ms` 为有效期。
-    pub fn issue(&self, now_ms: i64, ttl_ms: i64) -> Result<String, CryptoError> {
+    /// 签发 Token，`ttl_ms` 为有效期，`sid` 为会话 ID。
+    pub fn issue(&self, now_ms: i64, ttl_ms: i64, sid: &str) -> Result<String, CryptoError> {
         let ttl = ttl_ms.clamp(60_000, 30 * 24 * 60 * 60 * 1000);
         let payload = TokenPayload {
             v: 1,
             iat: now_ms,
             exp: now_ms.saturating_add(ttl),
             jti: random_hex(8)?,
+            sid: sid.to_string(),
         };
         let json = serde_json::to_vec(&payload)
             .map_err(|e| CryptoError::EncryptFailed(format!("Token 载荷序列化失败：{e}")))?;
@@ -402,6 +406,7 @@ impl<'a> SessionToken<'a> {
         }
         TokenState::Valid {
             expires_at: payload.exp,
+            sid: payload.sid,
         }
     }
 
@@ -499,12 +504,13 @@ mod tests {
         let key = test_key();
         let issuer = SessionToken::new(&key);
         let now = 1_700_000_000_000i64;
-        let token = issuer.issue(now, 60_000).expect("签发成功");
+        let token = issuer.issue(now, 60_000, "sid-1").expect("签发成功");
         assert!(issuer.is_valid(&token, now + 1_000));
         assert_eq!(
             issuer.verify(&token, now + 1_000),
             TokenState::Valid {
-                expires_at: now + 60_000
+                expires_at: now + 60_000,
+                sid: "sid-1".to_string(),
             }
         );
         assert_eq!(
@@ -522,7 +528,7 @@ mod tests {
         let key = test_key();
         let issuer = SessionToken::new(&key);
         let now = 1_700_000_000_000i64;
-        let token = issuer.issue(now, 60_000).expect("签发成功");
+        let token = issuer.issue(now, 60_000, "sid-1").expect("签发成功");
         let mut parts: Vec<&str> = token.split('.').collect();
         let forged_payload = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&TokenPayload {
@@ -530,6 +536,7 @@ mod tests {
                 iat: now,
                 exp: now + 99_999_999,
                 jti: "forged".to_string(),
+                sid: "sid-1".to_string(),
             })
             .expect("序列化"),
         );
@@ -544,7 +551,7 @@ mod tests {
             MasterKey::parse("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100")
                 .expect("合法");
         let token = SessionToken::new(&test_key())
-            .issue(1_700_000_000_000, 60_000)
+            .issue(1_700_000_000_000, 60_000, "sid-1")
             .expect("签发");
         assert!(!SessionToken::new(&other).is_valid(&token, 1_700_000_000_001));
     }

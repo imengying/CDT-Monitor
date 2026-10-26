@@ -21,8 +21,8 @@ use worker::wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement, Env, Result};
 
 use crate::models::{
-    AccountRow, ActionLog, HistoryBucket, InstanceInfo, JobRow, JobStatus, JobType, SnapshotRow,
-    SnapshotUpdate, TrafficPoint, setting_key,
+    AccountRow, ActionLog, HistoryBucket, InstanceInfo, JobRow, JobStatus, JobType, SessionRow,
+    SnapshotRow, SnapshotUpdate, TrafficPoint, setting_key,
 };
 
 // ===========================================================================
@@ -890,6 +890,75 @@ impl Db {
     pub async fn purge_locks(&self, now_ms: i64) -> Result<usize> {
         self.exec("DELETE FROM locks WHERE expires_at <= ?", &[j_i64(now_ms)])
             .await
+    }
+
+    // =======================================================================
+    // 登录设备（sessions）
+    // =======================================================================
+
+    /// 新建会话。
+    pub async fn create_session(&self, row: &SessionRow) -> Result<()> {
+        self.exec(
+            "INSERT INTO sessions (sid, ua, ip, created_at, last_seen_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                j_text(&row.sid),
+                j_text(&row.ua),
+                j_text(&row.ip),
+                j_i64(row.created_at),
+                j_i64(row.last_seen_at),
+                j_i64(row.expires_at),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 会话是否仍然有效（存在、未过期）。
+    pub async fn session_is_active(&self, sid: &str, now_ms: i64) -> Result<bool> {
+        let hit: Option<SessionRow> = self
+            .query_first(
+                "SELECT * FROM sessions WHERE sid = ? AND expires_at > ?",
+                &[j_text(sid), j_i64(now_ms)],
+            )
+            .await?;
+        Ok(hit.is_some())
+    }
+
+    /// 刷新活跃时间（供「最近活跃」展示）。
+    pub async fn touch_session(&self, sid: &str, now_ms: i64) -> Result<()> {
+        self.exec(
+            "UPDATE sessions SET last_seen_at = ? WHERE sid = ?",
+            &[j_i64(now_ms), j_text(sid)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 列出未过期的会话，最近活跃在前。
+    pub async fn list_sessions(&self, now_ms: i64) -> Result<Vec<SessionRow>> {
+        self.query(
+            "SELECT * FROM sessions WHERE expires_at > ? ORDER BY last_seen_at DESC",
+            &[j_i64(now_ms)],
+        )
+        .await
+    }
+
+    /// 吊销指定会话，返回是否真的删掉了。
+    pub async fn delete_session(&self, sid: &str) -> Result<bool> {
+        let changed = self
+            .exec("DELETE FROM sessions WHERE sid = ?", &[j_text(sid)])
+            .await?;
+        Ok(changed > 0)
+    }
+
+    /// 清理过期会话。
+    pub async fn purge_sessions(&self, now_ms: i64) -> Result<usize> {
+        self.exec(
+            "DELETE FROM sessions WHERE expires_at <= ?",
+            &[j_i64(now_ms)],
+        )
+        .await
     }
 
     // =======================================================================

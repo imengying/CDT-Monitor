@@ -723,6 +723,51 @@ impl JobRow {
     }
 }
 
+/// `sessions` 表行（登录设备）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRow {
+    pub sid: String,
+    pub ua: String,
+    pub ip: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub expires_at: i64,
+}
+
+impl SessionRow {
+    /// 转 DTO；`current` 标记当前请求所属会话。
+    pub fn to_dto(&self, current_sid: Option<&str>) -> SessionDto {
+        SessionDto {
+            sid: self.sid.clone(),
+            ua: self.ua.clone(),
+            ip: self.ip.clone(),
+            created_at: self.created_at,
+            last_seen_at: self.last_seen_at,
+            expires_at: self.expires_at,
+            current: current_sid == Some(self.sid.as_str()),
+        }
+    }
+}
+
+/// 登录设备（脱敏：不下发 sid 之外的任何凭据材料）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionDto {
+    pub sid: String,
+    pub ua: String,
+    pub ip: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub expires_at: i64,
+    /// 是否为发起本次请求的设备。
+    pub current: bool,
+}
+
+/// 登录设备列表响应。
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionsResponse {
+    pub sessions: Vec<SessionDto>,
+}
+
 /// `action_logs` 表行（带账号名，便于界面直接展示）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ActionLog {

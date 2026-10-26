@@ -1402,6 +1402,9 @@ impl Scheduler {
         if let Err(err) = self.db.purge_locks(now).await {
             report.notes.push(format!("清理过期锁失败：{err}"));
         }
+        if let Err(err) = self.db.purge_sessions(now).await {
+            report.notes.push(format!("清理过期会话失败：{err}"));
+        }
         let day = 24 * 60 * 60 * 1000i64;
         if let Err(err) = self
             .db

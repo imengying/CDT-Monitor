@@ -22,6 +22,7 @@ export type ApiErrorCode =
   | 'turnstile_broken'
   | 'cross_origin'
   | 'job_locked'
+  | 'cannot_kick_self'
   | 'job_conflict'
   | 'credentials_not_configured'
   | 'internal_error'
@@ -236,6 +237,20 @@ export interface DailyReportSettings {
   enabled: boolean
   time: string
   timezone: string
+}
+
+export interface SessionDevice {
+  sid: string
+  ua: string
+  ip: string
+  created_at: number
+  last_seen_at: number
+  expires_at: number
+  current: boolean
+}
+
+export interface SessionsResponse {
+  sessions: SessionDevice[]
 }
 
 export interface TurnstileSettings {
@@ -531,6 +546,21 @@ export const api = {
 
   deleteAccount(id: number): Promise<unknown> {
     return request<unknown>(`/api/v1/accounts/${id}`, { method: 'DELETE' })
+  },
+
+  // ---------------------------------------------------------------- 登录设备
+  sessions(): Promise<SessionsResponse> {
+    return request<SessionsResponse>('/api/v1/sessions')
+  },
+
+  revokeSession(sid: string): Promise<SessionsResponse> {
+    return request<SessionsResponse>(`/api/v1/sessions/${encodeURIComponent(sid)}`, {
+      method: 'DELETE',
+    })
+  },
+
+  revokeOtherSessions(): Promise<SessionsResponse> {
+    return request<SessionsResponse>('/api/v1/sessions', { method: 'DELETE' })
   },
 
   // ---------------------------------------------------------------- 设置

@@ -15,6 +15,7 @@ PRAGMA foreign_keys = ON;
 --   daily_report          日报配置 JSON：{enabled,time,timezone}
 --   telegram              Telegram 配置 JSON：{enabled,token_enc,chat_id,api_host}
 --   bark                  Bark 配置 JSON：{enabled,server_url,device_key_enc,normal_level,alert_level}
+--   turnstile             Turnstile 配置 JSON：{enabled,site_key,secret_enc}
 --
 -- 注意：管理员账号与密码**不在**本表，它们只来自 Worker 环境变量
 -- （ADMIN_USERNAME / ADMIN_PASSWORD），数据库里没有任何密码材料。
@@ -123,6 +124,26 @@ CREATE INDEX IF NOT EXISTS idx_action_logs_account_created
   ON action_logs (account_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_action_logs_created
   ON action_logs (created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- 登录设备（会话）
+--
+-- 无状态 Token 可离线验签，但「踢下线」需要服务端状态：Token 载荷携带 sid，
+-- 每次请求校验 sid 仍在本表且未被吊销。
+--
+-- ua / ip 仅用于展示，不参与鉴权。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sessions (
+  sid          TEXT PRIMARY KEY,
+  ua           TEXT NOT NULL DEFAULT '',
+  ip           TEXT NOT NULL DEFAULT '',
+  created_at   INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  expires_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions (last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions (expires_at);
 
 -- ---------------------------------------------------------------------------
 -- 幂等锁：保证同一账号的同类自动化动作在 TTL 内只执行一次

@@ -51,16 +51,16 @@ use worker::{
 
 use crate::crypto::{
     Crypto, DEFAULT_SESSION_TTL_MS, MasterKey, SessionToken, TokenState, constant_time_eq,
-    session_cookie, session_token_from_cookie,
+    random_hex, session_cookie, session_token_from_cookie,
 };
 use crate::db::Db;
 use crate::models::{
     AcceptedJob, AccountInput, ApiErrorBody, BarkConfig, BarkSettingsDto, BarkSettingsUpdate,
     DailyReportConfig, DailyReportDto, HistoryBucket, HistoryQuery, JobDto, JobStatus, JobType,
-    LoginRequest, NotifyChannel, NotifyTestRequest, SessionResponse, SettingsDto, TelegramConfig,
-    TelegramSettingsDto, TelegramSettingsUpdate, TrafficHistoryResponse, TurnstileConfig,
-    TurnstileSettingsDto, TurnstileSettingsUpdate, build_overview, now_ms, setting_key,
-    utc_offset_minutes,
+    LoginRequest, NotifyChannel, NotifyTestRequest, SessionResponse, SessionsResponse, SettingsDto,
+    TelegramConfig, TelegramSettingsDto, TelegramSettingsUpdate, TrafficHistoryResponse,
+    TurnstileConfig, TurnstileSettingsDto, TurnstileSettingsUpdate, build_overview, now_ms,
+    setting_key, utc_offset_minutes,
 };
 use crate::notify::NotifyLevel;
 use crate::scheduler::Scheduler;
@@ -191,6 +191,86 @@ fn client_ip(req: &Request) -> Option<String> {
         }
     }
     None
+}
+
+/// 取 `User-Agent`，截断到 512 字节避免超长入库。
+fn client_ua(req: &Request) -> String {
+    req.headers()
+        .get("User-Agent")
+        .ok()
+        .flatten()
+        .map(|v| v.chars().take(512).collect::<String>())
+        .unwrap_or_default()
+}
+
+/// 生成会话 ID（128 位随机，十六进制）。
+fn random_sid() -> worker::Result<String> {
+    random_hex(16).map_err(|err| worker::Error::RustError(err.to_string()))
+}
+
+/// 从 UA 里提炼可读的设备名，用于列表展示。
+///
+/// 只做粗粒度识别：浏览器 + 平台足够区分多台设备，不必引入 UA 解析库。
+fn short_device(ua: &str) -> String {
+    let lower = ua.to_ascii_lowercase();
+
+    let browser = if lower.contains("edg/") {
+        "Edge"
+    } else if lower.contains("chrome/") && !lower.contains("chromium") {
+        "Chrome"
+    } else if lower.contains("firefox/") {
+        "Firefox"
+    } else if lower.contains("safari/") {
+        "Safari"
+    } else if lower.contains("curl/") {
+        "curl"
+    } else if lower.contains("python") {
+        "Python"
+    } else if lower.is_empty() {
+        "未知客户端"
+    } else {
+        "其他"
+    };
+
+    let platform = if lower.contains("iphone") {
+        "iPhone"
+    } else if lower.contains("ipad") {
+        "iPad"
+    } else if lower.contains("android") {
+        "Android"
+    } else if lower.contains("mac os x") || lower.contains("macintosh") {
+        "macOS"
+    } else if lower.contains("windows") {
+        "Windows"
+    } else if lower.contains("linux") {
+        "Linux"
+    } else {
+        ""
+    };
+
+    if platform.is_empty() {
+        browser.to_string()
+    } else {
+        format!("{browser} · {platform}")
+    }
+}
+
+/// 掩码 IP：保留前两段，其余用 `*`，避免在界面上完整暴露来源地址。
+fn short_ip(ip: &str) -> String {
+    if ip.is_empty() {
+        return "未知来源".to_string();
+    }
+    if ip.contains(':') {
+        // IPv6 只留前 4 组
+        let head: Vec<&str> = ip.split(':').filter(|s| !s.is_empty()).take(2).collect();
+        return format!("{}::*", head.join(":"));
+    }
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() == 4 {
+        format!("{}.{}.*.*", parts[0], parts[1])
+    } else {
+        ip.to_string()
+    }
 }
 
 /// 取 `Origin` 的 host 部分。
@@ -360,15 +440,38 @@ impl AppCtx {
             .unwrap_or(DEFAULT_SESSION_TTL_MS)
     }
 
-    /// 校验会话 Cookie，成功返回过期时间。
-    fn session_from_request(&self, req: &Request) -> Option<i64> {
+    /// 从请求中取出已验签的会话（不查库）。
+    fn session_claims(&self, req: &Request) -> Option<SessionClaims> {
         let header = req.headers().get("Cookie").ok().flatten();
         let token = session_token_from_cookie(header.as_deref())?;
         match SessionToken::new(self.crypto.key()).verify(&token, now_ms()) {
-            TokenState::Valid { expires_at } => Some(expires_at),
+            TokenState::Valid { expires_at, sid } => Some(SessionClaims { expires_at, sid }),
             _ => None,
         }
     }
+
+    /// 校验会话 Cookie，并确认会话在库中仍有效（未被踢下线）。
+    ///
+    /// 无状态 Token 无法吊销，因此每次鉴权都要回查 `sessions`：
+    /// 缺库（未建表）时按无效处理，不放行。
+    async fn session_from_request(&self, req: &Request) -> Option<SessionClaims> {
+        let claims = self.session_claims(req)?;
+        match self.db.session_is_active(&claims.sid, now_ms()).await {
+            Ok(true) => Some(claims),
+            Ok(false) => None,
+            Err(err) => {
+                log_error!("会话校验失败：{err}");
+                None
+            }
+        }
+    }
+}
+
+/// 会话声明（验签通过 + 库中存在）。
+#[derive(Debug, Clone)]
+struct SessionClaims {
+    expires_at: i64,
+    sid: String,
 }
 
 // ===========================================================================
@@ -507,11 +610,11 @@ fn verify_credentials(app: &AppCtx, username: &str, password: &str) -> bool {
 
 /// `GET /api/v1/auth/session`（公开）
 async fn handle_session(app: &AppCtx, req: &Request) -> worker::Result<Response> {
-    let expires_at = app.session_from_request(req);
+    let claims = app.session_from_request(req).await;
     ok(&SessionResponse {
-        authenticated: expires_at.is_some(),
+        authenticated: claims.is_some(),
         turnstile_site_key: app.turnstile_site_key().await,
-        expires_at,
+        expires_at: claims.map(|c| c.expires_at),
     })
 }
 
@@ -605,16 +708,44 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
         return error_response_with_code(401, "用户名或密码错误", "invalid_credentials");
     }
 
-    // 3) 签发 Token
+    // 3) 建立会话并签发 Token
+    //
+    // 先落库再签发：sid 必须在库中存在，否则首个请求就会被判为已吊销。
     let ttl = app.session_ttl_ms();
+    let now = now_ms();
+    let sid = random_sid()?;
+    let ua = client_ua(&req);
+    let ip = client_ip(&req).unwrap_or_default();
+
+    app.db
+        .create_session(&crate::models::SessionRow {
+            sid: sid.clone(),
+            ua: ua.clone(),
+            ip: ip.clone(),
+            created_at: now,
+            last_seen_at: now,
+            expires_at: now.saturating_add(ttl),
+        })
+        .await?;
+
     let token = SessionToken::new(app.crypto.key())
-        .issue(now_ms(), ttl)
+        .issue(now, ttl, &sid)
         .map_err(|err| worker::Error::RustError(err.to_string()))?;
     let max_age = (ttl / 1000).max(60);
     let cookie = session_cookie(&token, max_age);
 
     app.db
-        .add_log(None, "login_success", None, "管理员登录成功", now_ms())
+        .add_log(
+            None,
+            "login_success",
+            None,
+            &format!(
+                "管理员登录成功（{} / {}）",
+                short_device(&ua),
+                short_ip(&ip)
+            ),
+            now,
+        )
         .await
         .ok();
 
@@ -630,12 +761,85 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
 }
 
 /// `POST /api/v1/auth/logout`（公开：清 Cookie 即可）
-fn handle_logout() -> worker::Result<Response> {
+async fn handle_logout(app: &AppCtx, req: &Request) -> worker::Result<Response> {
+    // 只删当前会话：退出一个设备不应影响其它已登录设备
+    if let Some(claims) = app.session_claims(req)
+        && let Err(err) = app.db.delete_session(&claims.sid).await
+    {
+        log_error!("删除会话失败：{err}");
+    }
     json_response(
         &serde_json::json!({ "authenticated": false }),
         200,
         Some(session_cookie("", 0)),
     )
+}
+
+/// `GET /api/v1/sessions`：列出登录设备。
+async fn handle_list_sessions(app: &AppCtx, current_sid: &str) -> worker::Result<Response> {
+    let rows = app.db.list_sessions(now_ms()).await?;
+    let sessions = rows
+        .iter()
+        .map(|row| row.to_dto(Some(current_sid)))
+        .collect();
+    ok(&SessionsResponse { sessions })
+}
+
+/// `DELETE /api/v1/sessions/{sid}`：踢指定设备下线。
+async fn handle_delete_session(
+    app: &AppCtx,
+    current_sid: &str,
+    sid: &str,
+) -> worker::Result<Response> {
+    if sid == current_sid {
+        return error_response_with_code(
+            400,
+            "不能在这里退出当前设备，请使用「退出登录」",
+            "cannot_kick_self",
+        );
+    }
+    if !app.db.delete_session(sid).await? {
+        return error_response(404, "设备不存在或已下线");
+    }
+    app.db
+        .add_log(
+            None,
+            "session_revoked",
+            None,
+            &format!(
+                "已踢下线一个登录设备（{}）",
+                sid.chars().take(8).collect::<String>()
+            ),
+            now_ms(),
+        )
+        .await
+        .ok();
+    handle_list_sessions(app, current_sid).await
+}
+
+/// `DELETE /api/v1/sessions`：踢出除当前设备外的全部会话。
+async fn handle_delete_other_sessions(app: &AppCtx, current_sid: &str) -> worker::Result<Response> {
+    let rows = app.db.list_sessions(now_ms()).await?;
+    let mut removed = 0usize;
+    for row in rows {
+        if row.sid == current_sid {
+            continue;
+        }
+        if app.db.delete_session(&row.sid).await.unwrap_or(false) {
+            removed += 1;
+        }
+    }
+    app.db
+        .add_log(
+            None,
+            "session_revoked",
+            None,
+            &format!("已踢下线其它 {removed} 个登录设备"),
+            now_ms(),
+        )
+        .await
+        .ok();
+    handle_list_sessions(app, current_sid).await
 }
 
 // ===========================================================================
@@ -1502,15 +1706,16 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
     match (method.clone(), rest.as_slice()) {
         (Method::Get, ["auth", "session"]) => return handle_session(&app, &req).await,
         (Method::Post, ["auth", "login"]) => return handle_login(&app, req).await,
-        (Method::Post, ["auth", "logout"]) => return handle_logout(),
+        (Method::Post, ["auth", "logout"]) => return handle_logout(&app, &req).await,
         _ => {}
     }
 
     // ---------------------------------------------------------------- 鉴权
-    let Some(expires_at) = app.session_from_request(&req) else {
+    let Some(claims) = app.session_from_request(&req).await else {
         return error_response_with_code(401, "请先登录", "unauthenticated");
     };
-    let _ = expires_at;
+    // 顺带刷新活跃时间，供「登录设备」展示；失败不影响请求
+    let _ = app.db.touch_session(&claims.sid, now_ms()).await;
 
     // 写接口的跨站防护
     if method != Method::Get && !same_origin_ok(&req) {
@@ -1520,6 +1725,11 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
     let mut req = req;
 
     match (method.clone(), rest.as_slice()) {
+        // ------------------------------------------------------------ 登录设备
+        (Method::Get, ["sessions"]) => handle_list_sessions(&app, &claims.sid).await,
+        (Method::Delete, ["sessions"]) => handle_delete_other_sessions(&app, &claims.sid).await,
+        (Method::Delete, ["sessions", sid]) => handle_delete_session(&app, &claims.sid, sid).await,
+
         // ------------------------------------------------------------ 概览
         (Method::Get, ["overview"]) => handle_overview(&app).await,
         (Method::Get, ["history"]) => handle_history(&app, &req).await,
@@ -1855,6 +2065,46 @@ mod tests {
         // 配置仍然是 enabled + complete，说明闸门会判定为 Broken 而非 Disabled
         config.enabled = true;
         assert!(config.enabled && config.is_complete());
+    }
+
+    #[test]
+    fn device_name_from_user_agent() {
+        let chrome_mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                          (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        assert_eq!(short_device(chrome_mac), "Chrome · macOS");
+
+        let safari_iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) \
+                             AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+        assert_eq!(short_device(safari_iphone), "Safari · iPhone");
+
+        let edge_win = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                        (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0";
+        assert_eq!(short_device(edge_win), "Edge · Windows");
+
+        assert_eq!(short_device("curl/8.4.0"), "curl");
+        assert_eq!(short_device(""), "未知客户端");
+    }
+
+    #[test]
+    fn ip_is_masked() {
+        assert_eq!(short_ip("203.0.113.42"), "203.0.*.*");
+        assert_eq!(short_ip("2001:db8:85a3::8a2e:370:7334"), "2001:db8::*");
+        assert_eq!(short_ip(""), "未知来源");
+    }
+
+    #[test]
+    fn session_dto_marks_current_device() {
+        let row = crate::models::SessionRow {
+            sid: "abc123".to_string(),
+            ua: "Chrome".to_string(),
+            ip: "1.2.*.*".to_string(),
+            created_at: 1,
+            last_seen_at: 2,
+            expires_at: 3,
+        };
+        assert!(row.to_dto(Some("abc123")).current);
+        assert!(!row.to_dto(Some("other")).current);
+        assert!(!row.to_dto(None).current);
     }
 
     #[test]
