@@ -133,7 +133,7 @@ export class TrafficChart {
       style: { backgroundColor: 'color-mix(in oklab, var(--color-surface) 72%, transparent)' },
     })
     this.summaryRow = el('div', {
-      class: 'mt-1 hidden flex-wrap items-center gap-x-4 gap-y-1 px-1 text-[11px]',
+      class: 'mt-1 hidden flex-wrap items-center gap-x-4 gap-y-1 px-1 text-[0.8125rem]',
       style: { color: 'var(--color-ink-subtle)' },
     })
     this.element = el(

@@ -137,7 +137,7 @@ export class LogDrawer {
       el(
         'aside',
         {
-          class: 'relative flex h-full w-full max-w-lg flex-col border-l shadow-2xl',
+          class: 'relative flex h-full w-full max-w-xl flex-col border-l shadow-2xl',
           style: { backgroundColor: 'var(--color-surface)', borderColor: 'var(--color-line)' },
           role: 'dialog',
           'aria-modal': 'true',
@@ -185,6 +185,7 @@ export class LogDrawer {
 
   /** 打开抽屉并加载日志。 */
   open(): void {
+    document.body.style.overflow = 'hidden'
     this.element.classList.remove('hidden')
     this.element.style.display = 'flex'
     this.filter = ''
@@ -197,6 +198,7 @@ export class LogDrawer {
   close(): void {
     this.element.classList.add('hidden')
     this.element.style.display = 'none'
+    document.body.style.overflow = ''
     this.removeEscListener?.()
     this.removeEscListener = null
   }
@@ -287,19 +289,19 @@ export class LogDrawer {
           text: ACTION_LABELS[log.action_type] ?? log.action_type,
         }),
         ...(log.account_name
-          ? [el('span', { class: 'text-[11px] font-medium', text: log.account_name })]
+          ? [el('span', { class: 'text-[0.8125rem] font-medium', text: log.account_name })]
           : []),
         ...(log.instance_id
           ? [
               el('span', {
-                class: 'font-mono text-[10px]',
+                class: 'font-mono text-xs',
                 style: { color: 'var(--color-ink-subtle)' },
                 text: log.instance_id,
               }),
             ]
           : []),
         el('span', {
-          class: 'ml-auto text-[10px] tabular-nums',
+          class: 'ml-auto text-xs tabular-nums',
           style: { color: 'var(--color-ink-subtle)' },
           text: formatTime(log.created_at),
         }),
@@ -314,7 +316,7 @@ export class LogDrawer {
           },
           head,
           el('p', {
-            class: 'mt-1 text-[11px] leading-relaxed break-words',
+            class: 'mt-1 text-[0.8125rem] leading-relaxed break-words',
             style: { color: 'var(--color-ink-muted)' },
             text: log.detail,
           }),

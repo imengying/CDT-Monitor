@@ -22,6 +22,9 @@ import {
   type NotifyChannel,
   type OverLimitAction,
   type PushLevel,
+  formatTime,
+  relativeTime,
+  type SessionDevice,
   type SettingsResponse,
   type SiteType,
   type StopMode,
@@ -69,6 +72,38 @@ function blankAccountForm(): AccountForm {
     spotKeepAlive: false,
     enabled: true,
   }
+}
+
+/** 从 UA 提炼可读设备名（与后端 short_device 保持一致的粒度）。 */
+function deviceName(ua: string): string {
+  const lower = ua.toLowerCase()
+  const browser = lower.includes('edg/')
+    ? 'Edge'
+    : lower.includes('chrome/') && !lower.includes('chromium')
+      ? 'Chrome'
+      : lower.includes('firefox/')
+        ? 'Firefox'
+        : lower.includes('safari/')
+          ? 'Safari'
+          : lower.includes('curl/')
+            ? 'curl'
+            : lower.trim() === ''
+              ? '未知客户端'
+              : '其他'
+  const platform = lower.includes('iphone')
+    ? 'iPhone'
+    : lower.includes('ipad')
+      ? 'iPad'
+      : lower.includes('android')
+        ? 'Android'
+        : lower.includes('mac os x') || lower.includes('macintosh')
+          ? 'macOS'
+          : lower.includes('windows')
+            ? 'Windows'
+            : lower.includes('linux')
+              ? 'Linux'
+              : ''
+  return platform ? `${browser} · ${platform}` : browser
 }
 
 /** 由 DTO 生成表单（Secret 永远留空）。 */
@@ -133,11 +168,14 @@ export class SettingsModal {
 
   private reportDraft = { enabled: false, time: '09:00' }
   private timezoneDraft = 'UTC+8'
+  private devices: SessionDevice[] = []
+  private devicesLoaded = false
+  private kicking: string | null = null
 
   private removeEscListener: (() => void) | null = null
 
   constructor() {
-    this.content = el('div', { class: 'scroll-thin min-h-0 flex-1 overflow-y-auto p-5' })
+    this.content = el('div', { class: 'scroll-thin min-h-0 flex-1 overflow-y-auto p-6' })
     this.notice = el('div', {
       class: 'hidden items-start gap-2 border-b px-5 py-2 text-xs',
       style: { borderColor: 'var(--color-line)' },
@@ -156,7 +194,7 @@ export class SettingsModal {
       el(
         'div',
         {
-          class: 'card flex max-h-[88vh] w-full max-w-3xl flex-col overflow-hidden',
+          class: 'card flex h-[min(42rem,88vh)] w-full max-w-5xl flex-col overflow-hidden',
           role: 'dialog',
           'aria-modal': 'true',
           'aria-label': '系统设置',
@@ -186,8 +224,11 @@ export class SettingsModal {
     this.form = blankAccountForm()
     this.confirmDeleteId = null
     this.hideNotice()
+    this.devices = []
+    this.devicesLoaded = false
     this.element.classList.remove('hidden')
     this.element.style.display = 'flex'
+    document.body.style.overflow = 'hidden'
     this.renderNav()
     this.renderContent()
     this.removeEscListener = onEscape(() => this.close())
@@ -200,6 +241,7 @@ export class SettingsModal {
   close(): void {
     this.element.classList.add('hidden')
     this.element.style.display = 'none'
+    document.body.style.overflow = ''
     this.removeEscListener?.()
     this.removeEscListener = null
   }
@@ -282,7 +324,7 @@ export class SettingsModal {
   private buildNav(): HTMLElement {
     const nav = el('nav', {
       class:
-        'flex shrink-0 gap-1 overflow-x-auto border-b p-2 md:w-40 md:flex-col md:border-r md:border-b-0',
+        'flex shrink-0 gap-1 overflow-x-auto border-b p-2 md:w-48 md:flex-col md:border-r md:border-b-0',
       style: { borderColor: 'var(--color-line)' },
     })
 
@@ -372,7 +414,7 @@ export class SettingsModal {
       ...(hint
         ? [
             el('p', {
-              class: 'mt-1 text-[10px]',
+              class: 'mt-1 text-xs',
               style: { color: 'var(--color-ink-subtle)' },
               text: hint,
             }),
@@ -472,7 +514,7 @@ export class SettingsModal {
     return el(
       'label',
       {
-        class: 'flex cursor-pointer items-center gap-2 text-[11px]',
+        class: 'flex cursor-pointer items-center gap-2 text-[0.8125rem]',
         style: { color: 'var(--color-ink-muted)' },
       },
       box,
@@ -564,7 +606,7 @@ export class SettingsModal {
         {},
         el('h3', { class: 'text-xs font-semibold', text: '阿里云账号' }),
         el('p', {
-          class: 'mt-0.5 text-[11px]',
+          class: 'mt-0.5 text-[0.8125rem]',
           style: { color: 'var(--color-ink-subtle)' },
           text: 'AccessKey Secret 使用 XChaCha20-Poly1305 加密后存入 D1，永不回显。',
         }),
@@ -596,7 +638,7 @@ export class SettingsModal {
   private buildAccountList(accounts: AccountDto[]): HTMLElement {
     if (accounts.length === 0) {
       return el('div', {
-        class: 'rounded-lg border border-dashed px-3 py-6 text-center text-[11px]',
+        class: 'rounded-lg border border-dashed px-3 py-6 text-center text-[0.8125rem]',
         style: {
           borderColor: 'var(--color-line)',
           color: 'var(--color-ink-subtle)',
@@ -619,7 +661,7 @@ export class SettingsModal {
       )
 
       const metaRow = el('div', {
-        class: 'mt-1 font-mono text-[11px]',
+        class: 'mt-1 font-mono text-[0.8125rem]',
         style: { color: 'var(--color-ink-subtle)' },
         text: `${account.access_key_id_masked} · 阈值 ${account.traffic_limit_gb} GB · ${account.regions.length} 个地域`,
       })
@@ -675,7 +717,7 @@ export class SettingsModal {
             'div',
             {
               class:
-                'mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md px-2.5 py-2 text-[11px]',
+                'mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md px-2.5 py-2 text-[0.8125rem]',
               style: {
                 backgroundColor: 'var(--color-danger-soft)',
                 color: 'var(--color-danger)',
@@ -1032,7 +1074,7 @@ export class SettingsModal {
         {},
         el('h3', { class: 'text-xs font-semibold', text: 'Cloudflare Turnstile' }),
         el('p', {
-          class: 'mt-0.5 text-[11px] leading-relaxed',
+          class: 'mt-0.5 text-[0.8125rem] leading-relaxed',
           style: { color: 'var(--color-ink-subtle)' },
           text: '登录时的人机校验。不填就是不启用 —— 只校验用户名与密码。',
         }),
@@ -1040,7 +1082,7 @@ export class SettingsModal {
       el(
         'div',
         {
-          class: 'flex items-start gap-2 rounded-lg px-3 py-2 text-[11px]',
+          class: 'flex items-start gap-2 rounded-lg px-3 py-2 text-[0.8125rem]',
           style: {
             backgroundColor: active ? 'var(--color-ok-soft)' : 'var(--color-surface-muted)',
             color: active ? 'var(--color-ok)' : 'var(--color-ink-subtle)',
@@ -1096,7 +1138,7 @@ export class SettingsModal {
       el(
         'p',
         {
-          class: 'text-[11px] leading-relaxed',
+          class: 'text-[0.8125rem] leading-relaxed',
           style: { color: 'var(--color-ink-subtle)' },
           text: '密钥在 Cloudflare 控制台 → Turnstile → 添加站点 获取。私钥以 XChaCha20-Poly1305 加密后存入 D1，不再以明文下发。',
         },
@@ -1191,7 +1233,7 @@ export class SettingsModal {
         {},
         el('h3', { class: 'text-xs font-semibold', text: 'Telegram 通知' }),
         el('p', {
-          class: 'mt-0.5 text-[11px]',
+          class: 'mt-0.5 text-[0.8125rem]',
           style: { color: 'var(--color-ink-subtle)' },
           text: 'Worker 运行在海外边缘节点，可直连 api.telegram.org；必要时可填自定义反代域名。',
         }),
@@ -1321,7 +1363,7 @@ export class SettingsModal {
         {},
         el('h3', { class: 'text-xs font-semibold', text: 'Bark 通知' }),
         el('p', {
-          class: 'mt-0.5 text-[11px]',
+          class: 'mt-0.5 text-[0.8125rem]',
           style: { color: 'var(--color-ink-subtle)' },
           text: '通过 HTTPS POST JSON 推送；普通通知与熔断告警可分别设置推送级别。',
         }),
@@ -1456,7 +1498,7 @@ export class SettingsModal {
           {},
           el('h3', { class: 'text-xs font-semibold', text: '每日日报' }),
           el('p', {
-            class: 'mt-0.5 text-[11px]',
+            class: 'mt-0.5 text-[0.8125rem]',
             style: { color: 'var(--color-ink-subtle)' },
             text: '到达设定时间后的 40 分钟窗口内推送一次，当天不会重复推送。',
           }),
@@ -1522,7 +1564,7 @@ export class SettingsModal {
           {},
           el('h3', { class: 'text-xs font-semibold', text: '时区' }),
           el('p', {
-            class: 'mt-0.5 text-[11px]',
+            class: 'mt-0.5 text-[0.8125rem]',
             style: { color: 'var(--color-ink-subtle)' },
             text: '影响账期划分、定时开关机与图表分桶。格式如 UTC+8、UTC-5、UTC+5:30。',
           }),
@@ -1548,47 +1590,188 @@ export class SettingsModal {
         el(
           'div',
           { class: 'border-t pt-4', style: { borderColor: 'var(--color-line)' } },
-          el('h3', { class: 'text-xs font-semibold', text: '登录凭证' }),
+          el('h3', { class: 'text-sm font-semibold', text: '登录凭证' }),
           el('p', {
-            class: 'mt-0.5 text-[11px]',
+            class: 'mt-1 text-xs leading-relaxed',
             style: { color: 'var(--color-ink-subtle)' },
-            text: '管理员用户名与密码由 Worker 环境变量提供，不在后台修改，也不写入数据库。',
-          }),
-          el(
-            'div',
-            {
-              class: 'mt-2 space-y-1.5 rounded-lg px-3 py-2.5 font-mono text-[11px]',
-              style: {
-                backgroundColor: 'var(--color-surface-muted)',
-                color: 'var(--color-ink-muted)',
-              },
-            },
-            el('div', { text: 'ADMIN_USERNAME' }),
-            el('div', { text: 'ADMIN_PASSWORD' }),
-          ),
-          el('p', {
-            class: 'mt-2 text-[11px] leading-relaxed',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '轮换方式：Cloudflare 控制台 → Settings → Variables and Secrets 修改后重新部署。改完旧会话不会自动失效，必要时在浏览器清除 Cookie。',
+            text: '由环境变量提供，后台不可修改。',
           }),
         ),
         el(
           'div',
-          {
-            class: 'flex items-start gap-2 rounded-lg px-3 py-2 text-[11px]',
-            style: {
-              backgroundColor: 'var(--color-surface-muted)',
-              color: 'var(--color-ink-subtle)',
-            },
-          },
-          iconSvg(icons.cloud, 13),
-          el('span', {
-            class: 'leading-relaxed',
-            text: '通知凭据与阿里云 Secret 均以 XChaCha20-Poly1305 加密存储，主密钥为 Worker 的 MASTER_KEY 环境变量；轮换主密钥会导致现有密文全部失效。',
+          { class: 'border-t pt-4', style: { borderColor: 'var(--color-line)' } },
+          el(
+            'div',
+            { class: 'flex items-center justify-between gap-2' },
+            el('h3', { class: 'text-sm font-semibold', text: '登录设备' }),
+            el(
+              'button',
+              {
+                class: 'btn btn-ghost btn-sm',
+                type: 'button',
+                on: { click: () => void this.loadDevices(true) },
+              },
+              iconSvg(icons.refresh, 12),
+              el('span', { text: '刷新' }),
+            ),
+          ),
+          el('p', {
+            class: 'mt-1 text-xs leading-relaxed',
+            style: { color: 'var(--color-ink-subtle)' },
+            text: '记录登录时使用的浏览器与来源地址，可随时让其它设备下线。',
           }),
+          this.buildDeviceList(),
         ),
       ),
     )
+
+    void this.loadDevices(false)
+  }
+
+  /** 登录设备列表。 */
+  private buildDeviceList(): HTMLElement {
+    const wrapper = el('div', { class: 'mt-3 space-y-2', dataset: { role: 'device-list' } })
+
+    if (!this.devicesLoaded) {
+      replaceChildren(
+        wrapper,
+        el('p', {
+          class: 'text-xs',
+          style: { color: 'var(--color-ink-subtle)' },
+          text: '正在加载…',
+        }),
+      )
+      return wrapper
+    }
+
+    if (this.devices.length === 0) {
+      replaceChildren(
+        wrapper,
+        el('p', {
+          class: 'text-xs',
+          style: { color: 'var(--color-ink-subtle)' },
+          text: '暂无登录设备。',
+        }),
+      )
+      return wrapper
+    }
+
+    const others = this.devices.filter((device) => !device.current)
+
+    if (others.length > 0) {
+      wrapper.append(
+        el(
+          'div',
+          { class: 'flex justify-end' },
+          el(
+            'button',
+            {
+              class: 'btn btn-danger btn-sm',
+              type: 'button',
+              disabled: this.kicking !== null,
+              on: { click: () => void this.kickOthers() },
+            },
+            el('span', { text: '退出其它设备' }),
+          ),
+        ),
+      )
+    }
+
+    for (const device of this.devices) {
+      wrapper.append(this.buildDeviceRow(device))
+    }
+
+    return wrapper
+  }
+
+  private buildDeviceRow(device: SessionDevice): HTMLElement {
+    return el(
+      'div',
+      {
+        class: 'flex items-start justify-between gap-3 rounded-lg border px-3 py-2',
+        style: { borderColor: 'var(--color-line)' },
+      },
+      el(
+        'div',
+        { class: 'min-w-0' },
+        el(
+          'div',
+          { class: 'flex flex-wrap items-center gap-1.5' },
+          el('span', { class: 'text-sm font-medium', text: deviceName(device.ua) }),
+          ...(device.current
+            ? [el('span', { class: 'badge badge-ok', text: '本机' })]
+            : []),
+        ),
+        el('p', {
+          class: 'mt-1 font-mono text-xs',
+          style: { color: 'var(--color-ink-subtle)' },
+          text: `${device.ip || '未知来源'} · 登录于 ${formatTime(device.created_at)}`,
+        }),
+        el('p', {
+          class: 'text-xs',
+          style: { color: 'var(--color-ink-subtle)' },
+          text: `最近活跃 ${relativeTime(device.last_seen_at)}`,
+        }),
+      ),
+      ...(device.current
+        ? []
+        : [
+            el(
+              'button',
+              {
+                class: 'btn btn-ghost btn-sm shrink-0',
+                type: 'button',
+                disabled: this.kicking !== null,
+                on: { click: () => void this.kickOne(device.sid) },
+              },
+              el('span', { text: this.kicking === device.sid ? '处理中…' : '下线' }),
+            ),
+          ]),
+    )
+  }
+
+  private async loadDevices(notify: boolean): Promise<void> {
+    try {
+      const data = await api.sessions()
+      this.devices = data.sessions
+      this.devicesLoaded = true
+      if (this.activeTab === 'system') this.renderContent()
+      if (notify) this.showNotice('设备列表已刷新', 'ok')
+    } catch (error) {
+      this.devicesLoaded = true
+      if (this.activeTab === 'system') this.renderContent()
+      this.showNotice(error instanceof ApiError ? error.message : '读取登录设备失败', 'danger')
+    }
+  }
+
+  private async kickOne(sid: string): Promise<void> {
+    if (this.kicking) return
+    this.kicking = sid
+    try {
+      const data = await api.revokeSession(sid)
+      this.devices = data.sessions
+      this.showNotice('该设备已下线', 'ok')
+    } catch (error) {
+      this.showNotice(error instanceof ApiError ? error.message : '下线失败', 'danger')
+    } finally {
+      this.kicking = null
+      this.renderContent()
+    }
+  }
+
+  private async kickOthers(): Promise<void> {
+    if (this.kicking) return
+    this.kicking = 'all'
+    try {
+      const data = await api.revokeOtherSessions()
+      this.devices = data.sessions
+      this.showNotice('其它设备已全部下线', 'ok')
+    } catch (error) {
+      this.showNotice(error instanceof ApiError ? error.message : '下线失败', 'danger')
+    } finally {
+      this.kicking = null
+      this.renderContent()
+    }
   }
 
   private async saveTimezone(): Promise<void> {

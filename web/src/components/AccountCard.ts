@@ -93,12 +93,12 @@ function trafficBar(label: string, bytes: number, limitGb: number, percent: numb
       'div',
       { class: 'mt-1.5 flex items-baseline justify-between gap-2' },
       el('span', {
-        class: 'font-mono text-[11px] tabular-nums',
+        class: 'font-mono text-[0.8125rem] tabular-nums',
         style: { color: 'var(--color-ink-subtle)' },
         text: humanBytes(bytes),
       }),
       el('span', {
-        class: 'font-mono text-[11px] tabular-nums',
+        class: 'font-mono text-[0.8125rem] tabular-nums',
         style: { color: 'var(--color-ink-subtle)' },
         text: `/ ${limitGb} GB`,
       }),
@@ -291,7 +291,7 @@ export class AccountCard {
     const meta = el(
       'div',
       {
-        class: 'mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]',
+        class: 'mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[0.8125rem]',
         style: { color: 'var(--color-ink-subtle)' },
       },
       el(
@@ -450,7 +450,7 @@ export class AccountCard {
         : el(
             'div',
             {
-              class: 'flex items-center gap-2 text-[11px]',
+              class: 'flex items-center gap-2 text-[0.8125rem]',
               style: { color: 'var(--color-ink-subtle)' },
             },
             el(
@@ -471,7 +471,7 @@ export class AccountCard {
     const body =
       account.instances.length === 0
         ? el('div', {
-            class: 'px-5 pb-5 text-center text-[11px]',
+            class: 'px-5 pb-5 text-center text-[0.8125rem]',
             style: { color: 'var(--color-ink-subtle)' },
             text: '暂无实例数据，点击卡片右上角「刷新」采集一次。',
           })
@@ -542,7 +542,7 @@ export class AccountCard {
     const metaRow = el(
       'div',
       {
-        class: 'mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px]',
+        class: 'mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[0.8125rem]',
         style: { color: 'var(--color-ink-subtle)' },
       },
       ...metaParts,
@@ -610,7 +610,7 @@ export class AccountCard {
     return el(
       'label',
       {
-        class: 'flex cursor-pointer items-center gap-1.5 text-[11px]',
+        class: 'flex cursor-pointer items-center gap-1.5 text-[0.8125rem]',
         title: this.account.spot_keep_alive
           ? '账号级保活已开启'
           : '账号级保活已关闭，逐实例开关不会生效',
@@ -624,7 +624,7 @@ export class AccountCard {
     return el(
       'div',
       {
-        class: 'flex items-start gap-2 border-t px-5 py-2.5 text-[11px]',
+        class: 'flex items-start gap-2 border-t px-5 py-2.5 text-[0.8125rem]',
         style: {
           borderColor: 'var(--color-line)',
           backgroundColor: 'var(--color-danger-soft)',

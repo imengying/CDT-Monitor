@@ -124,11 +124,6 @@ export class LoginModal {
       this.buildTurnstileSection(),
       this.errorBox,
       this.submitButton,
-      el('p', {
-        class: 'mt-4 text-center text-[11px] leading-relaxed',
-        style: { color: 'var(--color-ink-subtle)' },
-        text: '受 Cloudflare Turnstile 保护，会话 Cookie 为 HttpOnly + SameSite=Strict',
-      }),
     )
 
     this.element = el(
@@ -163,16 +158,10 @@ export class LoginModal {
         },
         iconSvg(icons.shield, 24),
       ),
-      el(
-        'div',
-        {},
-        el('h1', { class: 'text-lg font-semibold tracking-tight', text: 'CDT Monitor' }),
-        el('p', {
-          class: 'mt-0.5 text-xs',
-          style: { color: 'var(--color-ink-muted)' },
-          text: '阿里云流量监控与实例自动化控制',
-        }),
-      ),
+      el('h1', {
+        class: 'text-xl font-semibold tracking-tight',
+        text: 'CDT Monitor',
+      }),
     )
   }
 

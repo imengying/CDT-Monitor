@@ -49,7 +49,6 @@ export class App {
   private readonly accountList = new AccountList()
 
   /** 需要就地更新的节点。 */
-  private subtitle: HTMLElement | null = null
   private lastRefreshLabel: HTMLSpanElement | null = null
   private refreshButton: HTMLButtonElement | null = null
   private errorBanner: HTMLDivElement | null = null
@@ -155,14 +154,8 @@ export class App {
     this.logDrawer = new LogDrawer()
     this.trafficChart = new TrafficChart()
 
-    this.subtitle = el('p', {
-      class: 'truncate text-[10px] leading-tight',
-      style: { color: 'var(--color-ink-subtle)' },
-      text: '正在加载…',
-    })
-
     this.lastRefreshLabel = el('span', {
-      class: 'hidden text-[11px] sm:inline',
+      class: 'hidden text-[0.8125rem] sm:inline',
       style: { color: 'var(--color-ink-subtle)' },
     })
 
@@ -204,13 +197,12 @@ export class App {
       this.buildHeader(),
       el(
         'main',
-        { class: 'mx-auto max-w-6xl px-4 py-4' },
+        { class: 'mx-auto max-w-7xl px-5 py-5' },
         this.errorBanner,
         this.summaryGrid,
         this.emptyCard,
         this.accountList.element,
         this.chartPanel,
-        this.buildFooter(),
       ),
     )
 
@@ -228,8 +220,8 @@ export class App {
     ): HTMLButtonElement =>
       el(
         'button',
-        { class: 'btn btn-ghost btn-sm', type: 'button', title, on: { click: onClick } },
-        iconSvg(icon, 13),
+        { class: 'btn btn-ghost', type: 'button', title, on: { click: onClick } },
+        iconSvg(icon, 15),
         ...(label ? [el('span', { class: 'hidden sm:inline', text: label })] : []),
       ) as HTMLButtonElement
 
@@ -244,7 +236,7 @@ export class App {
       },
       el(
         'div',
-        { class: 'mx-auto flex max-w-6xl items-center gap-3 px-4 py-2.5' },
+        { class: 'mx-auto flex max-w-7xl items-center gap-3 px-5 py-3' },
         el(
           'div',
           { class: 'flex min-w-0 items-center gap-2.5' },
@@ -259,8 +251,7 @@ export class App {
           el(
             'div',
             { class: 'min-w-0' },
-            el('h1', { class: 'truncate text-sm leading-tight font-semibold', text: 'CDT Monitor' }),
-            this.subtitle,
+            el('h1', { class: 'truncate text-base leading-tight font-semibold', text: 'CDT Monitor' }),
           ),
         ),
         el('div', { class: 'flex-1' }),
@@ -276,18 +267,6 @@ export class App {
           barButton('', icons.logout, '退出登录', () => void logout()),
         ),
       ),
-    )
-  }
-
-  private buildFooter(): HTMLElement {
-    return el(
-      'footer',
-      {
-        class: 'mt-6 flex flex-wrap items-center justify-between gap-2 border-t pt-3 text-[10px]',
-        style: { borderColor: 'var(--color-line)', color: 'var(--color-ink-subtle)' },
-      },
-      el('span', { text: 'CDT Monitor · Cloudflare Workers + D1 + TypeScript' }),
-      el('span', { text: 'Cron */5 * * * * · 会话 Cookie HttpOnly + SameSite=Strict' }),
     )
   }
 
@@ -315,7 +294,7 @@ export class App {
         el('p', {
           class: 'mt-1 text-xs',
           style: { color: 'var(--color-ink-subtle)' },
-          text: '添加账号后即可查看 CDT 流量、余额与 ECS 实例，并启用自动熔断与定时开关机。',
+          text: '添加阿里云账号后开始监控。',
         }),
       ),
       el(
@@ -347,7 +326,7 @@ export class App {
     }) as HTMLSelectElement
 
     const thresholdRow = el('p', {
-      class: 'mb-2 hidden items-center gap-1.5 rounded-lg px-3 py-1.5 text-[11px]',
+      class: 'mb-2 hidden items-center gap-1.5 rounded-lg px-3 py-1.5 text-[0.8125rem]',
       style: {
         backgroundColor: 'var(--color-danger-soft)',
         color: 'var(--color-danger)',
@@ -389,7 +368,7 @@ export class App {
           el(
             'div',
             {
-              class: 'flex overflow-hidden rounded-lg border text-[11px]',
+              class: 'flex overflow-hidden rounded-lg border text-[0.8125rem]',
               style: { borderColor: 'var(--color-line)' },
             },
             bucketButton('hour', '按小时'),
@@ -424,9 +403,6 @@ export class App {
     const overview = state.overview
     const accounts = overview?.accounts ?? []
 
-    if (this.subtitle) {
-      this.subtitle.textContent = `${overview?.timezone ?? 'UTC+8'} · 账期 ${overview?.billing_month ?? '—'}`
-    }
 
     if (this.refreshButton) {
       this.refreshButton.disabled = state.refreshingAll
@@ -510,7 +486,7 @@ export class App {
         'div',
         { class: 'card px-3 py-2.5' },
         el('p', {
-          class: 'text-[10px] font-medium',
+          class: 'text-xs font-medium',
           style: { color: 'var(--color-ink-subtle)' },
           text: label,
         }),
@@ -520,7 +496,7 @@ export class App {
           text: value,
         }),
         el('p', {
-          class: 'text-[10px]',
+          class: 'text-xs',
           style: { color: 'var(--color-ink-subtle)' },
           text: hint,
         }),
@@ -617,7 +593,6 @@ export class App {
     this.settingsModal = null
     this.logDrawer = null
     this.shell = null
-    this.subtitle = null
     this.lastRefreshLabel = null
     this.refreshButton = null
     this.errorBanner = null
