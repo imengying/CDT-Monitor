@@ -12,7 +12,7 @@
  * 避免每次 60 秒轮询都重建整棵树（会丢失滚动位置与输入焦点）。
  */
 
-import { humanBytes, type AccountOverview } from '@/api/client'
+import type { AccountOverview } from '@/api/client'
 import type { AppState } from '@/lib/store'
 import { clearToasts, store } from '@/lib/store'
 import { el, iconSvg, replaceChildren } from '@/lib/dom'
@@ -48,7 +48,9 @@ export class App {
   private settingsModal: SettingsModal | null = null
   private logDrawer: LogDrawer | null = null
 
-  private readonly accountList = new AccountList()
+  private readonly accountList = new AccountList((accountId) =>
+    this.settingsModal?.open(store.get().settings, false, accountId),
+  )
 
   /** 需要就地更新的节点。 */
   private refreshButton: HTMLButtonElement | null = null
@@ -174,8 +176,17 @@ export class App {
       },
     })
 
+    // 汇总条：整体一张毛玻璃面板，四格等分，与上游 metric-strip 一致
     this.summaryGrid = el('section', {
-      class: 'mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4',
+      class: 'mb-6 grid overflow-hidden grid-cols-2 sm:grid-cols-4',
+      style: {
+        borderRadius: '24px',
+        backgroundColor: 'var(--color-surface-raised)',
+        backdropFilter: 'blur(18px) saturate(112%)',
+        border: '1px solid var(--color-inner-line)',
+        boxShadow: '0 0 0 1px var(--color-line), var(--shadow-lg)',
+        animation: 'stage-in .68s .12s var(--ease-out) both',
+      },
     })
 
     this.emptyCard = this.buildEmptyCard()
@@ -509,37 +520,73 @@ export class App {
       }
     }
 
-    const card = (label: string, value: string, hint: string, color?: string): HTMLElement =>
-      el(
+    const metric = (
+      label: string,
+      value: string,
+      hint: string,
+      icon: typeof icons.dashboard,
+      tone: 'brand' | 'ok' | 'info' | 'warn' | 'danger' | 'muted',
+    ): HTMLElement => {
+      const toneMap = {
+        brand: ['var(--color-brand)', 'var(--color-brand-soft)'],
+        ok: ['var(--color-ok)', 'var(--color-ok-soft)'],
+        info: ['var(--color-info)', 'var(--color-info-soft)'],
+        warn: ['var(--color-warn)', 'var(--color-warn-soft)'],
+        danger: ['var(--color-danger)', 'var(--color-danger-soft)'],
+        muted: ['var(--color-ink-muted)', 'var(--color-surface-muted)'],
+      } as const
+      const [fg, bg] = toneMap[tone]
+      return el(
         'div',
-        { class: 'card px-3 py-2.5' },
-        el('p', {
-          class: 'text-xs font-medium',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: label,
-        }),
-        el('p', {
-          class: 'mt-0.5 text-base font-semibold tabular-nums',
-          style: color ? { color } : {},
-          text: value,
-        }),
-        el('p', {
-          class: 'text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: hint,
-        }),
+        {
+          class: 'relative flex items-center gap-3.5 px-5 py-4 transition-colors',
+          style: { minHeight: '92px' },
+        },
+        el(
+          'div',
+          {
+            class: 'grid shrink-0 place-items-center rounded-xl',
+            style: { width: '44px', height: '44px', color: fg, backgroundColor: bg },
+          },
+          iconSvg(icon, 20),
+        ),
+        el(
+          'div',
+          { class: 'min-w-0' },
+          el('label', {
+            class: 'mb-1 block text-[10px] font-bold uppercase',
+            style: { color: 'var(--color-ink-muted)' },
+            text: label,
+          }),
+          el(
+            'div',
+            { class: 'flex items-baseline' },
+            el('strong', {
+              class: 'text-2xl font-bold tabular-nums',
+              style: { color: fg },
+              text: value,
+            }),
+            el('small', {
+              class: 'ml-1 text-xs',
+              style: { color: 'var(--color-ink-subtle)' },
+              text: hint,
+            }),
+          ),
+        ),
       )
+    }
 
     replaceChildren(
       this.summaryGrid,
-      card('账号', `${enabled} / ${accounts.length}`, '已启用 / 总数'),
-      card('本月合计流量', humanBytes(totalBytes), '国内 + 海外'),
-      card('实例', `${running} 运行 / ${stopped} 停止`, '跨全部地域'),
-      card(
+      metric('账号', `${enabled}`, `/ ${accounts.length}`, icons.server, 'brand'),
+      metric('本月流量', (totalBytes / 1024 ** 3).toFixed(1), 'GB', icons.chart, 'info'),
+      metric('实例', `${running}`, `运行 / ${stopped} 停止`, icons.serverCog, 'ok'),
+      metric(
         '熔断',
         String(triggered),
-        triggered > 0 ? '已禁止自动拉起' : '全部正常',
-        triggered > 0 ? 'var(--color-danger)' : 'var(--color-ok)',
+        triggered > 0 ? '已禁止拉起' : '正常',
+        icons.shield,
+        triggered > 0 ? 'danger' : 'muted',
       ),
     )
   }

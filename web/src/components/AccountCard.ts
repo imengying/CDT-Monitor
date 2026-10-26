@@ -14,7 +14,6 @@ import {
   api,
   humanAmount,
   humanBytes,
-  percentTone,
   relativeTime,
   type AccountOverview,
   type InstanceInfo,
@@ -43,67 +42,6 @@ function instanceStatusLabel(status: string): string {
     Pending: '创建中',
   }
   return map[status] ?? status ?? '未知'
-}
-
-/** 进度条元素。 */
-function trafficBar(label: string, bytes: number, limitGb: number, percent: number): HTMLDivElement {
-  const tone = percentTone(percent)
-  const fillColor =
-    tone === 'danger'
-      ? 'var(--color-danger)'
-      : tone === 'warn'
-        ? 'var(--color-warn)'
-        : 'var(--color-brand)'
-  const valueColor =
-    tone === 'danger'
-      ? 'var(--color-danger)'
-      : tone === 'warn'
-        ? 'var(--color-warn)'
-        : 'var(--color-ink)'
-
-  return el(
-    'div',
-    {},
-    el(
-      'div',
-      { class: 'mb-1.5 flex items-baseline justify-between gap-2' },
-      el('span', {
-        class: 'text-xs font-medium',
-        style: { color: 'var(--color-ink-muted)' },
-        text: label,
-      }),
-      el('span', {
-        class: 'text-xs font-semibold tabular-nums',
-        style: { color: valueColor },
-        text: `${percent.toFixed(2)}%`,
-      }),
-    ),
-    el(
-      'div',
-      { class: 'progress-track' },
-      el('div', {
-        class: 'progress-fill',
-        style: {
-          width: `${Math.min(Math.max(percent, 0), 100)}%`,
-          backgroundColor: fillColor,
-        },
-      }),
-    ),
-    el(
-      'div',
-      { class: 'mt-1.5 flex items-baseline justify-between gap-2' },
-      el('span', {
-        class: 'font-mono text-[0.8125rem] tabular-nums',
-        style: { color: 'var(--color-ink-subtle)' },
-        text: humanBytes(bytes),
-      }),
-      el('span', {
-        class: 'font-mono text-[0.8125rem] tabular-nums',
-        style: { color: 'var(--color-ink-subtle)' },
-        text: `/ ${limitGb} GB`,
-      }),
-    ),
-  )
 }
 
 /**
@@ -166,6 +104,8 @@ interface ActionSpec {
   label: string
   icon: IconNode
   className: string
+  /** 仅图标按钮时的悬浮提示。 */
+  title?: string
   disabled?: boolean
   onClick: () => Promise<void> | void
 }
@@ -184,7 +124,10 @@ export class AccountCard {
   /** 已注册的按钮，用于就地刷新状态（不重建 DOM）。 */
   private buttons: { spec: ActionSpec; node: HTMLButtonElement }[] = []
 
-  constructor(account: AccountOverview) {
+  constructor(
+    account: AccountOverview,
+    private readonly onEdit?: (accountId: number) => void,
+  ) {
     this.account = account
     this.signature = signatureOf(account)
     this.root = this.build()
@@ -258,226 +201,302 @@ export class AccountCard {
   private build(): HTMLElement {
     this.buttons = []
     return el(
-      'section',
-      { class: 'card overflow-hidden' },
+      'article',
+      {
+        class: 'card card-hover',
+        style: { padding: '21px 22px', animation: 'stage-in .7s var(--ease-out) both' },
+      },
       this.buildHeader(),
-      this.buildDataRow(),
-      this.buildInstanceSection(),
+      this.buildTrafficBlock(),
+      this.buildFooterRow(),
       ...(this.account.threshold_triggered ? [this.buildThresholdBanner()] : []),
+      this.buildInstanceSection(),
     )
   }
 
+  /** 卡片头部：状态图标 + 名称/地域 + 状态胶囊 + 费用与余额。 */
   private buildHeader(): HTMLElement {
     const account = this.account
+    // 主实例（单实例部署时即唯一实例）
+    const primary = account.instances[0]
+    const status = primary?.status.toLowerCase() ?? ''
+    const tone =
+      !account.enabled ? 'negative' : status === 'running' ? 'positive' : status === 'stopped' ? 'negative' : 'warning'
+    const toneColor =
+      tone === 'positive'
+        ? 'var(--color-ok)'
+        : tone === 'negative'
+          ? 'var(--color-ink-subtle)'
+          : 'var(--color-warn)'
+    const toneBg =
+      tone === 'positive'
+        ? 'var(--color-ok-soft)'
+        : tone === 'negative'
+          ? 'var(--color-surface-muted)'
+          : 'var(--color-warn-soft)'
 
-    const badges: HTMLElement[] = [
-      el('span', { class: 'badge badge-brand', text: account.site_label }),
-      el('span', { class: 'badge badge-muted font-mono', text: account.access_key_id_masked }),
-    ]
-
-    if (!account.enabled) {
-      badges.push(el('span', { class: 'badge badge-muted', text: '已停用' }))
-    }
-    if (account.threshold_triggered) {
-      badges.push(
-        el(
-          'span',
-          { class: 'badge badge-danger' },
-          iconSvg(icons.alert, 10),
-          el('span', { text: '本月已熔断' }),
-        ),
-      )
-    } else if (account.traffic_limit_gb > 0 && account.total_percent >= 80) {
-      badges.push(el('span', { class: 'badge badge-warn', text: '接近阈值' }))
-    }
-
-    const meta = el(
-      'div',
-      {
-        class: 'mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[0.8125rem]',
-        style: { color: 'var(--color-ink-subtle)' },
-      },
-      el(
-        'span',
-        { class: 'inline-flex items-center gap-1' },
-        iconSvg(icons.calendar, 11),
-        el('span', { text: `账期 ${account.billing_month || '—'}` }),
-      ),
-      el('span', {
-        dataset: { role: 'updated-at' },
-        text: account.snapshot_updated_at
-          ? `更新于 ${relativeTime(account.snapshot_updated_at)}`
-          : '尚未采集',
-      }),
-    )
+    const statusText = !account.enabled
+      ? '已停用'
+      : primary
+        ? instanceStatusLabel(primary.status)
+        : '无实例'
 
     return el(
       'header',
-      { class: 'flex flex-wrap items-start justify-between gap-3 px-5 pt-4 pb-3' },
+      {
+        class: 'grid items-start gap-3.5',
+        style: { gridTemplateColumns: '46px minmax(0, 1fr) auto' },
+      },
+      el(
+        'div',
+        {
+          class: 'grid place-items-center rounded-xl',
+          style: {
+            width: '46px',
+            height: '46px',
+            color: toneColor,
+            backgroundColor: toneBg,
+            boxShadow: 'inset 0 1px 0 var(--color-inner-line)',
+          },
+        },
+        iconSvg(icons.server, 20),
+      ),
       el(
         'div',
         { class: 'min-w-0' },
         el(
-          'div',
-          { class: 'flex flex-wrap items-center gap-2' },
-          el('h2', { class: 'truncate text-sm font-semibold', text: account.name }),
-          ...badges,
+          'h3',
+          {
+            class: 'truncate text-base leading-tight font-semibold',
+            text: account.name,
+          },
         ),
-        meta,
+        el('span', {
+          class: 'mt-1 block truncate text-xs',
+          style: { color: 'var(--color-ink-subtle)' },
+          text: primary?.region_id || account.site_label,
+        }),
       ),
-      this.actionButton({
-        key: 'refresh',
-        label: '刷新',
-        icon: icons.refresh,
-        className: 'btn-ghost btn-sm',
-        onClick: () => this.refreshAccount(),
-      }),
-    )
-  }
-
-  private buildDataRow(): HTMLElement {
-    const account = this.account
-
-    const badges: HTMLElement[] = [
-      el(
-        'span',
-        {
-          class:
-            account.over_limit_action === 'stop_and_notify'
-              ? 'badge badge-danger'
-              : 'badge badge-warn',
-        },
-        iconSvg(icons.bellRing, 10),
-        el('span', { text: account.over_limit_action_label }),
-      ),
-      el(
-        'span',
-        { class: 'badge badge-muted' },
-        iconSvg(icons.power, 10),
-        el('span', { text: account.stop_mode_label }),
-      ),
-    ]
-
-    if (account.spot_keep_alive) {
-      badges.push(
-        el(
-          'span',
-          { class: 'badge badge-ok' },
-          iconSvg(icons.zap, 10),
-          el('span', { text: '抢占式保活' }),
-        ),
-      )
-    }
-    if (account.schedule_start_time || account.schedule_stop_time) {
-      badges.push(
-        el(
-          'span',
-          { class: 'badge badge-brand' },
-          iconSvg(icons.calendar, 10),
-          el('span', {
-            text: `${account.schedule_start_time || '—'} → ${account.schedule_stop_time || '—'}`,
-          }),
-        ),
-      )
-    }
-
-    return el(
-      'div',
-      {
-        class: 'grid gap-4 border-t px-5 py-4 md:grid-cols-2',
-        style: { borderColor: 'var(--color-line)' },
-      },
       el(
         'div',
-        { class: 'flex flex-col gap-3' },
+        { class: 'flex flex-col items-end gap-2' },
         el(
           'div',
           {
-            class: 'flex items-center justify-between rounded-lg px-3 py-2.5',
-            style: { backgroundColor: 'var(--color-surface-muted)' },
+            class: 'inline-flex items-center gap-1.5 rounded-full px-2.5 text-xs font-bold',
+            style: {
+              height: '30px',
+              color: toneColor,
+              backgroundColor: toneBg,
+            },
+          },
+          el('i', {
+            class: 'block h-1.5 w-1.5 rounded-full',
+            style: { backgroundColor: toneColor },
+          }),
+          el('span', { text: statusText }),
+        ),
+        el(
+          'div',
+          {
+            class: 'grid justify-end gap-x-4 gap-y-0.5 text-right',
+            style: { gridTemplateColumns: 'auto auto' },
           },
           el(
             'div',
-            { class: 'flex items-center gap-2' },
-            iconSvg(icons.coins, 15),
+            { class: 'grid gap-0.5' },
             el('span', {
-              class: 'text-xs',
-              style: { color: 'var(--color-ink-muted)' },
+              class: 'text-[10px] font-bold',
+              style: { color: 'var(--color-ink-subtle)' },
               text: '账户余额',
             }),
+            el('b', {
+              class: 'font-mono text-xs tabular-nums',
+              text: humanAmount(account.balance_amount, account.balance_currency),
+            }),
           ),
-          el('span', {
-            class: 'font-mono text-sm font-semibold tabular-nums',
-            text: humanAmount(account.balance_amount, account.balance_currency),
-          }),
+          el(
+            'div',
+            { class: 'grid gap-0.5' },
+            el('span', {
+              class: 'text-[10px] font-bold',
+              style: { color: 'var(--color-ink-subtle)' },
+              text: '阈值',
+            }),
+            el('b', {
+              class: 'font-mono text-xs tabular-nums',
+              text: `${account.traffic_limit_gb} GB`,
+            }),
+          ),
         ),
-        el('div', { class: 'flex flex-wrap items-center gap-2' }, ...badges),
-      ),
-      el(
-        'div',
-        { class: 'flex flex-col gap-3' },
-        trafficBar(
-          '国内流量',
-          account.cdt_domestic_bytes,
-          account.traffic_limit_gb,
-          account.domestic_percent,
-        ),
-        trafficBar(
-          '海外 / 亚太流量',
-          account.cdt_overseas_bytes,
-          account.traffic_limit_gb,
-          account.overseas_percent,
-        ),
-        trafficBar('合计', account.cdt_total_bytes, account.traffic_limit_gb, account.total_percent),
-        this.buildForecast(),
       ),
     )
   }
 
-  /**
-   * 用量预测。
-   *
-   * 只在本账期已有足够样本（至少一天）时才展示；不足一天时后端返回 null，
-   * 这里不占位，避免卡片上出现一行「暂无预测」的噪音。
-   */
-  private buildForecast(): HTMLElement {
-    const forecast = this.account.forecast
-    if (!forecast) return el('div', { class: 'hidden' })
+  /** 流量区：大号数字 + 单条进度 + 百分比与账期。 */
+  private buildTrafficBlock(): HTMLElement {
+    const account = this.account
+    const percent = account.total_percent
+    const fill =
+      account.threshold_triggered || percent >= 100
+        ? 'var(--color-danger)'
+        : percent >= 80
+          ? 'var(--color-warn)'
+          : 'var(--color-ink)'
 
-    const overLimit = forecast.exceed_date !== null
-    const tone = overLimit ? 'var(--color-warn)' : 'var(--color-ink-subtle)'
+    return el(
+      'div',
+      {},
+      el(
+        'div',
+        {
+          class: 'mt-5 flex items-end justify-between',
+        },
+        el(
+          'div',
+          {},
+          el('span', {
+            class: 'mb-1 block text-[10px] font-bold',
+            style: { color: 'var(--color-ink-subtle)' },
+            text: '本月 CDT 流量',
+          }),
+          el(
+            'div',
+            { class: 'flex items-baseline gap-1' },
+            el('strong', {
+              class: 'text-3xl font-bold tabular-nums',
+              text: (account.cdt_total_bytes / 1024 ** 3).toFixed(2),
+            }),
+            el('small', {
+              class: 'font-bold tabular-nums',
+              style: { color: 'var(--color-ink-subtle)' },
+              text: `/ ${account.traffic_limit_gb.toFixed(0)} GB`,
+            }),
+          ),
+        ),
+        this.actionButton({
+          key: 'refresh',
+          label: '',
+          icon: icons.refresh,
+          className: 'btn-ghost',
+          title: '刷新',
+          onClick: () => this.refreshAccount(),
+        }),
+      ),
+      el(
+        'div',
+        {
+          class: 'mt-3 overflow-hidden rounded-full',
+          style: {
+            height: '7px',
+            backgroundColor: 'color-mix(in oklab, var(--color-line-strong) 68%, transparent)',
+            boxShadow: 'inset 0 1px 3px rgb(0 0 0 / 0.08)',
+          },
+        },
+        el('i', {
+          class: 'block h-full rounded-full',
+          style: {
+            width: `${Math.min(Math.max(percent, 0), 100)}%`,
+            backgroundColor: fill,
+            animation: 'progress-in .8s .35s var(--ease-emphasis) both',
+          },
+        }),
+      ),
+      el(
+        'div',
+        {
+          class: 'mt-2 flex justify-between text-[10px] font-bold tabular-nums',
+          style: { color: 'var(--color-ink-muted)' },
+        },
+        el('span', { text: `${percent.toFixed(2)}% 已使用` }),
+        el('span', { text: `账期 ${account.billing_month || '—'}` }),
+      ),
+      el(
+        'div',
+        {
+          class: 'mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs',
+          style: { color: 'var(--color-ink-subtle)' },
+        },
+        el('span', { text: `国内 ${humanBytes(account.cdt_domestic_bytes)}` }),
+        el('span', { text: `非内地 ${humanBytes(account.cdt_overseas_bytes)}` }),
+        ...(account.forecast
+          ? [
+              el('span', {
+                style:
+                  account.forecast.exceed_date !== null
+                    ? { color: 'var(--color-warn)', fontWeight: '600' }
+                    : {},
+                text: `预计月末 ${(account.forecast.projected_bytes / 1024 ** 3).toFixed(1)} GB`,
+              }),
+            ]
+          : []),
+      ),
+    )
+  }
 
-    const parts: HTMLElement[] = [
-      el('span', { text: '预计月末' }),
-      el('span', {
-        class: 'font-mono font-semibold tabular-nums',
-        style: { color: tone },
-        text: `${(forecast.projected_bytes / 1024 ** 3).toFixed(1)} GB`,
-      }),
-      el('span', {
-        class: 'font-mono tabular-nums',
-        style: { color: 'var(--color-ink-subtle)' },
-        text: `（${forecast.projected_percent.toFixed(1)}%）`,
+  /** 底部：更新时间 + 操作按钮组。 */
+  private buildFooterRow(): HTMLElement {
+    const account = this.account
+    const primary = account.instances[0]
+    const running = primary?.status.toLowerCase() === 'running'
+    const stopped = primary?.status.toLowerCase() === 'stopped'
+
+    const buttons: HTMLElement[] = [
+      this.actionButton({
+        key: 'settings',
+        label: '',
+        icon: icons.settings,
+        className: 'btn-ghost',
+        title: '账号设置',
+        onClick: () => this.onEdit?.(this.account.id),
       }),
     ]
-
-    if (overLimit) {
-      parts.push(
-        el('span', {
-          class: 'badge badge-warn',
-          text: `预计 ${forecast.exceed_date} 超限`,
+    if (stopped) {
+      buttons.push(
+        this.actionButton({
+          key: 'start',
+          label: '',
+          icon: icons.play,
+          className: 'btn-ghost',
+          title: '开机',
+          onClick: () => void this.toggleInstance(primary, true),
+        }),
+      )
+    }
+    if (running) {
+      buttons.push(
+        this.actionButton({
+          key: 'stop',
+          label: '',
+          icon: icons.power,
+          className: 'btn-danger',
+          title: '关机',
+          onClick: () => void this.toggleInstance(primary, false),
         }),
       )
     }
 
     return el(
-      'div',
+      'footer',
       {
-        class: 'flex flex-wrap items-center gap-1.5 text-[0.8125rem]',
-        style: { color: 'var(--color-ink-muted)' },
-        title: `已过去 ${forecast.days_elapsed} 天，剩余 ${forecast.days_remaining} 天`,
+        class: 'mt-4 flex flex-wrap items-center justify-between gap-2 border-t pt-3.5',
+        style: { borderColor: 'var(--color-line)' },
       },
-      ...parts,
+      el(
+        'span',
+        {
+          class: 'flex items-center gap-1.5 text-[10px] tabular-nums',
+          style: { color: 'var(--color-ink-subtle)' },
+        },
+        iconSvg(icons.calendar, 14),
+        el('span', {
+          dataset: { role: 'updated-at' },
+          text: account.snapshot_updated_at
+            ? relativeTime(account.snapshot_updated_at)
+            : '等待首次同步',
+        }),
+      ),
+      el('div', { class: 'flex gap-2' }, ...buttons),
     )
   }
 
@@ -705,13 +724,20 @@ export class AccountCard {
   // -------------------------------------------------------------------------
 
   private actionButton(spec: ActionSpec): HTMLButtonElement {
-    const node = el('button', { class: `btn ${spec.className}`, type: 'button' }) as HTMLButtonElement
+    const node = el('button', {
+      class: `btn ${spec.className}`,
+      type: 'button',
+      title: spec.title ?? spec.label,
+      'aria-label': spec.title ?? spec.label,
+    }) as HTMLButtonElement
     node.disabled = this.busy.has(spec.key) || Boolean(spec.disabled)
+    // label 为空时只显示图标（上游的图标按钮形态）
+    const labelPart = spec.label ? [el('span', { text: spec.label })] : []
     replaceChildren(
       node,
       ...(this.busy.has(spec.key)
-        ? [iconSvg(icons.spinner, 12, 'animate-spin'), el('span', { text: spec.label })]
-        : [iconSvg(spec.icon, 12), el('span', { text: spec.label })]),
+        ? [iconSvg(icons.spinner, 15, 'animate-spin')]
+        : [iconSvg(spec.icon, 15), ...labelPart]),
     )
     node.addEventListener('click', () => {
       if (node.disabled) return
@@ -834,8 +860,12 @@ export class AccountList {
 
   private readonly cards = new Map<number, AccountCard>()
 
-  constructor() {
-    this.element = el('section', { class: 'space-y-3' })
+  constructor(private readonly onEdit?: (accountId: number) => void) {
+    // 两列网格，与上游一致；窄屏单列
+    this.element = el('section', {
+      class: 'grid gap-4',
+      style: { gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))' },
+    })
   }
 
   /** 同步账号列表。 */
@@ -848,7 +878,7 @@ export class AccountList {
       if (existing) {
         existing.update(account)
       } else {
-        const card = new AccountCard(account)
+        const card = new AccountCard(account, this.onEdit)
         this.cards.set(account.id, card)
         this.element.append(card.element)
       }

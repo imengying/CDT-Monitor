@@ -229,14 +229,23 @@ export class SettingsModal {
    * 打开弹窗。
    *
    * `startWithNewAccount` 打开后直接进入新增账号表单，供空状态的
-   * 「添加账号」按钮使用，省掉一次多余的点击。
+   * 「添加账号」按钮使用。
+   * `editAccountId` 打开后直接进入指定账号的编辑表单，供卡片上的设置按钮使用。
    */
-  open(settings: SettingsResponse | null, startWithNewAccount = false): void {
+  open(
+    settings: SettingsResponse | null,
+    startWithNewAccount = false,
+    editAccountId?: number,
+  ): void {
     this.settings = settings
     this.syncDrafts()
     this.activeTab = 'accounts'
-    this.formOpen = startWithNewAccount
+    this.formOpen = startWithNewAccount || editAccountId !== undefined
     this.form = blankAccountForm()
+    if (editAccountId !== undefined) {
+      const target = settings?.accounts.find((a) => a.id === editAccountId)
+      if (target) this.form = formFromAccount(target)
+    }
     this.confirmDeleteId = null
     this.hideNotice()
     this.devices = []
