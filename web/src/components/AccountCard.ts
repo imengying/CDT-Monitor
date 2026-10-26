@@ -1,10 +1,12 @@
 /**
- * 账号卡片（对应原版 `AccountCard.vue`）
+ * 账号卡片
  * ============================================================================
- * 一张卡片对应一个阿里云账号：
- *   头部：名称 + 站点 + AK 掩码 + 状态徽章 + 刷新按钮
- *   数据：余额 / 策略标签 + 国内/海外/合计三条进度条
- *   实例：每个实例一行，含状态徽章、规格/IP、保活开关、开机/关机
+ * 一张卡片对应一个阿里云账号，典型部署为一个账号一台实例：
+ *
+ *   头部：状态图标 + 名称/地域 + 状态胶囊 + 余额/阈值
+ *   流量：本月合计（大号数字）+ 单条进度条 + 百分比/账期
+ *   实例：主实例的规格、公网 IP、抢占式标记与保活开关
+ *   底部：更新时间 + 设置/开机/关机按钮
  *
  * 按钮的执行态由 `busy` 集合驱动：提交后立即禁用并显示 spinner，
  * 直到 Job 轮询结束（或失败），避免连点触发服务端 409。
@@ -397,8 +399,14 @@ export class AccountCard {
           class: 'mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs',
           style: { color: 'var(--color-ink-subtle)' },
         },
-        el('span', { text: `国内 ${humanBytes(account.cdt_domestic_bytes)}` }),
-        el('span', { text: `非内地 ${humanBytes(account.cdt_overseas_bytes)}` }),
+        // 只显示实际产生流量的区域：单机部署通常只落在一侧，
+        // 另一侧恒为 0 B，列出来纯属噪音
+        ...(account.cdt_domestic_bytes > 0
+          ? [el('span', { text: `国内 ${humanBytes(account.cdt_domestic_bytes)}` })]
+          : []),
+        ...(account.cdt_overseas_bytes > 0
+          ? [el('span', { text: `非内地 ${humanBytes(account.cdt_overseas_bytes)}` })]
+          : []),
       ),
     )
   }
