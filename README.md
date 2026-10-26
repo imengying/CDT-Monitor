@@ -353,6 +353,8 @@ CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、
 
 ### RAM 最小权限
 
+阿里云 RAM 用户只授予 CDT 查询、ECS 查询/启停和可选 BSS 查询所需的最小权限。
+
 只读查询 + 实例启停所需的最小策略：
 
 ```json
@@ -361,10 +363,7 @@ CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": [
-        "cdt:ListCdtInternetTraffic",
-        "cdt:GetCdtInternetTraffic"
-      ],
+      "Action": ["cdt:ListCdtInternetTraffic"],
       "Resource": "*"
     },
     {
@@ -385,6 +384,9 @@ CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、
   ]
 }
 ```
+
+`bssopenapi:QueryAccountBalance` 是可选的 —— 不授权时余额一栏显示 `—`
+（通知里显示「未知」），其余功能不受影响，适合不想让程序读财务数据的场景。
 
 `ecs:DescribeInstances` 不能省：启停接口内部会先校验实例状态。
 若实例在 VPC 内且报权限错误，再补 `vpc:DescribeVpcs` 等基础网络查询权限。
