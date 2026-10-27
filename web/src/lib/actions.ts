@@ -19,8 +19,6 @@ export function handleUnauthorized(notifyUser = true): void {
     phase: 'unauthenticated',
     overview: null,
     settings: null,
-    settingsOpen: false,
-    logsOpen: false,
     overviewError: '',
   })
   if (notifyUser) {

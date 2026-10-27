@@ -319,20 +319,10 @@ export interface BarkUpdate {
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
   body?: unknown
-  /** 覆盖默认的 401 处理（登录接口自己处理） */
-  skipAuthRedirect?: boolean
-}
-
-/** 会话失效时的回调（由 App.vue 注册）。 */
-let unauthorizedHandler: (() => void) | null = null
-
-/** 注册会话失效回调。 */
-export function onUnauthorized(handler: () => void): void {
-  unauthorizedHandler = handler
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = 'GET', body, skipAuthRedirect = false } = options
+  const { method = 'GET', body } = options
 
   const init: RequestInit = {
     method,
@@ -371,11 +361,6 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       } catch {
         message = text.slice(0, 300) || message
       }
-    }
-
-    // 登录接口的 401 由调用方处理，避免在登录页反复触发跳转
-    if (response.status === 401 && !skipAuthRedirect) {
-      unauthorizedHandler?.()
     }
 
     throw new ApiError(message, response.status, code)
@@ -477,14 +462,12 @@ export const api = {
         password,
         turnstile_token: turnstileToken,
       },
-      skipAuthRedirect: true,
     })
   },
 
   async logout(): Promise<void> {
     await request<unknown>('/api/v1/auth/logout', {
       method: 'POST',
-      skipAuthRedirect: true,
     })
   },
 
@@ -629,27 +612,6 @@ export const api = {
 // ---------------------------------------------------------------------------
 // 展示工具
 // ---------------------------------------------------------------------------
-
-const GIB = 1024 ** 3
-
-/** 字节 -> 人类可读（与后端 models::human_bytes 规则一致）。 */
-export function humanBytes(bytes: number): string {
-  const value = Math.max(0, bytes)
-  if (value < 1024) return `${value.toFixed(0)} B`
-  const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB']
-  let scaled = value / 1024
-  let index = 0
-  while (scaled >= 1024 && index + 1 < units.length) {
-    scaled /= 1024
-    index += 1
-  }
-  return `${scaled.toFixed(2)} ${units[index]}`
-}
-
-/** 字节 -> GB 数值（保留两位）。 */
-export function bytesToGb(bytes: number): number {
-  return Math.max(0, bytes) / GIB
-}
 
 /** 金额格式化。 */
 export function humanAmount(amount: number | null, currency: string | null): string {

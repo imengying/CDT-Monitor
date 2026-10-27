@@ -36,8 +36,6 @@ export interface AppState {
   settings: SettingsResponse | null
 
 
-  settingsOpen: boolean
-  logsOpen: boolean
 
   toasts: Toast[]
 }
@@ -52,8 +50,6 @@ export function initialState(): AppState {
     overviewError: '',
     refreshingAll: false,
     settings: null,
-    settingsOpen: false,
-    logsOpen: false,
     toasts: [],
   }
 }

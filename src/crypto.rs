@@ -178,9 +178,6 @@ impl MasterKey {
         &self.bytes
     }
 
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.bytes)
-    }
 }
 
 fn to_array(bytes: Vec<u8>) -> [u8; 32] {
@@ -288,13 +285,6 @@ impl Crypto {
         self.decrypt(payload).ok()
     }
 
-    /// 加密可选值：`None` 保持 `None`。
-    pub fn encrypt_optional(&self, value: Option<&str>) -> Result<Option<String>, CryptoError> {
-        match value.map(str::trim).filter(|v| !v.is_empty()) {
-            Some(v) => Ok(Some(self.encrypt(v)?)),
-            None => Ok(None),
-        }
-    }
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

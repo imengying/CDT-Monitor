@@ -148,13 +148,6 @@ impl Db {
         stmt.first::<T>(None).await
     }
 
-    /// 查询单个标量（例如 `COUNT(*)` 或 `MAX(recorded_at)`）。
-    async fn scalar_i64(&self, sql: &str, params: &[JsValue]) -> Result<i64> {
-        let stmt = self.stmt(sql)?.bind(params)?;
-        let value: Option<i64> = stmt.first(Some("value")).await?;
-        Ok(value.unwrap_or(0))
-    }
-
     // =======================================================================
     // settings
     // =======================================================================
@@ -179,13 +172,6 @@ impl Db {
             &[j_text(key), j_text(value), j_i64(now_ms)],
         )
         .await?;
-        Ok(())
-    }
-
-    /// 删除一个配置项。
-    pub async fn delete_setting(&self, key: &str) -> Result<()> {
-        self.exec("DELETE FROM settings WHERE key = ?", &[j_text(key)])
-            .await?;
         Ok(())
     }
 
@@ -694,18 +680,6 @@ impl Db {
         }
     }
 
-    /// 判断某账号是否已有同类任务在跑（避免前端连点导致重复开机/关机）。
-    pub async fn has_active_job(&self, account_id: i64, job_type: JobType) -> Result<bool> {
-        let count = self
-            .scalar_i64(
-                "SELECT COUNT(*) AS value FROM jobs
-                 WHERE account_id = ? AND job_type = ? AND status IN ('pending', 'running')",
-                &[j_i64(account_id), j_text(job_type.as_str())],
-            )
-            .await?;
-        Ok(count > 0)
-    }
-
     /// 清理过期任务记录。
     pub async fn purge_jobs(&self, before_ms: i64) -> Result<usize> {
         self.exec("DELETE FROM jobs WHERE created_at < ?", &[j_i64(before_ms)])
@@ -942,39 +916,6 @@ impl Db {
         Ok(hourly + daily)
     }
 
-    /// 统计各表行数，供设置页「存储」信息展示。
-    pub async fn stats(&self) -> Result<DbStats> {
-        let accounts = self
-            .scalar_i64("SELECT COUNT(*) AS value FROM accounts", &[])
-            .await?;
-        let samples = self
-            .scalar_i64(
-                "SELECT (SELECT COUNT(*) FROM traffic_hourly) + (SELECT COUNT(*) FROM traffic_daily) AS value",
-                &[],
-            )
-            .await?;
-        let logs = self
-            .scalar_i64("SELECT COUNT(*) AS value FROM action_logs", &[])
-            .await?;
-        let jobs = self
-            .scalar_i64("SELECT COUNT(*) AS value FROM jobs", &[])
-            .await?;
-        Ok(DbStats {
-            accounts,
-            samples,
-            logs,
-            jobs,
-        })
-    }
-}
-
-/// 存储统计。
-#[derive(Debug, Clone, Serialize)]
-pub struct DbStats {
-    pub accounts: i64,
-    pub samples: i64,
-    pub logs: i64,
-    pub jobs: i64,
 }
 
 /// 任务状态的中文描述，日志里用。

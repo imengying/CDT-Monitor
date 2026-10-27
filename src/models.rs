@@ -178,13 +178,6 @@ pub fn local_hhmm(ms: i64, tz: &str) -> String {
     format!("{:02}:{:02}", dt.hour(), dt.minute())
 }
 
-/// 便于日志阅读的本地时间字符串。
-pub fn format_local_timestamp(ms: i64, tz: &str) -> String {
-    local_datetime(ms, tz)
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
-}
-
 /// 解析 `HH:MM` 为当日分钟数；非法输入返回 `None`。
 pub fn parse_hhmm(value: &str) -> Option<u32> {
     let trimmed = value.trim();
@@ -223,16 +216,6 @@ pub fn gb_to_bytes(gb: f64) -> i64 {
 /// 字节 -> GB。
 pub fn bytes_to_gb(bytes: i64) -> f64 {
     bytes.max(0) as f64 / GIB
-}
-
-/// 相对配额的百分比（保留两位小数，上限 9999.99）。
-pub fn percent_of_limit(bytes: i64, limit_gb: f64) -> f64 {
-    let limit_bytes = gb_to_bytes(limit_gb);
-    if limit_bytes <= 0 {
-        return 0.0;
-    }
-    let pct = (bytes.max(0) as f64 / limit_bytes as f64) * 100.0;
-    ((pct * 100.0).round() / 100.0).clamp(0.0, 9999.99)
 }
 
 // ===========================================================================
@@ -492,10 +475,6 @@ impl JobStatus {
         }
     }
 
-    pub fn is_terminal(self) -> bool {
-        matches!(self, JobStatus::Success | JobStatus::Failed)
-    }
-
     pub fn from_db(value: &str) -> Self {
         match value {
             "pending" => JobStatus::Pending,
@@ -597,36 +576,6 @@ pub enum HistoryBucket {
 }
 
 impl HistoryBucket {
-    /// 桶宽度（毫秒）。
-    pub fn width_ms(self) -> i64 {
-        match self {
-            HistoryBucket::Hour => 3_600_000,
-            HistoryBucket::Day => 86_400_000,
-        }
-    }
-
-    /// 默认回溯窗口（毫秒）。
-    pub fn default_span_ms(self) -> i64 {
-        match self {
-            HistoryBucket::Hour => 48 * 3_600_000,
-            HistoryBucket::Day => 30 * 86_400_000,
-        }
-    }
-
-    /// 默认桶数量上限。
-    pub fn default_limit(self) -> u32 {
-        match self {
-            HistoryBucket::Hour => 48,
-            HistoryBucket::Day => 30,
-        }
-    }
-
-    pub fn from_query(value: &str) -> Self {
-        match value {
-            "day" | "daily" => HistoryBucket::Day,
-            _ => HistoryBucket::Hour,
-        }
-    }
 }
 
 // ===========================================================================
@@ -1385,14 +1334,6 @@ pub struct TrafficHistoryResponse {
     pub threshold_triggered: bool,
 }
 
-/// 图表查询参数（从 URL query 解析而来）。
-#[derive(Debug, Clone)]
-pub struct HistoryQuery {
-    pub account_id: Option<i64>,
-    pub bucket: HistoryBucket,
-    pub limit: u32,
-}
-
 // --------------------------- 设置相关 DTO ---------------------------------
 
 /// Telegram 设置（脱敏）。
@@ -1746,9 +1687,9 @@ mod tests {
 
     #[test]
     fn percent_math() {
-        assert_eq!(percent_of_limit(gb_to_bytes(10.0), 20.0), 50.0);
-        assert_eq!(percent_of_limit(0, 20.0), 0.0);
-        assert_eq!(percent_of_limit(10, 0.0), 0.0);
+        assert_eq!(percent_of(10.0, 20.0), 50.0);
+        assert_eq!(percent_of(0.0, 20.0), 0.0);
+        assert_eq!(percent_of(10.0, 0.0), 0.0);
     }
 
     #[test]
