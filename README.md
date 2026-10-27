@@ -421,6 +421,10 @@ CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、
 `bssapi:QueryAccountBalance` 是可选的 —— 不授权时余额一栏显示 `—`
 （通知里显示「未知」），其余功能不受影响，适合不想让程序读财务数据的场景。
 
+> 注：阿里云文档《QueryAccountBalance》的「授权信息」表里写的是
+> `bss:DescribeAcccount`，实测 `bssapi:QueryAccountBalance` 同样能正常
+> 查询余额，两种写法都可用。
+
 `ecs:DescribeInstances` 不能省：启停接口内部会先校验实例状态。
 若实例在 VPC 内且报权限错误，再补 `vpc:DescribeVpcs` 等基础网络查询权限。
 

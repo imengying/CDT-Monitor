@@ -157,7 +157,8 @@ export class AccountCard {
           el('span', { text: '账户余额' }),
           el('b', {
             text: humanAmount(account.balance_amount, account.balance_currency),
-            title: breakdown,
+            // 分项数据缺失时不挂空的悬浮提示
+            ...(breakdown ? { 'data-tip': breakdown } : {}),
           }),
         ),
       )
@@ -179,7 +180,7 @@ export class AccountCard {
       el(
         'div',
         { class: 'account-title' },
-        el('h3', { text: account.name, title: account.name }),
+        el('h3', { text: account.name }),
         el('span', { text: account.region_name }),
       ),
       el(
@@ -220,7 +221,7 @@ export class AccountCard {
         class: 'mini-icon',
         type: 'button',
         'aria-label': '查看历史流量',
-        title: '历史流量',
+        'data-tip': '历史流量',
         on: { click: () => this.onHistory?.(this.account) },
       },
       iconSvg(icons.chart, 17),
@@ -353,7 +354,7 @@ export class AccountCard {
       class: options.mini ? 'mini-icon' : 'icon-button',
       type: 'button',
       'aria-label': options.label,
-      title: options.label,
+      'data-tip': options.label,
       'data-action': options.key,
     }) as HTMLButtonElement
 

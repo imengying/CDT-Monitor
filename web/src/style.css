@@ -1011,6 +1011,61 @@ h3 {
   stroke-width: 1.8;
 }
 
+/* ------------------------------------------------------------------------- */
+/* 图标按钮的悬浮提示                                                          */
+/*                                                                           */
+/* 不用原生 `title`：它的浮层由操作系统绘制，固定黑底白字，无法跟随主题。     */
+/* 改用 `data-tip` + 伪元素，配色与面板一致。                                  */
+/* ------------------------------------------------------------------------- */
+[data-tip] {
+  position: relative;
+}
+
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  z-index: 60;
+  left: 50%;
+  bottom: calc(100% + 9px);
+  transform: translate(-50%, 4px);
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 10px 22px -14px rgba(20, 27, 38, 0.55);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity var(--duration-fast) ease,
+    transform var(--duration-fast) var(--ease-out),
+    visibility var(--duration-fast);
+}
+
+[data-tip]:hover:not(:disabled)::after,
+[data-tip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(-50%, 0);
+}
+
+/* 顶栏右侧的按钮靠右对齐，提示居中会被窗口边缘裁掉 */
+.topbar-actions [data-tip]::after {
+  left: auto;
+  right: 0;
+  transform: translate(0, 4px);
+}
+
+.topbar-actions [data-tip]:hover:not(:disabled)::after,
+.topbar-actions [data-tip]:focus-visible::after {
+  transform: translate(0, 0);
+}
+
 .icon-button--positive {
   color: var(--green);
 }
@@ -1747,6 +1802,21 @@ h3 {
   background: rgba(255, 255, 255, 0.58);
   border: 1px solid rgba(255, 255, 255, 0.8);
   box-shadow: 0 0 0 1px var(--line);
+}
+
+/* 提交按钮贴在表单底部右侧，视觉上与设置页的悬浮保存栏一致。 */
+.account-editor__submit {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(209, 209, 214, 0.45);
+}
+
+.account-editor__submit .button {
+  box-shadow:
+    0 18px 34px -18px rgba(20, 27, 38, 0.55),
+    0 1px 0 rgba(255, 255, 255, 0.16) inset;
 }
 
 .account-editor__head {

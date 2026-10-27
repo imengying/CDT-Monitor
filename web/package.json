@@ -10,16 +10,16 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "echarts": "^5.5.1",
-    "lucide": "^1.61.0"
+    "echarts": "^6.1.0",
+    "lucide": "^1.62.0"
   },
   "devDependencies": {
-    "@types/node": "^26.6.5",
-    "typescript": "^5.7.2",
-    "vite": "^6.0.5"
+    "@types/node": "^24.19.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
   },
   "engines": {
-    "node": ">=20.19",
+    "node": ">=24.0",
     "bun": ">=1.2"
   }
 }

@@ -560,7 +560,7 @@ export class SettingsModal {
         title: '云端实例',
         subtitle: 'ALIYUN ACCOUNTS',
       }),
-      this.formOpen ? el('span') : addButton,
+      addButton,
     )
 
     const body = this.formOpen ? this.buildAccountForm() : this.buildAccountList(accounts)
@@ -793,29 +793,18 @@ export class SettingsModal {
         'div',
         { class: 'account-editor__head' },
         el('b', { text: form.id === null ? '新增实例' : `编辑「${form.name || form.id}」` }),
-        el(
-          'div',
-          { class: 'account-editor__actions' },
-          el('button', {
-            class: 'button button--secondary button--small',
-            type: 'button',
-            text: '取消',
-            on: {
-              click: () => {
-                this.formOpen = false
-                this.form = blankAccountForm()
-                this.renderContent()
-              },
-            },
-          }),
-          el(
-            'button',
-            { class: 'button button--primary button--small', type: 'submit' },
-            el('span', { text: form.id === null ? '创建实例' : '保存修改' }),
-          ),
-        ),
       ),
       fields,
+      // 提交按钮悬浮在弹窗右下角，与其它设置页的保存栏位置一致
+      el(
+        'div',
+        { class: 'account-editor__submit' },
+        el(
+          'button',
+          { class: 'button button--primary', type: 'submit' },
+          el('span', { text: form.id === null ? '创建实例' : '保存修改' }),
+        ),
+      ),
     )
   }
 
@@ -861,8 +850,20 @@ export class SettingsModal {
     this.saving = true
     try {
       if (form.id === null) {
-        await api.createAccount(payload)
-        toast('实例已添加', 'ok')
+        const created = await api.createAccount(payload)
+        // 新建账号还没有快照，不立即采集的话卡片会一直是空的，
+        // 要等到下一轮 Cron（最长 15 分钟）才有数据。
+        // 采集失败不阻断创建：账号已经建好了，卡片会显示「等待首次同步」。
+        let collected = true
+        try {
+          await api.refreshAccount(created.id)
+        } catch {
+          collected = false
+        }
+        toast(
+          collected ? '实例已添加' : '实例已添加，首次采集失败，可稍后手动刷新',
+          collected ? 'ok' : 'warn',
+        )
       } else {
         await api.updateAccount(form.id, payload)
         toast('实例已更新', 'ok')

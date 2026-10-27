@@ -208,7 +208,8 @@ export function iconButton(options: {
     class: `icon-button${options.tone ? ` icon-button--${options.tone}` : ''}${options.className ? ` ${options.className}` : ''}`,
     type: 'button',
     'aria-label': options.label,
-    title: options.label,
+    // 不用原生 `title`：那个浮层由系统绘制，样式无法跟随主题（黑底白字）
+    'data-tip': options.label,
     on: { click: options.onClick },
   }) as HTMLButtonElement
   button.disabled = Boolean(options.disabled)
