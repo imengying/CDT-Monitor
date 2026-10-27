@@ -661,10 +661,9 @@ impl AccountRow {
             site_type: self.site(),
             site_label: self.site().label().to_string(),
             access_key_id: self.access_key_id.clone(),
-            access_key_id_masked: mask_secret(&self.access_key_id),
             region_id: self.region_id.clone(),
             region_name: RegionName::of(&self.region_id).to_string(),
-            instance_id: self.instance_id.clone(),
+            instance_id: self.instance_id.clone().unwrap_or_default(),
             traffic_threshold_gb: self.traffic_threshold_gb,
             quota_gb: self.quota_pool().quota_gb(),
             quota_label: self.quota_pool().label().to_string(),
@@ -1145,10 +1144,10 @@ pub struct AccountDto {
     pub site_type: SiteType,
     pub site_label: String,
     pub access_key_id: String,
-    pub access_key_id_masked: String,
     pub region_id: String,
     pub region_name: String,
-    pub instance_id: Option<String>,
+    /// 实例 ID：一个账号固定作用于此实例，必填。
+    pub instance_id: String,
     /// 告警阈值（GB）。0 表示不限制也不告警。
     pub traffic_threshold_gb: f64,
     /// 该地域所属池的免费额度（GB），只读展示。
@@ -1179,6 +1178,7 @@ pub struct AccountInput {
     #[serde(default)]
     pub access_key_secret: Option<String>,
     pub region_id: String,
+    /// 实例 ID（必填）：一个账号只作用于这一台实例。
     #[serde(default)]
     pub instance_id: Option<String>,
     /// 告警阈值（GB）。0 表示不限制也不告警。
@@ -1215,6 +1215,15 @@ impl AccountInput {
             .map(str::to_string)
     }
 
+    /// 实例 ID（必填）。`validate()` 已拦下空值，这里再兜一次底。
+    pub fn require_instance_id(&self) -> worker::Result<&str> {
+        self.instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| worker::Error::RustError("请填写实例 ID".to_string()))
+    }
+
     pub fn schedule_start_minutes(&self) -> Option<u32> {
         self.schedule_start_time.as_deref().and_then(parse_hhmm)
     }
@@ -1242,6 +1251,11 @@ impl AccountInput {
         if self.normalized_region().is_empty() {
             return Err("请选择地域".to_string());
         }
+        // 一个账号只作用于一台实例：留空会让熔断停机、定时开关机、
+        // 保活作用到该地域内的所有实例，必须显式指定。
+        if self.normalized_instance_id().is_none() {
+            return Err("请填写实例 ID".to_string());
+        }
         if !self.traffic_threshold_gb.is_finite() || self.traffic_threshold_gb < 0.0 {
             return Err("告警阈值不能为负数".to_string());
         }
@@ -1268,10 +1282,10 @@ pub struct AccountOverview {
     pub name: String,
     pub site_type: SiteType,
     pub site_label: String,
-    pub access_key_id_masked: String,
     pub region_id: String,
     pub region_name: String,
-    pub instance_id: Option<String>,
+    /// 实例 ID：一个账号固定作用于此实例，必填。
+    pub instance_id: String,
     /// 告警阈值（GB）。0 表示不限制也不告警。
     pub traffic_threshold_gb: f64,
     /// 该地域所属池的免费额度（GB）。
@@ -1541,10 +1555,9 @@ pub fn build_overview(
         name: account.name.clone(),
         site_type: account.site(),
         site_label: account.site().label().to_string(),
-        access_key_id_masked: mask_secret(&account.access_key_id),
         region_id: account.region_id.clone(),
         region_name: RegionName::of(&account.region_id).to_string(),
-        instance_id: account.instance_id.clone(),
+        instance_id: account.instance_id.clone().unwrap_or_default(),
         traffic_threshold_gb: account.traffic_threshold_gb,
         quota_gb: account.quota_pool().quota_gb(),
         quota_label: account.quota_pool().label().to_string(),
@@ -1574,6 +1587,44 @@ pub fn build_overview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 实例 ID 必填：留空会让熔断停机 / 定时开关机 / 保活
+    /// 作用到该地域内的所有实例。
+    #[test]
+    fn account_input_requires_instance_id() {
+        let base = AccountInput {
+            name: "测试节点".to_string(),
+            site_type: SiteType::China,
+            access_key_id: "LTAI5tTestKey123".to_string(),
+            access_key_secret: Some("secret".to_string()),
+            region_id: "cn-hongkong".to_string(),
+            instance_id: None,
+            traffic_threshold_gb: 0.0,
+            over_limit_action: OverLimitAction::NotifyOnly,
+            stop_mode: StopMode::StopCharging,
+            schedule_start_time: None,
+            schedule_stop_time: None,
+            spot_keep_alive: false,
+            enabled: true,
+        };
+
+        // 留空 / 纯空白：必须被拒
+        assert_eq!(base.validate().unwrap_err(), "请填写实例 ID");
+        let blank = AccountInput {
+            instance_id: Some("   ".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(blank.validate().unwrap_err(), "请填写实例 ID");
+
+        // 正常填写：通过，且归一化会去掉首尾空白
+        let filled = AccountInput {
+            instance_id: Some("  i-bp1abc  ".to_string()),
+            ..base.clone()
+        };
+        assert!(filled.validate().is_ok());
+        assert_eq!(filled.normalized_instance_id().as_deref(), Some("i-bp1abc"));
+        assert_eq!(filled.require_instance_id().unwrap(), "i-bp1abc");
+    }
 
     #[test]
     fn parse_offset() {

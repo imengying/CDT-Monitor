@@ -130,7 +130,7 @@ function formFromAccount(account: AccountDto): AccountForm {
     accessKeyId: account.access_key_id,
     accessKeySecret: '',
     regionId: account.region_id,
-    instanceId: account.instance_id ?? '',
+    instanceId: account.instance_id,
     trafficThresholdGb: account.traffic_threshold_gb,
     overLimitAction: account.over_limit_action,
     stopMode: account.stop_mode,
@@ -374,6 +374,7 @@ export class SettingsModal {
       suffix?: string
       min?: string
       step?: string
+      required?: boolean
     } = {},
   ): HTMLElement {
     const input = textInput({
@@ -384,6 +385,7 @@ export class SettingsModal {
       min: options.min,
       step: options.step,
     })
+    if (options.required) input.required = true
     input.addEventListener('input', () => onInput(input.value))
     return inputShell({ icon: options.icon, input, suffix: options.suffix })
   }
@@ -581,14 +583,7 @@ export class SettingsModal {
           {},
           el('b', { text: account.name }),
           el('small', {
-            text: [
-              account.region_name,
-              account.access_key_id_masked,
-              account.traffic_threshold_gb > 0
-                ? `阈值 ${account.traffic_threshold_gb} GB`
-                : '未设阈值',
-              account.enabled ? '' : '已停用',
-            ]
+            text: [account.region_name, account.enabled ? '' : '已停用']
               .filter(Boolean)
               .join(' · '),
           }),
@@ -693,7 +688,7 @@ export class SettingsModal {
         'AccessKey ID',
         this.line(form.accessKeyId, (value) => {
           this.form.accessKeyId = value
-        }, { placeholder: 'LTAI5t…' }),
+        }, { type: 'password', placeholder: 'LTAI5t…' }),
       ),
       field(
         'AccessKey Secret',
@@ -711,10 +706,10 @@ export class SettingsModal {
         }),
       ),
       field(
-        '实例 ID',
+        '实例 ID *',
         this.line(form.instanceId, (value) => {
           this.form.instanceId = value
-        }, { placeholder: 'i-bp…' }),
+        }, { placeholder: 'i-bp…', required: true }),
       ),
       field(
         '告警阈值（GB）',
@@ -840,13 +835,17 @@ export class SettingsModal {
       toast('新增账号必须填写 AccessKey Secret', 'warn')
       return
     }
+    if (!form.instanceId.trim()) {
+      toast('请填写实例 ID', 'warn')
+      return
+    }
 
     const payload: AccountInput = {
       name: form.name.trim(),
       site_type: form.siteType,
       access_key_id: form.accessKeyId.trim(),
       region_id: form.regionId,
-      instance_id: form.instanceId.trim() || null,
+      instance_id: form.instanceId.trim(),
       traffic_threshold_gb: form.trafficThresholdGb,
       over_limit_action: form.overLimitAction,
       stop_mode: form.stopMode,
@@ -921,7 +920,7 @@ export class SettingsModal {
             '站点公钥 Site Key',
             this.line(this.turnstileDraft.siteKey, (value) => {
               this.turnstileDraft.siteKey = value
-            }, { placeholder: '0x4AAAAAAAA…' }),
+            }, { type: 'password', placeholder: '0x4AAAAAAAA…' }),
           ),
           this.labeledField(
             '私钥 Secret Key',

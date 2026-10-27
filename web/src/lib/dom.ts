@@ -218,7 +218,17 @@ export function iconButton(options: {
 
 /** 字段容器：大写标签 + 内容。 */
 export function field(label: string, ...children: Child[]): HTMLElement {
-  return el('div', { class: 'field' }, el('label', { text: label }), ...children)
+  // 标签以 `*` 结尾表示必填：渲染时把星号拆出来单独着色
+  const required = label.endsWith('*')
+  const labelNode = required
+    ? el(
+        'label',
+        {},
+        el('span', { text: label.slice(0, -1) }),
+        el('i', { class: 'field-required', text: '*', title: '必填' }),
+      )
+    : el('label', { text: label })
+  return el('div', { class: 'field' }, labelNode, ...children)
 }
 
 /** 带图标外壳的输入框。 */

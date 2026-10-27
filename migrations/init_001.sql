@@ -38,9 +38,10 @@ CREATE TABLE IF NOT EXISTS accounts (
   access_key_id               TEXT    NOT NULL,
   -- Base64(24 字节 Nonce + XChaCha20Poly1305 密文)
   encrypted_access_key_secret TEXT    NOT NULL,
-  -- 一个账号对应一个地域、一台实例
+  -- 一个账号对应一个地域、一台实例。实例 ID 必填：
+  -- 留空会让熔断停机 / 定时开关机 / 保活作用到该地域内所有实例。
   region_id                   TEXT    NOT NULL DEFAULT 'cn-hongkong',
-  instance_id                 TEXT,
+  instance_id                 TEXT    NOT NULL,
   -- 告警阈值（GB）。0 表示不限制也不告警；大于 0 时累计流量到线即告警。
   -- 实际比较的额度按 region_id 决定：中国内地地域 20 GB，其余 200 GB。
   traffic_threshold_gb        REAL    NOT NULL DEFAULT 0,

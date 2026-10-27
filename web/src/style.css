@@ -1196,9 +1196,14 @@ h3 {
 
 .account-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
   gap: 16px;
   margin-top: 20px;
+}
+
+/* 卡片不必铺满整行：上限收窄后一行能放更多张，视觉密度更高 */
+.account-grid > * {
+  max-width: 440px;
 }
 
 .account-card {
@@ -1574,7 +1579,7 @@ h3 {
   border-radius: 26px;
   overflow: hidden;
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
+  grid-template-rows: auto auto 1fr;
   background: var(--panel-soft);
   animation: modal-in 0.46s var(--ease-emphasis) both;
 }
@@ -1662,7 +1667,7 @@ h3 {
 }
 
 .settings-content {
-  padding: 26px 30px 40px;
+  padding: 26px 30px 84px;
   overflow: auto;
   min-height: 0;
   overscroll-behavior: contain;
@@ -1744,12 +1749,28 @@ h3 {
 }
 
 .settings-footer {
+  position: absolute;
+  right: 30px;
+  bottom: 24px;
   display: flex;
   justify-content: flex-end;
   gap: 12px;
-  padding: 16px 30px 20px;
-  border-top: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.46);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.settings-footer > * {
+  pointer-events: auto;
+}
+
+/* 悬浮在内容之上，给按钮一点浮起的层次，避免和正文糊在一起 */
+.settings-footer .button--primary {
+  box-shadow:
+    0 18px 34px -18px rgba(20, 27, 38, 0.55),
+    0 1px 0 rgba(255, 255, 255, 0.16) inset;
 }
 
 .account-settings-list {
@@ -2155,6 +2176,11 @@ h3 {
     grid-template-columns: 1fr;
   }
 
+  /* 窄屏让卡片占满可用宽度，不再受桌面的 max-width 限制 */
+  .account-grid > * {
+    max-width: none;
+  }
+
   .toggle-list {
     grid-template-columns: 1fr;
   }
@@ -2301,7 +2327,7 @@ h3 {
   }
 
   .settings-content {
-    padding: 24px 18px;
+    padding: 24px 18px 76px;
     overflow-x: hidden;
   }
 
@@ -2310,7 +2336,8 @@ h3 {
   }
 
   .settings-footer {
-    padding: 14px 18px;
+    right: 18px;
+    bottom: 18px;
   }
 
   .section-title-row {

@@ -308,8 +308,7 @@ bun run dev:web                  # :5173
 | 表 | 用途 |
 |---|---|
 | `settings` | KV 配置（时区、日报、TG/Bark 密文、Turnstile 密文） |
-| `accounts` | 阿里云账号（AK、加密 Secret、地域、实例 ID、告警阈值、策略、定时、保活） |
-| `account_snapshots` | 每账号一行最新状态，首页只读此表 |
+| `accounts` | 阿里云账号（AK、加密 Secret、地域、实例 ID、告警阈值、策略、定时、保活） || `account_snapshots` | 每账号一行最新状态，首页只读此表 |
 | `traffic_hourly` / `traffic_daily` | 流量采样（账期累计值），索引 `(account_id, recorded_at)` |
 | `jobs` | 异步任务状态 |
 | `action_logs` | 自动化动作 / 告警 / 登录审计 |
@@ -318,6 +317,9 @@ bun run dev:web                  # :5173
 
 时间戳统一 Unix 毫秒 `INTEGER`；布尔存 `0/1`（Rust 侧以 `i64` 承载后转换，
 `serde-wasm-bindgen` 反序列化 `bool` 只接受 JS `true/false`）。
+
+`accounts.instance_id` 为 `NOT NULL`：一个账号固定作用于一个地域内的一台实例。
+留空会让熔断停机、定时开关机、保活作用到该地域下的所有实例，因此实例 ID 必填。
 
 ---
 
@@ -365,29 +367,58 @@ CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["cdt:ListCdtInternetTraffic"],
+      "Action": "cdt:ListCdtInternetTraffic",
       "Resource": "*"
     },
     {
       "Effect": "Allow",
-      "Action": ["bssopenapi:QueryAccountBalance"],
+      "Action": "bssapi:QueryAccountBalance",
       "Resource": "*"
     },
     {
       "Effect": "Allow",
-      "Action": ["ecs:DescribeInstances"],
+      "Action": "ecs:DescribeInstances",
       "Resource": "*"
     },
     {
       "Effect": "Allow",
-      "Action": ["ecs:StartInstance", "ecs:StopInstance"],
+      "Action": [
+        "ecs:StartInstance",
+        "ecs:StopInstance"
+      ],
       "Resource": "acs:ecs:<region>:<主账号 UID>:instance/<实例 ID>"
     }
   ]
 }
 ```
 
-`bssopenapi:QueryAccountBalance` 是可选的 —— 不授权时余额一栏显示 `—`
+#### ARN 里三段占位怎么填
+
+`acs:ecs:<region>:<主账号 UID>:instance/<实例 ID>` 三段都要替换成实际值：
+
+| 占位 | 含义 | 说明 | 示例 |
+|---|---|---|---|
+| `<region>` | 地域 ID | 目标实例所在地域。可用 `*` 表示对所有地域生效 | `cn-hongkong` |
+| `<主账号 UID>` | 阿里云账号 ID | 资源所属的主账号。登录控制台后把鼠标移到右上角头像即可看到。可用 `*` 表示不限制账号 | `1234567890123456` |
+| `<实例 ID>` | ECS 实例 ID | 要授权的具体实例，`instance` 后**必须带斜杠 `/`** | `i-bp1234567890abcdef` |
+
+本项目一个账号固定对应一个地域和一台实例，三段都写实际值即可，不必用通配符。
+通配符会把权限放大到该账号下达所有地域/实例，与「一账号一实例」的模型不符：
+
+```json
+"Resource": "acs:ecs:cn-hongkong:1234567890123456:instance/i-bp1234567890abcdef"
+```
+
+需要授权多台实例时，`Resource` 写成数组：
+
+```json
+"Resource": [
+  "acs:ecs:cn-hongkong:1234567890123456:instance/i-bp1111111111abcdef",
+  "acs:ecs:cn-hangzhou:1234567890123456:instance/i-bp2222222222abcdef"
+]
+```
+
+`bssapi:QueryAccountBalance` 是可选的 —— 不授权时余额一栏显示 `—`
 （通知里显示「未知」），其余功能不受影响，适合不想让程序读财务数据的场景。
 
 `ecs:DescribeInstances` 不能省：启停接口内部会先校验实例状态。

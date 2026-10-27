@@ -106,10 +106,9 @@ export interface AccountOverview {
   name: string
   site_type: SiteType
   site_label: string
-  access_key_id_masked: string
   region_id: string
   region_name: string
-  instance_id: string | null
+  instance_id: string
   traffic_threshold_gb: number
   quota_gb: number
   quota_label: string
@@ -192,10 +191,9 @@ export interface AccountDto {
   site_type: SiteType
   site_label: string
   access_key_id: string
-  access_key_id_masked: string
   region_id: string
   region_name: string
-  instance_id: string | null
+  instance_id: string
   traffic_threshold_gb: number
   quota_gb: number
   quota_label: string
@@ -220,7 +218,7 @@ export interface AccountInput {
   /** 编辑时留空表示沿用原密钥 */
   access_key_secret?: string
   region_id: string
-  instance_id: string | null
+  instance_id: string
   traffic_threshold_gb: number
   over_limit_action: OverLimitAction
   stop_mode: StopMode
