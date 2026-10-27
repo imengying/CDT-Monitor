@@ -453,50 +453,13 @@ h3 {
 
 .login-card-stack {
   width: min(100%, 500px);
-  display: grid;
-  gap: 22px;
   animation: stage-in 0.7s var(--ease-out) both;
-}
-
-.login-brand {
-  text-align: center;
-}
-
-.login-brand .brand-lockup {
-  justify-content: center;
-}
-
-.login-brand > p {
-  color: var(--muted);
-  font-size: 1.05rem;
-  line-height: 1.7;
-  margin: 18px 0 0;
 }
 
 .auth-card {
   width: min(100%, 500px);
   padding: clamp(30px, 5vw, 54px);
   border-radius: 28px;
-}
-
-.large-icon {
-  width: 70px;
-  height: 70px;
-  border-radius: 20px;
-  background: #fff;
-  display: grid;
-  place-items: center;
-  margin-bottom: 30px;
-  box-shadow:
-    var(--shadow-sm),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.95),
-    0 0 0 1px var(--line);
-}
-
-.large-icon svg {
-  width: 28px;
-  height: 28px;
-  stroke-width: 1.8;
 }
 
 /* ------------------------------------------------------------------------- */

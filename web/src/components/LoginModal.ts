@@ -21,9 +21,7 @@
 
 import { api, ApiError } from '@/api/client'
 import {
-  brandLockup,
   el,
-  eyebrow,
   field,
   iconSvg,
   inputShell,
@@ -72,7 +70,7 @@ export class LoginModal {
     this.submitButton = el(
       'button',
       { class: 'button button--primary button--full', type: 'submit' },
-      el('span', { text: '安全登录' }),
+      el('span', { text: '登录' }),
     ) as HTMLButtonElement
 
     this.widgetHost = el('div', { class: 'cf-turnstile' })
@@ -91,8 +89,6 @@ export class LoginModal {
           },
         },
       },
-      el('div', { class: 'large-icon' }, iconSvg(icons.shield, 28)),
-      eyebrow('ADMIN ACCESS'),
       el('h1', { text: '欢迎回来' }),
       el('p', { class: 'muted', text: '使用管理员凭据进入控制台' }),
       el(
@@ -109,17 +105,7 @@ export class LoginModal {
     this.element = el(
       'main',
       { class: 'login-shell' },
-      el(
-        'div',
-        { class: 'login-card-stack' },
-        el(
-          'div',
-          { class: 'login-brand' },
-          brandLockup(true),
-          el('p', { text: '阿里云 CDT 流量与实例自动化控制台' }),
-        ),
-        this.card,
-      ),
+      el('div', { class: 'login-card-stack' }, this.card),
     )
 
     this.usernameInput.addEventListener('input', () => this.syncSubmitState())
@@ -265,7 +251,7 @@ export class LoginModal {
       this.submitButton,
       ...(this.submitting
         ? [iconSvg(icons.spinner, 18, 'spin'), el('span', { text: '验证中…' })]
-        : [iconSvg(icons.arrowRight, 18), el('span', { text: '安全登录' })]),
+        : [el('span', { text: '登录' })]),
     )
   }
 
