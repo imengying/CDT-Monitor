@@ -14,7 +14,7 @@ import { ApiError, api, type NotifyChannel } from '@/api/client'
 import { store, toast } from '@/lib/store'
 
 /** 会话失效：清空数据并回到登录页。 */
-export function handleUnauthorized(notifyUser = true): void {
+function handleUnauthorized(notifyUser = true): void {
   store.patch({
     phase: 'unauthenticated',
     overview: null,
@@ -104,7 +104,7 @@ export async function loadOverview(): Promise<void> {
 // 设置
 // ---------------------------------------------------------------------------
 
-export async function loadSettings(): Promise<void> {
+async function loadSettings(): Promise<void> {
   try {
     const settings = await api.settings()
     store.patch({ settings })

@@ -30,6 +30,9 @@
   --ink: #181a1d;
   --muted: #6d727b;
   --muted-soft: #8a9098;
+  /* 上游沿用 iOS 系统色，与 --ink / --muted-soft 略有差异，单独留令牌 */
+  --ink-strong: #1c1c1e;
+  --muted-icon: #8e8e93;
   --line: rgba(163, 169, 177, 0.34);
   --line-strong: rgba(118, 125, 135, 0.42);
   --inner-line: rgba(255, 255, 255, 0.9);
@@ -218,16 +221,6 @@ h3 {
   color: var(--green);
 }
 
-.badge-brand {
-  background: var(--blue-soft);
-  color: var(--blue);
-}
-
-.badge-muted {
-  background: rgba(225, 229, 233, 0.72);
-  color: var(--muted);
-}
-
 /* 原生 select 的外壳样式（与 .input-shell 同一套内阴影） */
 .native-select {
   width: 100%;
@@ -242,7 +235,7 @@ h3 {
   background-position: right 12px center;
   background-size: 17px;
   color: var(--ink);
-  font-size: 0.9375rem;
+  font-size: 15px;
   cursor: pointer;
   box-shadow:
     inset 0 1px 3px rgba(28, 28, 30, 0.045),
@@ -370,8 +363,7 @@ h3 {
 
 .glass-card,
 .settings-panel,
-.chart-modal,
-.instance-settings-modal {
+.chart-modal {
   background: var(--panel);
   border: 1px solid var(--inner-line);
   box-shadow: 0 0 0 1px var(--line), var(--shadow-lg);
@@ -431,6 +423,10 @@ h3 {
   padding: 32px;
   display: grid;
   place-items: center;
+  grid-template-columns: minmax(320px, 500px);
+  gap: 0;
+  align-content: center;
+  justify-content: center;
 }
 
 .center-stage {
@@ -442,13 +438,6 @@ h3 {
   width: 26px;
   height: 26px;
   color: var(--muted-soft);
-}
-
-.login-shell {
-  grid-template-columns: minmax(320px, 500px);
-  gap: 0;
-  align-content: center;
-  justify-content: center;
 }
 
 .login-card-stack {
@@ -484,10 +473,6 @@ h3 {
 .field {
   min-width: 0;
   position: relative;
-}
-
-.field--wide {
-  grid-column: 1 / -1;
 }
 
 .field > label {
@@ -589,7 +574,7 @@ h3 {
 
 .suffix {
   flex: 0 0 auto;
-  color: #8e8e93;
+  color: var(--muted-icon);
   font-size: 13px;
   font-weight: 700;
   white-space: nowrap;
@@ -613,165 +598,6 @@ h3 {
   border-radius: 10px;
   font-size: 13px;
   box-shadow: inset 0 0 0 1px rgba(201, 60, 71, 0.18);
-}
-
-/* 下拉选择 */
-.select-control {
-  position: relative;
-  min-width: 0;
-}
-
-.select-trigger {
-  width: 100%;
-  min-height: 52px;
-  border: 0;
-  border-radius: 12px;
-  padding: 0 14px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 18px;
-  align-items: center;
-  gap: 10px;
-  color: var(--ink);
-  background: rgba(255, 255, 255, 0.84);
-  box-shadow:
-    inset 0 0 0 1px var(--line-strong),
-    0 1px 0 rgba(255, 255, 255, 0.92),
-    var(--shadow-sm);
-  transition:
-    background var(--duration-fast) ease,
-    box-shadow var(--duration-fast) ease;
-  cursor: pointer;
-  text-align: left;
-}
-
-.select-trigger:hover {
-  background: rgba(255, 255, 255, 0.98);
-  box-shadow:
-    inset 0 0 0 1px rgba(98, 105, 115, 0.5),
-    0 1px 0 white,
-    var(--shadow-sm);
-}
-
-.select-control.open .select-trigger {
-  background: #fff;
-  box-shadow:
-    inset 0 0 0 1.5px var(--ink),
-    0 0 0 3px rgba(50, 103, 178, 0.08);
-}
-
-.select-trigger__label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.select-trigger code {
-  color: var(--muted-soft);
-  font-size: 11px;
-  font-weight: 650;
-  white-space: nowrap;
-}
-
-.select-chevron {
-  grid-column: 3;
-  width: 17px;
-  height: 17px;
-  color: #5f6670;
-  pointer-events: none;
-  transition:
-    transform var(--duration-base) var(--ease-out),
-    color var(--duration-fast) ease;
-}
-
-.select-control.open .select-chevron {
-  color: var(--ink);
-  transform: rotate(180deg);
-}
-
-.select-popover {
-  position: fixed;
-  z-index: 120;
-  padding: 8px;
-  display: grid;
-  gap: 4px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  border: 1px solid rgba(163, 169, 177, 0.38);
-  border-radius: 14px;
-  background: #fdfdfe;
-  box-shadow:
-    0 28px 54px -30px rgba(20, 27, 38, 0.56),
-    inset 0 1px 0 rgba(255, 255, 255, 0.95);
-}
-
-.select-popover::-webkit-scrollbar {
-  width: 8px;
-}
-
-.select-popover::-webkit-scrollbar-thumb {
-  border: 2px solid transparent;
-  border-radius: 99px;
-  background: #aeb4bc;
-  background-clip: padding-box;
-}
-
-.select-option {
-  width: 100%;
-  min-height: 48px;
-  border: 0;
-  border-radius: 8px;
-  padding: 0 11px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 12px;
-  color: var(--ink);
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-  transition:
-    background var(--duration-fast) ease,
-    color var(--duration-fast) ease;
-}
-
-.select-option:hover,
-.select-option.active {
-  background: #eef3f8;
-}
-
-.select-option[aria-selected='true'] {
-  background: var(--blue-soft);
-}
-
-.select-option__label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
-  font-weight: 760;
-}
-
-.select-option__aside {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.select-option__aside code {
-  color: #7d8694;
-  font-size: 11px;
-  font-weight: 650;
-  white-space: nowrap;
-}
-
-.select-option__aside svg {
-  width: 16px;
-  height: 16px;
-  color: var(--blue);
 }
 
 /* 分段控件 */
@@ -812,7 +638,7 @@ h3 {
 
 .segmented button.active {
   background: rgba(255, 255, 255, 0.88);
-  color: #1c1c1e;
+  color: var(--ink-strong);
   box-shadow:
     0 4px 12px -8px rgba(0, 0, 0, 0.4),
     inset 0 0 0 1px rgba(255, 255, 255, 0.9);
@@ -994,6 +820,12 @@ h3 {
     box-shadow var(--duration-fast) ease;
 }
 
+/* 卡片内的小图标按钮比顶栏的略小 */
+.mini-icon {
+  width: 36px;
+  height: 36px;
+}
+
 .icon-button:hover:not(:disabled),
 .mini-icon:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.98);
@@ -1072,11 +904,6 @@ h3 {
 
 .icon-button--danger {
   color: var(--red);
-}
-
-.mini-icon {
-  width: 36px;
-  height: 36px;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1523,13 +1350,13 @@ h3 {
 .empty-state > svg {
   width: 35px;
   height: 35px;
-  color: #8e8e93;
+  color: var(--muted-icon);
 }
 
 .empty-state h3 {
   margin: 8px 0 0;
   font-size: 1.05rem;
-  color: #1c1c1e;
+  color: var(--ink-strong);
 }
 
 .empty-state p {
@@ -1541,7 +1368,7 @@ h3 {
   display: flex;
   gap: 5px;
   align-items: center;
-  color: #1c1c1e;
+  color: var(--ink-strong);
   font-size: 12px;
   font-weight: 750;
   margin-top: 8px;
@@ -1715,6 +1542,7 @@ h3 {
   align-items: center;
 }
 
+/* 标题 + 右侧操作（添加按钮 / 刷新）分布在两端 */
 .section-title-row {
   justify-content: space-between;
   gap: 20px;
@@ -1886,57 +1714,6 @@ h3 {
   height: 28px;
 }
 
-/* 实例配置弹窗 */
-.instance-settings-modal {
-  position: relative;
-  width: min(560px, 94vw);
-  max-height: min(82vh, 720px);
-  border-radius: 24px;
-  overflow: hidden;
-  display: grid;
-  grid-template-rows: auto 1fr auto;
-  background: var(--panel-soft);
-  animation: modal-in 0.46s var(--ease-emphasis) both;
-}
-
-.instance-settings-modal > header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 24px 28px 16px;
-  gap: 16px;
-}
-
-.instance-settings-modal > header > div {
-  min-width: 0;
-  flex: 1;
-}
-
-.instance-settings-modal > header h2 {
-  margin: 0;
-  font-size: 1.35rem;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.instance-settings-modal__body {
-  padding: 4px 28px 20px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.instance-settings-modal > footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 12px;
-  padding: 16px 28px 24px;
-  border-top: 1px solid var(--line);
-}
-
 /* 历史流量弹窗 */
 .chart-modal {
   position: relative;
@@ -1958,12 +1735,6 @@ h3 {
   min-width: 0;
   min-height: 300px;
   padding: 12px 22px 0 10px;
-}
-
-.chart-loader {
-  display: block;
-  margin: 120px auto;
-  color: #8e8e93;
 }
 
 /* 日志抽屉 */
@@ -2090,16 +1861,14 @@ h3 {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #8e8e93;
+  background: var(--muted-icon);
 }
 
-.log-dot--warning,
 .log-dot--error {
   background: var(--red);
 }
 
-.log-dot--info,
-.log-dot--audit {
+.log-dot--info {
   background: var(--green);
 }
 
@@ -2154,10 +1923,6 @@ h3 {
 
 .toast--error svg {
   color: var(--red);
-}
-
-.toast--info svg {
-  color: var(--blue);
 }
 
 .toast-close {
@@ -2387,30 +2152,6 @@ h3 {
     align-items: flex-start;
     flex-wrap: wrap;
     gap: 12px;
-  }
-
-  .instance-settings-modal {
-    width: 100%;
-    max-height: calc(100dvh - 24px);
-    border-radius: 20px;
-  }
-
-  .instance-settings-modal > header {
-    padding: 18px 20px 14px;
-  }
-
-  .instance-settings-modal__body {
-    padding: 4px 20px 16px;
-  }
-
-  .instance-settings-modal > footer {
-    padding: 14px 20px 20px;
-    gap: 10px;
-  }
-
-  .instance-settings-modal > footer .button {
-    flex: 1;
-    justify-content: center;
   }
 
   .chart-modal {

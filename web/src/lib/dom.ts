@@ -101,7 +101,7 @@ export function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 /** 批量追加子节点。 */
-export function appendChildren(parent: Element, children: Child[]): void {
+function appendChildren(parent: Element, children: Child[]): void {
   for (const child of children) {
     if (child === null || child === undefined || child === false) continue
     parent.append(typeof child === 'string' || typeof child === 'number' ? String(child) : child)

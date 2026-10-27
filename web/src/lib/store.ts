@@ -41,7 +41,7 @@ export interface AppState {
 }
 
 /** 初始状态。 */
-export function initialState(): AppState {
+function initialState(): AppState {
   return {
     phase: 'booting',
     session: null,
