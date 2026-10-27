@@ -1,63 +1,57 @@
 /**
  * 账号卡片
  * ============================================================================
- * 一张卡片对应一个阿里云账号，典型部署为一个账号一台实例：
+ * 结构照搬上游 `AccountCard`：
  *
- *   头部：状态图标 + 名称/地域 + 状态胶囊 + 余额/阈值
- *   流量：本月合计（大号数字）+ 单条进度条 + 百分比/账期
- *   实例：主实例的规格、公网 IP、抢占式标记与保活开关
- *   底部：更新时间 + 设置/开机/关机按钮
+ *   ┌ 头部：状态图标 · 名称/地域 · 状态胶囊/余额 ┐
+ *   ├ 流量：大号数字 + 历史按钮 · 进度条 · 百分比/阈值 ┤
+ *   └ 底部：最近同步时间 · 设置/刷新/开机/关机         ┘
  *
  * 按钮的执行态由 `busy` 集合驱动：提交后立即禁用并显示 spinner，
- * 直到 Job 轮询结束（或失败），避免连点触发服务端 409。
+ * 直到接口返回，避免连点触发服务端 409。
  */
 
-import {
-  api,
-  humanAmount,
-
-  relativeTime,
-  type AccountOverview,
-  type InstanceInfo,
-} from '@/api/client'
-import { el, iconSvg, replaceChildren } from '@/lib/dom'
+import { api, humanAmount, relativeTime, type AccountOverview, type InstanceInfo } from '@/api/client'
+import { el, iconSvg, iconButton, replaceChildren } from '@/lib/dom'
 import { icons, type IconNode } from '@/lib/icons'
 import { afterAccountChanged, reportError } from '@/lib/actions'
 import { toast } from '@/lib/store'
 
+/** 实例状态 → 视觉色调。 */
+function statusTone(status: string, enabled: boolean): string {
+  if (!enabled) return 'negative'
+  if (status === 'running') return 'positive'
+  if (status === 'stopped') return 'negative'
+  if (!status) return 'neutral'
+  return 'warning'
+}
+
 /** 实例状态中文名。 */
-function instanceStatusLabel(status: string): string {
+function statusLabel(status: string): string {
   const map: Record<string, string> = {
-    Running: '运行中',
-    Stopped: '已停止',
-    Starting: '启动中',
-    Stopping: '停止中',
-    Pending: '创建中',
+    running: '运行中',
+    stopped: '已停止',
+    starting: '启动中',
+    stopping: '停止中',
+    pending: '等待中',
   }
-  return map[status] ?? status ?? '未知'
+  return map[status] ?? (status ? '未知' : '无实例')
 }
 
 /**
  * 计算账号数据的渲染指纹。
  *
  * 排除 `snapshot_updated_at`（采集时间戳，不代表可见内容变化）。
- * 用 JSON 序列化就够：字段都是原始类型与数组，顺序稳定。
  */
 function signatureOf(account: AccountOverview): string {
   return JSON.stringify({
     id: account.id,
     name: account.name,
-    site_label: account.site_label,
-    ak: account.access_key_id_masked,
+    site: account.site_label,
     region: account.region_name,
     threshold: account.traffic_threshold_gb,
     quota: account.quota_gb,
-    action: account.over_limit_action,
-    actionLabel: account.over_limit_action_label,
     stopMode: account.stop_mode,
-    stopModeLabel: account.stop_mode_label,
-    start: account.schedule_start_time,
-    stop: account.schedule_stop_time,
     spot: account.spot_keep_alive,
     enabled: account.enabled,
     balance: account.balance_amount,
@@ -66,49 +60,23 @@ function signatureOf(account: AccountOverview): string {
     credit: account.balance_credit,
     used: account.traffic_used_gb,
     percent: account.percentage,
-    overThreshold: account.over_threshold,
-    month: account.billing_month,
     triggered: account.threshold_triggered,
     instances: account.instances.map((instance) => ({
       id: instance.instance_id,
-      name: instance.instance_name,
-      type: instance.instance_type,
-      region: instance.region_id,
       status: instance.status,
-      pub: instance.public_ip,
-      priv: instance.private_ip,
-      charge: instance.instance_charge_type,
-      spot: instance.spot,
       keep: instance.keep_alive,
     })),
   })
-}
-
-/** 按钮描述。 */
-interface ActionSpec {
-  key: string
-  label: string
-  icon: IconNode
-  className: string
-  /** 仅图标按钮时的悬浮提示。 */
-  title?: string
-  disabled?: boolean
-  onClick: () => Promise<void> | void
 }
 
 /** 账号卡片。 */
 export class AccountCard {
   private root: HTMLElement
   private account: AccountOverview
-  /** 已渲染数据的指纹，用于跳过无变化的重建。 */
   private signature = ''
 
-  /** 正在执行中的操作键：`refresh` 或 `${instanceId}:${action}`。 */
+  /** 正在执行中的操作键：`refresh` / `start` / `stop` / `keepalive`。 */
   private readonly busy = new Set<string>()
-  /** 逐实例保活的即时覆盖值（避免等整页刷新）。 */
-  private readonly keepAliveOverride = new Map<string, boolean>()
-  /** 已注册的按钮，用于就地刷新状态（不重建 DOM）。 */
-  private buttons: { spec: ActionSpec; node: HTMLButtonElement }[] = []
 
   constructor(
     account: AccountOverview,
@@ -120,7 +88,6 @@ export class AccountCard {
     this.root = this.build()
   }
 
-  /** 当前 DOM 节点。 */
   get element(): HTMLElement {
     return this.root
   }
@@ -128,57 +95,30 @@ export class AccountCard {
   /**
    * 用新数据更新。
    *
-   * 只有**真正变化**时才重建 DOM。60 秒一次的静默轮询在数据没变时
-   * 会带着完全相同的对象进来，若无条件 `rebuild()` 会：
-   * * 让正在聚焦的按钮丢焦点（键盘用户无法连续操作）
-   * * 重置滚动位置（长实例列表里尤其恼人）
-   * * 白白丢弃一遍 DOM 与事件监听
-   *
-   * `snapshot_updated_at` 不参与比较：它是采集时间戳，只要真实数据
-   * 没变就不值得为它重建整张卡片。
+   * 只有真正变化时才重建 DOM：静默轮询的数据经常一模一样，
+   * 无条件重建会让正在聚焦的按钮丢焦点、重置滚动位置。
    */
   update(account: AccountOverview): void {
-    const nextSignature = signatureOf(account)
-    if (nextSignature === this.signature) {
-      // 数据没变，只刷新一下「更新于 x 分钟前」这类相对时间文本
+    const next = signatureOf(account)
+    if (next === this.signature) {
       this.account = account
       this.refreshRelativeTime(account)
       return
     }
-    this.account = account
-    this.signature = nextSignature
-    this.rebuild()
-  }
-
-  /** 刷新「更新于 …」文本（不重建 DOM）。 */
-  private refreshRelativeTime(account: AccountOverview): void {
-    const node = this.root.querySelector<HTMLElement>('[data-role="updated-at"]')
-    if (!node) return
-    node.textContent = account.snapshot_updated_at
-      ? `更新于 ${relativeTime(account.snapshot_updated_at)}`
-      : '尚未采集'
-  }
-
-  /** 重建 DOM 并保持节点位置。 */
-  private rebuild(): void {
     const previous = this.root
-    this.signature = signatureOf(this.account)
+    this.account = account
+    this.signature = next
     this.root = this.build()
     previous.replaceWith(this.root)
   }
 
-  /** 只刷新按钮的忙碌态（不重建整张卡片，保留滚动位置与焦点）。 */
-  private syncButtons(): void {
-    for (const { spec, node } of this.buttons) {
-      const busy = this.busy.has(spec.key)
-      node.disabled = busy || Boolean(spec.disabled)
-      replaceChildren(
-        node,
-        ...(busy
-          ? [iconSvg(icons.spinner, 12, 'animate-spin'), el('span', { text: spec.label })]
-          : [iconSvg(spec.icon, 12), el('span', { text: spec.label })]),
-      )
-    }
+  /** 刷新「同步于 …」文本（不重建 DOM）。 */
+  private refreshRelativeTime(account: AccountOverview): void {
+    const node = this.root.querySelector<HTMLElement>('[data-role="updated-at"]')
+    if (!node) return
+    node.textContent = account.snapshot_updated_at
+      ? relativeTime(account.snapshot_updated_at)
+      : '等待首次同步'
   }
 
   // -------------------------------------------------------------------------
@@ -186,146 +126,72 @@ export class AccountCard {
   // -------------------------------------------------------------------------
 
   private build(): HTMLElement {
-    this.buttons = []
+    const account = this.account
     return el(
       'article',
       {
-        class: 'card card-hover',
-        style: { padding: '20px 22px' },
+        class: `glass-card account-card${account.threshold_triggered ? ' account-card--alert' : ''}`,
       },
       this.buildHeader(),
       this.buildTrafficBlock(),
-      this.buildPrimaryInstanceRow(),
-      this.buildFooterRow(),
-      ...(this.account.threshold_triggered ? [this.buildThresholdBanner()] : []),
+      this.buildFooter(),
     )
   }
 
-  /** 卡片头部：状态图标 + 名称/地域 + 状态胶囊 + 费用与余额。 */
+  /** 头部：状态图标 + 名称/地域 + 状态胶囊 + 余额与额度。 */
   private buildHeader(): HTMLElement {
     const account = this.account
-    // 主实例（单实例部署时即唯一实例）
     const primary = account.instances[0]
     const status = primary?.status.toLowerCase() ?? ''
-    const tone =
-      !account.enabled ? 'negative' : status === 'running' ? 'positive' : status === 'stopped' ? 'negative' : 'warning'
-    const toneColor =
-      tone === 'positive'
-        ? 'var(--color-ok)'
-        : tone === 'negative'
-          ? 'var(--color-ink-subtle)'
-          : 'var(--color-warn)'
-    const toneBg =
-      tone === 'positive'
-        ? 'var(--color-ok-soft)'
-        : tone === 'negative'
-          ? 'var(--color-surface-muted)'
-          : 'var(--color-warn-soft)'
+    const tone = statusTone(status, account.enabled)
+    const text = account.enabled ? statusLabel(status) : '已停用'
 
-    const statusText = !account.enabled
-      ? '已停用'
-      : primary
-        ? instanceStatusLabel(primary.status)
-        : '无实例'
+    const billing = el('div', { class: 'account-billing' })
+
+    if (account.balance_amount !== null) {
+      const breakdown = this.balanceBreakdown()
+      const balance = el(
+        'div',
+        {},
+        el('span', { text: '账户余额' }),
+        el('b', {
+          text: humanAmount(account.balance_amount, account.balance_currency),
+          title: breakdown,
+        }),
+      )
+      billing.append(balance)
+    }
+
+    billing.append(
+      el(
+        'div',
+        {},
+        el('span', { text: '本月额度' }),
+        el('b', { text: `${account.quota_gb.toFixed(0)} GB` }),
+      ),
+      el('small', { text: account.site_label }),
+    )
 
     return el(
       'header',
-      {
-        class: 'grid items-start gap-3',
-        style: { gridTemplateColumns: '40px minmax(0, 1fr) auto' },
-      },
+      { class: 'account-card__header' },
+      el('div', { class: `status-icon ${tone}` }, iconSvg(icons.server, 20)),
       el(
         'div',
-        {
-          class: 'grid place-items-center rounded-lg',
-          style: {
-            width: '40px',
-            height: '40px',
-            color: toneColor,
-            backgroundColor: toneBg,
-          },
-        },
-        iconSvg(icons.server, 18),
+        { class: 'account-title' },
+        el('h3', { text: account.name, title: account.name }),
+        el('span', { text: account.region_name }),
       ),
       el(
         'div',
-        { class: 'min-w-0' },
-        el(
-          'h3',
-          {
-            class: 'truncate text-base leading-tight font-semibold',
-            text: account.name,
-          },
-        ),
-        el('span', {
-          class: 'mt-1 block truncate text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: account.region_name,
-        }),
-      ),
-      el(
-        'div',
-        { class: 'flex flex-col items-end gap-1.5' },
-        el(
-          'div',
-          {
-            class: 'inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium',
-            style: {
-              color: toneColor,
-              backgroundColor: toneBg,
-            },
-          },
-          el('i', {
-            class: 'block h-1.5 w-1.5 rounded-full',
-            style: { backgroundColor: toneColor },
-          }),
-          el('span', { text: statusText }),
-        ),
-        el(
-          'div',
-          {
-            class: 'grid justify-end gap-x-4 gap-y-0.5 text-right',
-            style: { gridTemplateColumns: 'auto auto' },
-          },
-          el(
-            'div',
-            { class: 'grid gap-0.5' },
-            el('span', {
-              class: 'text-xs',
-              style: { color: 'var(--color-ink-subtle)' },
-              text: '余额',
-            }),
-            el('b', {
-              class: 'font-mono text-xs tabular-nums',
-              text: humanAmount(account.balance_amount, account.balance_currency),
-              title: this.balanceBreakdown(),
-            }),
-          ),
-          el(
-            'div',
-            { class: 'grid gap-0.5' },
-            el('span', {
-              class: 'text-xs',
-              style: { color: 'var(--color-ink-subtle)' },
-              text: '免费额度',
-            }),
-            el('b', {
-              class: 'font-mono text-xs tabular-nums',
-              text: `${account.quota_gb} GB`,
-            }),
-          ),
-        ),
+        { class: 'account-card__side' },
+        el('div', { class: `status-pill ${tone}` }, el('i', {}), el('span', { text })),
+        billing,
       ),
     )
   }
 
-  /** 流量区：大号数字 + 单条进度 + 百分比与账期。 */
-  /** 打开历史流量弹窗。 */
-  private openHistory(): void {
-    this.onHistory?.(this.account)
-  }
-
-  /** 余额分项的 hover 文案；没有分项时返回空串（不显示 tooltip）。 */
+  /** 余额分项的悬浮文案。 */
   private balanceBreakdown(): string {
     const account = this.account
     const parts: string[] = []
@@ -338,93 +204,62 @@ export class AccountCard {
     return parts.join(' · ')
   }
 
-  /** 流量区：大号数字 + 一条进度 + 百分比与阈值。 */
+  /** 流量区：大号数字 + 进度条 + 百分比与阈值。 */
   private buildTrafficBlock(): HTMLElement {
     const account = this.account
     const percent = account.percentage
-    const fill =
-      account.threshold_triggered || percent >= 100
-        ? 'var(--color-danger)'
-        : percent >= 80
-          ? 'var(--color-warn)'
-          : 'var(--color-ink)'
+    const fill = account.threshold_triggered
+      ? 'danger'
+      : percent >= 80
+        ? 'warning'
+        : ''
+
+    const historyButton = el(
+      'button',
+      {
+        class: 'mini-icon',
+        type: 'button',
+        'aria-label': '查看历史流量',
+        title: '历史流量',
+        on: { click: () => this.onHistory?.(this.account) },
+      },
+      iconSvg(icons.chart, 17),
+    )
+
+    const refreshButton = this.actionButton({
+      key: 'refresh',
+      label: '刷新实例',
+      icon: icons.refresh,
+      mini: true,
+      onClick: () => void this.refreshAccount(),
+    })
 
     return el(
       'div',
       {},
       el(
         'div',
-        { class: 'mt-5 flex items-end justify-between' },
+        { class: 'traffic-value' },
         el(
           'div',
           {},
-          el('span', {
-            class: 'mb-1 block text-xs',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '本月 CDT 流量',
-          }),
-          el(
-            'div',
-            { class: 'flex items-baseline gap-1' },
-            el('strong', {
-              class: 'text-2xl font-semibold tabular-nums',
-              text: account.traffic_used_gb.toFixed(2),
-            }),
-            el('small', {
-              class: 'font-medium tabular-nums',
-              style: { color: 'var(--color-ink-subtle)' },
-              text: `/ ${account.quota_gb.toFixed(0)} GB`,
-            }),
-          ),
+          el('span', { text: '本月 CDT 流量' }),
+          el('strong', { text: account.traffic_used_gb.toFixed(2) }),
+          el('small', { text: ` / ${account.quota_gb.toFixed(0)} GB` }),
         ),
-        el(
-          'div',
-          { class: 'flex items-center gap-1' },
-          el(
-            'button',
-            {
-              class: 'btn btn-ghost btn-sm',
-              type: 'button',
-              title: '历史流量',
-              on: { click: () => this.openHistory() },
-            },
-            iconSvg(icons.chart, 13),
-          ),
-          this.actionButton({
-            key: 'refresh',
-            label: '',
-            icon: icons.refresh,
-            className: 'btn-ghost',
-            title: '刷新',
-            onClick: () => this.refreshAccount(),
-          }),
-        ),
+        el('div', { class: 'control-group' }, historyButton, refreshButton),
       ),
       el(
         'div',
-        {
-          class: 'mt-3 overflow-hidden rounded-full',
-          style: {
-            height: '7px',
-            backgroundColor: 'color-mix(in oklab, var(--color-line-strong) 68%, transparent)',
-            boxShadow: 'inset 0 1px 3px rgb(0 0 0 / 0.08)',
-          },
-        },
+        { class: 'progress-track' },
         el('i', {
-          class: 'block h-full rounded-full',
-          style: {
-            width: `${Math.min(Math.max(percent, 0), 100)}%`,
-            backgroundColor: fill,
-            animation: 'progress-in .8s .35s var(--ease-emphasis) both',
-          },
+          class: fill,
+          style: { width: `${Math.min(Math.max(percent, 0), 100)}%` },
         }),
       ),
       el(
         'div',
-        {
-          class: 'mt-2 flex justify-between text-xs tabular-nums',
-          style: { color: 'var(--color-ink-muted)' },
-        },
+        { class: 'progress-meta' },
         el('span', { text: `${percent.toFixed(2)}% 已使用` }),
         el('span', {
           text:
@@ -436,110 +271,67 @@ export class AccountCard {
     )
   }
 
-  /**
-   * 主实例信息行。
-   *
-   * 只展示第一台实例：该项目的典型用法是一个账号一台轻量机，
-   * 上游也只显示单实例状态。多实例时其余实例不再列出。
-   */
-  private buildPrimaryInstanceRow(): HTMLElement {
-    const primary = this.account.instances[0]
-    if (!primary) return el('div', { class: 'hidden' })
-
-    const meta: HTMLElement[] = [
-      el(
-        'span',
-        { class: 'inline-flex items-center gap-1' },
-        iconSvg(icons.cpu, 10),
-        el('span', { text: primary.instance_type || '—' }),
-      ),
-    ]
-    if (primary.public_ip) {
-      meta.push(el('span', { text: primary.public_ip }))
-    }
-    if (primary.spot) {
-      meta.push(
-        el(
-          'span',
-          { class: 'inline-flex items-center gap-1' },
-          iconSvg(icons.zap, 10),
-          el('span', { text: '抢占式' }),
-        ),
-      )
-    }
-
-    return el(
-      'div',
-      {
-        class: 'mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl px-3 py-2',
-        style: { backgroundColor: 'var(--color-surface-raised)' },
-      },
-      el(
-        'div',
-        {
-          class: 'flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-        },
-        ...meta,
-      ),
-      ...(primary.spot ? [this.buildKeepAliveSwitch(primary)] : []),
-    )
-  }
-
-  /** 底部：更新时间 + 操作按钮组。 */
-  private buildFooterRow(): HTMLElement {
+  /** 底部：同步时间 + 操作按钮组。 */
+  private buildFooter(): HTMLElement {
     const account = this.account
     const primary = account.instances[0]
-    const running = primary?.status.toLowerCase() === 'running'
-    const stopped = primary?.status.toLowerCase() === 'stopped'
+    const status = primary?.status.toLowerCase() ?? ''
+    const running = status === 'running'
+    const stopped = status === 'stopped'
 
-    const buttons: HTMLElement[] = [
-      this.actionButton({
-        key: 'settings',
-        label: '',
+    const group = el('div', { class: 'control-group' })
+
+    group.append(
+      iconButton({
+        label: '实例设置',
         icon: icons.settings,
-        className: 'btn-ghost',
-        title: '账号设置',
         onClick: () => this.onEdit?.(this.account.id),
       }),
-    ]
-    if (stopped) {
-      buttons.push(
+    )
+
+    if (primary) {
+      group.append(
         this.actionButton({
-          key: 'start',
-          label: '',
-          icon: icons.play,
-          className: 'btn-ghost',
-          title: '开机',
-          onClick: () => void this.toggleInstance(primary, true),
+          key: 'refresh',
+          label: '强制刷新实例状态',
+          icon: icons.refresh,
+          onClick: () => void this.refreshAccount(),
         }),
       )
-    }
-    if (running) {
-      buttons.push(
-        this.actionButton({
-          key: 'stop',
-          label: '',
-          icon: icons.power,
-          className: 'btn-danger',
-          title: '关机',
-          onClick: () => void this.toggleInstance(primary, false),
-        }),
-      )
+
+      if (stopped) {
+        group.append(
+          this.actionButton({
+            key: 'start',
+            label: '开机',
+            icon: icons.play,
+            tone: 'positive',
+            onClick: () => void this.toggleInstance(primary, true),
+          }),
+        )
+      }
+
+      if (running) {
+        const keepAlive = account.spot_keep_alive
+        group.append(
+          this.actionButton({
+            key: 'stop',
+            label: keepAlive ? '保活启用，不能关机' : '关机',
+            icon: icons.power,
+            tone: 'danger',
+            disabled: keepAlive,
+            onClick: () => void this.toggleInstance(primary, false),
+          }),
+        )
+      }
     }
 
     return el(
       'footer',
-      {
-        class: 'mt-4 flex flex-wrap items-center justify-between gap-2 border-t pt-3.5',
-        style: { borderColor: 'var(--color-line)' },
-      },
+      { class: 'account-card__footer' },
       el(
         'span',
-        {
-          class: 'flex items-center gap-1.5 text-xs tabular-nums',
-          style: { color: 'var(--color-ink-subtle)' },
-        },
+        {},
         iconSvg(icons.calendar, 14),
         el('span', {
           dataset: { role: 'updated-at' },
@@ -548,64 +340,7 @@ export class AccountCard {
             : '等待首次同步',
         }),
       ),
-      el('div', { class: 'flex gap-2' }, ...buttons),
-    )
-  }
-
-  /** 逐实例抢占式保活开关。 */
-  private buildKeepAliveSwitch(instance: InstanceInfo): HTMLElement {
-    const on = this.keepAliveOverride.get(instance.instance_id) ?? instance.keep_alive
-    const busyKey = `${instance.instance_id}:keepalive`
-
-    const track = el('span', {
-      class: 'switch',
-      role: 'switch',
-      tabindex: '0',
-      'aria-checked': String(on),
-      'aria-label': '抢占式保活',
-      dataset: { on: String(on) },
-    })
-    track.append(el('span', { class: 'switch-knob' }))
-
-    const handler = (event: Event): void => {
-      event.preventDefault()
-      if (this.busy.has(busyKey)) return
-      void this.toggleKeepAlive(instance)
-    }
-    track.addEventListener('click', handler)
-    track.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') handler(event)
-    })
-
-    return el(
-      'label',
-      {
-        class: 'flex cursor-pointer items-center gap-1.5 text-[0.8125rem]',
-        title: this.account.spot_keep_alive
-          ? '账号级保活已开启'
-          : '账号级保活已关闭，逐实例开关不会生效',
-      },
-      track,
-      el('span', { text: '保活' }),
-    )
-  }
-
-  private buildThresholdBanner(): HTMLElement {
-    return el(
-      'div',
-      {
-        class: 'flex items-start gap-2 border-t px-5 py-2.5 text-[0.8125rem]',
-        style: {
-          borderColor: 'var(--color-line)',
-          backgroundColor: 'var(--color-danger-soft)',
-          color: 'var(--color-danger)',
-        },
-      },
-      iconSvg(icons.alert, 13),
-      el('span', {
-        class: 'leading-relaxed',
-        text: '本月已触发流量熔断，禁止拉起实例。',
-      }),
+      group,
     )
   }
 
@@ -613,53 +348,80 @@ export class AccountCard {
   // 按钮
   // -------------------------------------------------------------------------
 
-  private actionButton(spec: ActionSpec): HTMLButtonElement {
-    const node = el('button', {
-      class: `btn ${spec.className}`,
+  private actionButton(options: {
+    key: string
+    label: string
+    icon: IconNode
+    onClick: () => void
+    tone?: 'positive' | 'danger'
+    disabled?: boolean
+    mini?: boolean
+  }): HTMLButtonElement {
+    const button = el('button', {
+      class: options.mini ? 'mini-icon' : 'icon-button',
       type: 'button',
-      title: spec.title ?? spec.label,
-      'aria-label': spec.title ?? spec.label,
+      'aria-label': options.label,
+      title: options.label,
+      'data-action': options.key,
     }) as HTMLButtonElement
-    node.disabled = this.busy.has(spec.key) || Boolean(spec.disabled)
-    // label 为空时只显示图标（上游的图标按钮形态）
-    const labelPart = spec.label ? [el('span', { text: spec.label })] : []
-    replaceChildren(
-      node,
-      ...(this.busy.has(spec.key)
-        ? [iconSvg(icons.spinner, 15, 'animate-spin')]
-        : [iconSvg(spec.icon, 15), ...labelPart]),
-    )
-    node.addEventListener('click', () => {
-      if (node.disabled) return
-      void spec.onClick()
+
+    if (!options.mini && options.tone) {
+      button.classList.add(`icon-button--${options.tone}`)
+    }
+
+    button.disabled = Boolean(options.disabled)
+    button.append(iconSvg(options.icon, options.mini ? 17 : 18))
+    button.addEventListener('click', () => {
+      if (button.disabled) return
+      options.onClick()
     })
-    this.buttons.push({ spec, node })
-    return node
+    return button
+  }
+
+  /** 设置按钮忙碌态（不重建整张卡片）。 */
+  private markBusy(key: string, active: boolean, node?: HTMLButtonElement): void {
+    if (active) this.busy.add(key)
+    else this.busy.delete(key)
+
+    // 同一个动作可能出现在多个位置（流量区的小按钮 + 底部操作组），逐个同步
+    const buttons = node
+      ? [node]
+      : [...this.root.querySelectorAll<HTMLButtonElement>(`[data-action="${key}"]`)]
+
+    for (const button of buttons) {
+      if (active) {
+        replaceChildren(button, iconSvg(icons.spinner, button.classList.contains('mini-icon') ? 17 : 18, 'spin'))
+        button.disabled = true
+      } else {
+        button.disabled = false
+        replaceChildren(
+          button,
+          iconSvg(this.iconOf(key), button.classList.contains('mini-icon') ? 17 : 18),
+        )
+      }
+    }
+  }
+
+  /** 忙碌态结束后要还原的图标。 */
+  private iconOf(key: string): IconNode {
+    const map: Record<string, IconNode> = {
+      refresh: icons.refresh,
+      start: icons.play,
+      stop: icons.power,
+    }
+    return map[key] ?? icons.refresh
   }
 
   // -------------------------------------------------------------------------
   // 动作
   // -------------------------------------------------------------------------
 
-  private markBusy(key: string, active: boolean): void {
-    if (active) this.busy.add(key)
-    else this.busy.delete(key)
-    this.syncButtons()
-    // 保活开关不在 buttons 里，需要重绘实例区才能反映忙碌态
-    if (key.endsWith(':keepalive')) this.weightlessRefreshKeepAliveSwitch()
-  }
-
-  /** 保活开关没有独立的忙碌态渲染，重建卡片是最简单的可靠做法。 */
-  private weightlessRefreshKeepAliveSwitch(): void {
-    this.rebuild()
-  }
-
   private async refreshAccount(): Promise<void> {
     if (this.busy.has('refresh')) return
     this.markBusy('refresh', true)
     try {
       await api.refreshAccount(this.account.id)
-      toast(`${this.account.name} 已刷新`, 'ok')
+      toast('实例状态已刷新', 'ok')
       await afterAccountChanged()
     } catch (error) {
       reportError(error, '刷新失败')
@@ -669,40 +431,20 @@ export class AccountCard {
   }
 
   private async toggleInstance(instance: InstanceInfo, start: boolean): Promise<void> {
-    const key = `${instance.instance_id}:${start ? 'start' : 'stop'}`
-    if (this.busy.has(key)) return
-    this.markBusy(key, true)
+    if (this.busy.has(start ? 'start' : 'stop')) return
+    this.markBusy(start ? 'start' : 'stop', true)
     try {
       if (start) {
         await api.startInstance(this.account.id, instance.instance_id)
       } else {
         await api.stopInstance(this.account.id, instance.instance_id)
       }
-      toast(
-        `${instance.instance_name || instance.instance_id} ${start ? '已开机' : '已关机'}`,
-        'ok',
-      )
+      toast(start ? '已发送开机指令' : '已发送关机指令', 'ok')
       await afterAccountChanged()
     } catch (error) {
       reportError(error, start ? '开机失败' : '关机失败')
     } finally {
-      this.markBusy(key, false)
-    }
-  }
-
-  private async toggleKeepAlive(instance: InstanceInfo): Promise<void> {
-    const key = `${instance.instance_id}:keepalive`
-    if (this.busy.has(key)) return
-    const next = !(this.keepAliveOverride.get(instance.instance_id) ?? instance.keep_alive)
-    this.markBusy(key, true)
-    try {
-      await api.setKeepAlive(this.account.id, instance.instance_id, next)
-      this.keepAliveOverride.set(instance.instance_id, next)
-      toast(`已${next ? '开启' : '关闭'} ${instance.instance_id} 的抢占式保活`, 'ok')
-    } catch (error) {
-      reportError(error, '保活开关更新失败')
-    } finally {
-      this.markBusy(key, false)
+      this.markBusy(start ? 'start' : 'stop', false)
     }
   }
 }
@@ -717,11 +459,7 @@ export class AccountList {
     private readonly onEdit?: (accountId: number) => void,
     private readonly onHistory?: (account: AccountOverview) => void,
   ) {
-    // 两列网格，与上游一致；窄屏单列
-    this.element = el('section', {
-      class: 'grid gap-4',
-      style: { gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))' },
-    })
+    this.element = el('section', { class: 'account-grid' })
   }
 
   /** 同步账号列表。 */
@@ -748,7 +486,6 @@ export class AccountList {
     }
   }
 
-  /** 当前卡片数量。 */
   get size(): number {
     return this.cards.size
   }

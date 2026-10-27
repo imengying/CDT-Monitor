@@ -1,12 +1,19 @@
 /**
  * 历史流量弹窗
  * ============================================================================
- * 点卡片上的历史按钮打开，切换「24 小时 / 30 天」两种粒度。
+ * 结构照搬上游 `HistoryModal`：
  *
- * 关键点：**时间轴要补全**。采样数据是稀疏的（同一小时内多次巡检只留一个点），
- * 直接把数据点连起来会让曲线在没采样的时段"跳"过去，看起来像是流量突变。
- * 因此这里固定生成 25 个整点槽位 / 31 个整日槽位，缺失的槽位保持 `null`，
- * 由 ECharts 断开线段（`connectNulls: false`），真实缺口一眼可见。
+ *   modal-layer
+ *   ├ modal-scrim（点击关闭）
+ *   └ chart-modal
+ *     ├ header   TRAFFIC HISTORY / 账号名 / 关闭
+ *     ├ segmented 24 小时 · 30 天
+ *     └ chart-area
+ *
+ * 关键点：**时间轴要补全**。采样是稀疏的（同一小时内多次巡检只留一个点），
+ * 直接把数据点连起来会让曲线在没采样的时段"跳"过去，看起来像流量突变。
+ * 因此固定生成 25 个整点槽 / 31 个整日槽，缺失槽位保持 `null`，
+ * 由 `connectNulls: false` 断开线段，真实缺口一眼可见。
  */
 
 import * as echarts from 'echarts/core'
@@ -19,7 +26,7 @@ import {
 import { CanvasRenderer } from 'echarts/renderers'
 import type { EChartsType, EChartsCoreOption } from 'echarts/core'
 import type { TrafficHistoryResponse, TrafficSample } from '@/api/client'
-import { el, iconSvg, onEscape, replaceChildren } from '@/lib/dom'
+import { el, eyebrow, iconButton, iconSvg, onEscape, replaceChildren, segmented } from '@/lib/dom'
 import { icons } from '@/lib/icons'
 
 echarts.use([
@@ -40,35 +47,10 @@ interface DisplayPoint {
   traffic: number | null
 }
 
-/** 把 CSS 变量解析成 Canvas 能用的具体颜色（`light-dark()` 需要这样绕）。 */
-const colorCache = new Map<string, string>()
-
-function parseRgb(value: string): { r: number; g: number; b: number } | null {
-  const match = value.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i)
-  if (!match) return null
-  return { r: Number(match[1]), g: Number(match[2]), b: Number(match[3]) }
-}
-
-function resolveColor(variable: string, alpha = 1): string {
-  const key = `${variable}@${alpha}`
-  const cached = colorCache.get(key)
-  if (cached) return cached
-
-  const fallback = alpha >= 1 ? '#64748b' : `rgba(100, 116, 139, ${alpha})`
-  const probe = document.createElement('span')
-  probe.style.cssText = `color: var(${variable}); display: none;`
-  document.body.append(probe)
-  const computed = getComputedStyle(probe).color
-  probe.remove()
-
-  const rgb = parseRgb(computed)
-  if (!rgb) return fallback
-
-  const result =
-    alpha >= 1 ? `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})` : `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${alpha})`
-  colorCache.set(key, result)
-  return result
-}
+/** 上游图表使用的固定色值，不跟随主题变量。 */
+const INK = '#111315'
+const GRID = 'rgba(173, 178, 184, .32)'
+const AXIS_TEXT = '#737780'
 
 /** 本地当天 00:00。 */
 function startOfLocalDay(timestamp: number): number {
@@ -121,7 +103,7 @@ export class HistoryModal {
   private readonly subtitle: HTMLParagraphElement
   private readonly chartHost: HTMLDivElement
   private readonly emptyState: HTMLDivElement
-  private readonly rangeButtons = new Map<Range, HTMLButtonElement>()
+  private readonly rangeHost: HTMLDivElement
 
   private chart: EChartsType | null = null
   private data: TrafficHistoryResponse | null = null
@@ -129,88 +111,48 @@ export class HistoryModal {
   private removeEsc: (() => void) | null = null
 
   constructor() {
-    this.title = el('h2', { class: 'text-sm font-semibold' })
-    this.subtitle = el('p', {
-      class: 'mt-0.5 text-xs',
-      style: { color: 'var(--color-ink-subtle)' },
-    })
-    this.chartHost = el('div', { class: 'h-[320px] w-full', role: 'img' })
+    this.title = el('h2', {})
+    this.subtitle = el('p', { class: 'eyebrow', style: { marginBottom: '0' } })
+    this.chartHost = el('div', { style: { height: '100%' }, role: 'img' })
     this.emptyState = el(
       'div',
-      {
-        class: 'hidden h-[320px] place-items-center text-sm',
-        style: { color: 'var(--color-ink-subtle)' },
-      },
-      el('span', { text: '暂无采样数据' }),
+      { class: 'subtle-empty' },
+      iconSvg(icons.chart, 28),
+      el('span', { text: '等待采样数据' }),
     )
+    this.emptyState.style.height = '100%'
+    this.emptyState.hidden = true
 
-    const segmented = el('div', {
-      class: 'inline-flex overflow-hidden rounded-lg border',
-      style: { borderColor: 'var(--color-line)' },
-    })
-    for (const [key, label] of [
-      ['hourly', '24 小时'],
-      ['daily', '30 天'],
-    ] as [Range, string][]) {
-      const button = el(
-        'button',
-        {
-          class: 'px-3 py-1 text-xs',
-          type: 'button',
-          on: { click: () => this.setRange(key) },
-        },
-        el('span', { text: label }),
-      ) as HTMLButtonElement
-      this.rangeButtons.set(key, button)
-      segmented.append(button)
-    }
+    this.rangeHost = el('div', {})
+
+    const body = el('div', { class: 'chart-area' }, this.chartHost, this.emptyState)
 
     this.element = el(
       'div',
-      {
-        class: 'overlay hidden',
-        on: {
-          click: (event) => {
-            if (event.target === this.element) this.close()
-          },
-        },
-      },
+      { class: 'modal-layer', hidden: true },
+      el('div', { class: 'modal-scrim', on: { click: () => this.close() } }),
       el(
-        'div',
+        'section',
         {
-          class: 'card w-full max-w-3xl overflow-hidden',
+          class: 'glass-card chart-modal',
           role: 'dialog',
           'aria-modal': 'true',
           'aria-label': '历史流量',
         },
         el(
           'header',
-          {
-            class: 'flex items-start justify-between gap-3 border-b px-5 py-3',
-            style: { borderColor: 'var(--color-line)' },
-          },
-          el('div', {}, this.title, this.subtitle),
-          el(
-            'div',
-            { class: 'flex items-center gap-3' },
-            segmented,
-            el(
-              'button',
-              {
-                class: 'btn btn-ghost btn-sm',
-                type: 'button',
-                'aria-label': '关闭',
-                on: { click: () => this.close() },
-              },
-              iconSvg(icons.close, 14),
-            ),
-          ),
+          {},
+          el('div', {}, eyebrow('TRAFFIC HISTORY'), this.title, this.subtitle),
+          iconButton({
+            label: '关闭',
+            icon: icons.close,
+            onClick: () => this.close(),
+          }),
         ),
-        el('div', { class: 'px-5 py-4' }, this.chartHost, this.emptyState),
+        this.rangeHost,
+        body,
       ),
     )
-
-    this.syncRangeButtons()
   }
 
   /** 打开并展示某账号的历史数据。 */
@@ -218,19 +160,16 @@ export class HistoryModal {
     this.title.textContent = name
     this.data = data
     this.range = 'hourly'
-    this.syncRangeButtons()
 
     const quotaText = data.quota_gb > 0 ? `免费额度 ${data.quota_gb} GB` : ''
     const thresholdText =
-      data.traffic_threshold_gb > 0
-        ? `阈值 ${data.traffic_threshold_gb} GB`
-        : '未设告警阈值'
+      data.traffic_threshold_gb > 0 ? `阈值 ${data.traffic_threshold_gb} GB` : '未设阈值'
     this.subtitle.textContent = [data.billing_month, quotaText, thresholdText]
       .filter(Boolean)
       .join(' · ')
 
-    this.element.classList.remove('hidden')
-    this.element.style.display = 'flex'
+    this.renderRangeControl()
+    this.element.hidden = false
     document.body.style.overflow = 'hidden'
     this.removeEsc = onEscape(() => this.close())
 
@@ -240,8 +179,7 @@ export class HistoryModal {
 
   /** 关闭弹窗。 */
   close(): void {
-    this.element.classList.add('hidden')
-    this.element.style.display = 'none'
+    this.element.hidden = true
     document.body.style.overflow = ''
     this.removeEsc?.()
     this.removeEsc = null
@@ -252,17 +190,22 @@ export class HistoryModal {
   private setRange(range: Range): void {
     if (this.range === range) return
     this.range = range
-    this.syncRangeButtons()
+    this.renderRangeControl()
     this.render()
   }
 
-  private syncRangeButtons(): void {
-    for (const [key, button] of this.rangeButtons) {
-      const active = key === this.range
-      button.classList.toggle('bg-(--color-surface-muted)', active)
-      button.style.color = active ? 'var(--color-ink)' : 'var(--color-ink-muted)'
-      button.style.fontWeight = active ? '600' : '400'
-    }
+  private renderRangeControl(): void {
+    replaceChildren(
+      this.rangeHost,
+      segmented<Range>({
+        value: this.range,
+        items: [
+          ['hourly', '24 小时'],
+          ['daily', '30 天'],
+        ],
+        onChange: (value) => this.setRange(value),
+      }),
+    )
   }
 
   private render(): void {
@@ -272,9 +215,8 @@ export class HistoryModal {
     const sampled = timeline.filter((point) => point.traffic !== null).length
 
     const hasData = sampled > 0
-    this.emptyState.classList.toggle('hidden', hasData)
-    this.emptyState.classList.toggle('grid', !hasData)
-    this.chartHost.classList.toggle('hidden', !hasData)
+    this.emptyState.hidden = hasData
+    this.chartHost.hidden = !hasData
     if (!hasData) {
       this.chart?.dispose()
       this.chart = null
@@ -285,16 +227,10 @@ export class HistoryModal {
       this.chart = echarts.init(this.chartHost)
     }
     this.chart.setOption(this.buildOption(timeline, sampled), true)
+    this.chart.resize()
   }
 
   private buildOption(timeline: DisplayPoint[], sampled: number): EChartsCoreOption {
-    const ink = resolveColor('--color-ink')
-    const subtle = resolveColor('--color-ink-subtle')
-    const line = resolveColor('--color-line')
-    const brand = resolveColor('--color-brand')
-    const danger = resolveColor('--color-danger')
-    const surface = resolveColor('--color-surface')
-
     const formatLabel = this.range === 'hourly' ? hourLabel : dayLabel
     const values = timeline.map((point) => point.traffic)
     const maxValue = values.reduce<number>((max, value) => Math.max(max, value ?? 0), 0)
@@ -306,10 +242,10 @@ export class HistoryModal {
     if (quota > 0) {
       markLines.push({
         yAxis: quota,
-        lineStyle: { color: danger, type: 'dashed', width: 1 },
+        lineStyle: { color: '#bd3645', type: 'dashed', width: 1 },
         label: {
           formatter: `免费额度 ${quota} GB`,
-          color: danger,
+          color: '#bd3645',
           fontSize: 10,
           position: 'insideEndTop',
         },
@@ -318,32 +254,34 @@ export class HistoryModal {
     if (threshold > 0 && threshold !== quota) {
       markLines.push({
         yAxis: threshold,
-        lineStyle: { color: brand, type: 'dashed', width: 1 },
+        lineStyle: { color: '#2563b8', type: 'dashed', width: 1 },
         label: {
           formatter: `阈值 ${threshold} GB`,
-          color: brand,
+          color: '#2563b8',
           fontSize: 10,
           position: 'insideStartTop',
         },
       })
     }
 
-    // 数据点很少时把点画出来，否则一根孤零零的线看不出是"单点"还是"连续"
-    const showDots = sampled <= 4
-    const axisStyle = {
+    const tickStep = this.range === 'hourly' ? 4 : 5
+    const axis = {
       tickLine: false,
       axisLine: false,
-      tick: { fill: subtle, fontSize: 11 },
+      tick: { fill: AXIS_TEXT, fontSize: 11 },
     }
 
     const common = {
       animation: false,
-      grid: { top: 16, right: 20, bottom: 8, left: 8, containLabel: true },
+      grid: { top: 16, right: 18, bottom: 2, left: -8, containLabel: true },
       tooltip: {
         trigger: 'axis',
-        backgroundColor: surface,
-        borderColor: line,
-        textStyle: { color: ink, fontSize: 12 },
+        backgroundColor: 'rgba(255, 255, 255, .96)',
+        borderColor: 'rgba(173, 178, 184, .45)',
+        borderWidth: 1,
+        textStyle: { color: INK, fontSize: 12 },
+        extraCssText:
+          'border-radius:10px;box-shadow:0 16px 32px -20px rgba(15,23,42,.36)',
         formatter: (params: unknown) => {
           const list = Array.isArray(params) ? params : [params]
           const first = list[0] as { dataIndex?: number } | undefined
@@ -361,9 +299,9 @@ export class HistoryModal {
         type: 'category' as const,
         boundaryGap: this.range === 'daily',
         data: timeline.map((point) => formatLabel(point.at)),
-        axisLabel: { ...axisStyle.tick, interval: 'auto', hideOverlap: true },
+        axisLabel: { ...axis.tick, interval: tickStep },
         axisTick: { show: false },
-        axisLine: { lineStyle: { color: line } },
+        axisLine: { show: false },
       },
       yAxis: {
         type: 'value' as const,
@@ -371,10 +309,10 @@ export class HistoryModal {
         // 给 markLine 留出空间：额度线可能远高于实际用量
         max: Math.max(maxValue, quota > 0 ? quota : 0) * 1.08 || undefined,
         axisLabel: {
-          ...axisStyle.tick,
+          ...axis.tick,
           formatter: (value: number) => Number(value.toFixed(3)).toString(),
         },
-        splitLine: { lineStyle: { color: line } },
+        splitLine: { lineStyle: { color: GRID } },
       },
     }
 
@@ -387,8 +325,11 @@ export class HistoryModal {
             name: '累计流量',
             data: values,
             barMaxWidth: 26,
-            itemStyle: { color: ink, borderRadius: [4, 4, 0, 0] },
-            markLine: markLines.length > 0 ? { silent: true, symbol: 'none', data: markLines } : undefined,
+            itemStyle: { color: INK, borderRadius: [4, 4, 0, 0] },
+            markLine:
+              markLines.length > 0
+                ? { silent: true, symbol: 'none', data: markLines }
+                : undefined,
           },
         ],
       } as EChartsCoreOption
@@ -404,11 +345,14 @@ export class HistoryModal {
           // 关键：缺口不连线，避免把没采样的时段画成平滑曲线
           connectNulls: false,
           smooth: 0.2,
-          showSymbol: showDots,
-          symbolSize: 5,
-          lineStyle: { width: 2, color: ink },
-          itemStyle: { color: ink },
-          markLine: markLines.length > 0 ? { silent: true, symbol: 'none', data: markLines } : undefined,
+          showSymbol: sampled <= 4,
+          symbolSize: 6,
+          lineStyle: { width: 2.25, color: INK },
+          itemStyle: { color: INK, borderColor: '#fff', borderWidth: 2 },
+          markLine:
+            markLines.length > 0
+              ? { silent: true, symbol: 'none', data: markLines }
+              : undefined,
         },
       ],
     } as EChartsCoreOption

@@ -1,29 +1,25 @@
 /**
- * 主控制台（对应原版 `App.vue`）
+ * 主控制台外壳
  * ============================================================================
- * 负责整体布局与各区块的装配：
+ * 布局层级照搬上游 `Dashboard`：
  *
- *   ┌ 顶部导航：标题 · 刷新 · 日志 · 设置 · 退出 ┐
- *   ├ 汇总条：账号 / 本月流量 / 实例 / 熔断                   ┤
- *   ├ 账号卡片区（AccountList）                                ┤
- *   └ 历史流量弹窗（HistoryModal，由卡片上的按钮打开）              ┘
+ *   app-shell
+ *   ├ topbar         品牌 · 心跳 · 刷新/设置/日志/退出
+ *   ├ overview-head  大标题 + 日期 + 上次任务时间
+ *   ├ metric-strip   四格汇总（共用一张卡，竖线分隔）
+ *   ├ section-heading
+ *   └ account-grid   账号卡片
  *
  * 渲染策略：外壳只构建一次，各区块通过 `update(state)` 增量刷新，
- * 避免每次 60 秒轮询都重建整棵树（会丢失滚动位置与输入焦点）。
+ * 避免每次轮询都重建整棵树（会丢失滚动位置与输入焦点）。
  */
 
 import { api, type AccountOverview } from '@/api/client'
 import type { AppState } from '@/lib/store'
 import { clearToasts, store } from '@/lib/store'
-import { el, iconSvg, replaceChildren } from '@/lib/dom'
-import { icons } from '@/lib/icons'
-import {
-  bootstrap,
-  loadOverview,
-  logout,
-  refreshAll,
-  reportError,
-} from '@/lib/actions'
+import { brandLockup, el, eyebrow, iconButton, iconSvg, replaceChildren } from '@/lib/dom'
+import { icons, type IconNode } from '@/lib/icons'
+import { bootstrap, loadOverview, logout, refreshAll, reportError } from '@/lib/actions'
 import { AccountList } from '@/components/AccountCard'
 import { HistoryModal } from '@/components/HistoryModal'
 import { LoginModal } from '@/components/LoginModal'
@@ -38,6 +34,9 @@ import { renderToasts } from '@/components/ToastStack'
  * 因此取 5 分钟，保证刷新后能较快看到新数据即可。
  */
 const OVERVIEW_POLL_MS = 5 * 60_000
+
+/** 心跳文案视为「延迟」的秒数阈值。 */
+const HEARTBEAT_STALE_SECONDS = 180
 
 /** 控制台外壳。 */
 export class App {
@@ -54,11 +53,15 @@ export class App {
     (account) => void this.openHistory(account),
   )
 
-  /** 需要就地更新的节点。 */
+  private errorBanner: HTMLElement | null = null
+  private metricStrip: HTMLElement | null = null
+  private heartbeat: HTMLElement | null = null
+  private heartbeatText: HTMLElement | null = null
+  private lastRunNode: HTMLElement | null = null
+  private emptyCard: HTMLButtonElement | null = null
   private refreshButton: HTMLButtonElement | null = null
-  private errorBanner: HTMLDivElement | null = null
-  private summaryGrid: HTMLElement | null = null
-  private emptyCard: HTMLElement | null = null
+  private mobileMenuButton: HTMLButtonElement | null = null
+  private menuOpen = false
 
   private pollTimer: number | null = null
   private lastPhase: AppState['phase'] | null = null
@@ -126,16 +129,9 @@ export class App {
       this.root,
       el(
         'div',
-        {
-          class: 'flex min-h-full items-center justify-center',
-          style: { color: 'var(--color-ink-subtle)' },
-        },
-        el(
-          'div',
-          { class: 'flex flex-col items-center gap-3' },
-          iconSvg(icons.spinner, 20, 'animate-spin'),
-          el('span', { class: 'text-xs', text: '正在加载控制台…' }),
-        ),
+        { class: 'center-stage' },
+        brandLockup(true),
+        iconSvg(icons.spinner, 26, 'loading-glyph spin'),
       ),
     )
   }
@@ -165,40 +161,50 @@ export class App {
     this.logDrawer = new LogDrawer()
     this.historyModal = new HistoryModal()
 
-    this.refreshButton = el('button', {
-      class: 'btn btn-ghost btn-sm',
+    this.errorBanner = el('div', { class: 'error-banner', role: 'alert' })
+    this.errorBanner.hidden = true
+
+    this.metricStrip = el('section', { class: 'metric-strip' })
+
+    this.emptyCard = el('button', {
+      class: 'empty-state',
       type: 'button',
-      title: '刷新全部账号',
-      on: { click: () => void refreshAll() },
+      on: { click: () => this.settingsModal?.open(store.get().settings, true) },
     }) as HTMLButtonElement
-
-    this.errorBanner = el('div', {
-      class: 'mb-3 hidden items-start gap-2 rounded-lg px-3 py-2 text-xs',
-      style: {
-        backgroundColor: 'var(--color-danger-soft)',
-        color: 'var(--color-danger)',
-      },
-    })
-
-    // 汇总条：四格等分，共用一张卡片
-    this.summaryGrid = el('section', {
-      class: 'card mb-4 grid overflow-hidden grid-cols-2 sm:grid-cols-4',
-    })
-
-    this.emptyCard = this.buildEmptyCard()
+    replaceChildren(
+      this.emptyCard,
+      iconSvg(icons.cloud, 35),
+      el('h3', { text: '添加第一个云端实例' }),
+      el('p', { text: '进入设置完成 AccessKey 与实例信息配置' }),
+      el(
+        'span',
+        {},
+        el('span', { text: '打开设置' }),
+        iconSvg(icons.chevronRight, 16),
+      ),
+    )
+    this.emptyCard.hidden = true
 
     this.shell = el(
-      'div',
-      { class: 'min-h-full' },
-      this.buildHeader(),
+      'main',
+      { class: 'app-shell' },
+      this.buildTopbar(),
+      this.buildOverviewHead(),
+      this.errorBanner,
+      this.metricStrip,
       el(
-        'main',
-        { class: 'mx-auto max-w-7xl px-5 py-5' },
-        this.errorBanner,
-        this.summaryGrid,
-        this.emptyCard,
-        this.accountList.element,
+        'div',
+        { class: 'section-heading' },
+        el(
+          'div',
+          {},
+          eyebrow('MANAGED INSTANCES'),
+          el('h2', { text: '实例与流量' }),
+        ),
+        el('span', { dataset: { role: 'account-count' } }),
       ),
+      this.emptyCard,
+      this.accountList.element,
     )
 
     replaceChildren(
@@ -211,126 +217,152 @@ export class App {
     this.updateShell(state)
   }
 
-  private buildHeader(): HTMLElement {
-    const barButton = (
-      label: string,
-      icon: typeof icons.activity,
-      title: string,
-      onClick: () => void,
-    ): HTMLButtonElement =>
-      el(
-        'button',
-        { class: 'btn btn-ghost', type: 'button', title, on: { click: onClick } },
-        iconSvg(icon, 15),
-        ...(label ? [el('span', { class: 'hidden sm:inline', text: label })] : []),
-      ) as HTMLButtonElement
+  /** 顶栏：品牌 + 心跳 + 操作区。 */
+  private buildTopbar(): HTMLElement {
+    this.heartbeatText = el('span', { text: '自动化运行中' })
+    this.heartbeat = el('div', { class: 'heartbeat' }, el('i', {}), this.heartbeatText)
+
+    this.refreshButton = iconButton({
+      label: '强制刷新全部实例',
+      icon: icons.refresh,
+      onClick: () => void refreshAll(),
+    })
+
+    const actions = el(
+      'div',
+      { class: 'topbar-actions', id: 'dashboard-actions' },
+      this.heartbeat,
+      this.refreshButton,
+      iconButton({
+        label: '设置',
+        icon: icons.settings,
+        onClick: () => this.openSettings(),
+      }),
+      iconButton({
+        label: '操作日志',
+        icon: icons.activity,
+        onClick: () => this.openLogs(),
+      }),
+      iconButton({
+        label: '退出登录',
+        icon: icons.logout,
+        onClick: () => void logout(),
+      }),
+    )
+
+    this.mobileMenuButton = iconButton({
+      label: '菜单',
+      icon: icons.dashboard,
+      className: 'mobile-menu',
+      onClick: () => this.toggleMenu(),
+    })
 
     return el(
       'header',
-      {
-        class: 'sticky top-0 z-30 border-b',
-        style: {
-          borderColor: 'var(--color-line)',
-          backgroundColor: 'var(--color-surface)',
-        },
-      },
-      el(
-        'div',
-        { class: 'mx-auto flex max-w-7xl items-center gap-3 px-5 py-3' },
-        el(
-          'div',
-          { class: 'flex min-w-0 items-center gap-2.5' },
-          el(
-            'div',
-            {
-              class: 'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-white',
-              style: { background: 'linear-gradient(135deg, #2563eb, #0ea5e9)' },
-            },
-            iconSvg(icons.cloud, 16),
-          ),
-          el(
-            'div',
-            { class: 'min-w-0' },
-            el('h1', { class: 'truncate text-base leading-tight font-semibold', text: 'CDT Monitor' }),
-          ),
-        ),
-        el('div', { class: 'flex-1' }),
-        el(
-          'div',
-          { class: 'flex items-center gap-1.5' },
-          this.refreshButton,
-          barButton('日志', icons.activity, '操作日志', () => this.logDrawer?.open()),
-          barButton('设置', icons.settings, '系统设置', () =>
-            this.settingsModal?.open(store.get().settings),
-          ),
-          barButton('', icons.logout, '退出登录', () => void logout()),
-        ),
-      ),
+      { class: 'topbar' },
+      brandLockup(),
+      actions,
+      this.mobileMenuButton,
     )
   }
 
-  private buildEmptyCard(): HTMLElement {
-    const card = el('div', {
-      class: 'card flex-col items-center justify-center gap-3 px-6 py-14 text-center',
-    })
-    replaceChildren(
-      card,
-      el(
-        'div',
-        {
-          class: 'flex h-12 w-12 items-center justify-center rounded-2xl',
-          style: {
-            backgroundColor: 'var(--color-brand-soft)',
-            color: 'var(--color-brand)',
-          },
-        },
-        iconSvg(icons.dashboard, 22),
-      ),
+  private toggleMenu(): void {
+    this.menuOpen = !this.menuOpen
+    const actions = this.shell?.querySelector('.topbar-actions')
+    actions?.classList.toggle('open', this.menuOpen)
+    if (this.mobileMenuButton) {
+      this.mobileMenuButton.setAttribute('aria-expanded', String(this.menuOpen))
+    }
+  }
+
+  private closeMenu(): void {
+    if (!this.menuOpen) return
+    this.menuOpen = false
+    this.shell?.querySelector('.topbar-actions')?.classList.remove('open')
+    this.mobileMenuButton?.setAttribute('aria-expanded', 'false')
+  }
+
+  private openSettings(startWithAdd = false): void {
+    this.closeMenu()
+    this.settingsModal?.open(store.get().settings, startWithAdd)
+  }
+
+  private openLogs(): void {
+    this.closeMenu()
+    this.logDrawer?.open()
+  }
+
+  /** 标题区：大标题 + 星期 + 上次任务时间。 */
+  private buildOverviewHead(): HTMLElement {
+    this.lastRunNode = el('b', { text: '尚未运行' })
+
+    return el(
+      'section',
+      { class: 'overview-head' },
       el(
         'div',
         {},
-        el('h2', { class: 'text-sm font-semibold', text: '还没有阿里云账号' }),
+        eyebrow('LIVE INFRASTRUCTURE'),
+        el('h1', { text: '资源控制台' }),
         el('p', {
-          class: 'mt-1 text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: '添加阿里云账号后开始监控。',
+          class: 'muted',
+          text: new Date().toLocaleDateString('zh-CN', {
+            month: 'long',
+            day: 'numeric',
+            weekday: 'long',
+          }),
         }),
       ),
       el(
-        'button',
-        {
-          class: 'btn btn-primary',
-          type: 'button',
-          on: { click: () => this.settingsModal?.open(store.get().settings, true) },
-        },
-        iconSvg(icons.plus, 13),
-        el('span', { text: '添加账号' }),
+        'div',
+        { class: 'overview-time' },
+        iconSvg(icons.calendar, 17),
+        el('span', { text: '数据快照' }),
+        this.lastRunNode,
       ),
     )
-    card.classList.add('hidden')
-    return card
   }
 
   private updateShell(state: Readonly<AppState>): void {
     const overview = state.overview
     const accounts = overview?.accounts ?? []
 
-
     if (this.refreshButton) {
-      this.refreshButton.disabled = state.refreshingAll
-      replaceChildren(
-        this.refreshButton,
-        ...(state.refreshingAll
-          ? [iconSvg(icons.spinner, 13, 'animate-spin')]
-          : [iconSvg(icons.refresh, 13)]),
-        el('span', { class: 'hidden sm:inline', text: '刷新' }),
-      )
+      this.refreshButton.disabled = state.refreshingAll || state.overviewLoading
     }
 
+    this.updateHeartbeat(overview?.generated_at ?? null)
     this.renderErrorBanner(state)
-    this.renderSummary(accounts)
+    this.renderMetrics(accounts)
     this.renderEmptyState(state, accounts)
     this.accountList.render(accounts)
+
+    const count = this.shell?.querySelector<HTMLElement>('[data-role="account-count"]')
+    if (count) count.textContent = `${accounts.length} 个配置`
+  }
+
+  /**
+   * 心跳与「数据快照」时间。
+   *
+   * `generated_at` 是概览接口的响应时刻，也就是界面数据的新鲜度。
+   * 超过阈值说明自动化任务可能没按时跑（Cron 15 分钟一次）。
+   */
+  private updateHeartbeat(generatedAt: number | null): void {
+    if (!this.heartbeat || !this.heartbeatText) return
+    const stale =
+      generatedAt === null || (Date.now() - generatedAt) / 1000 > HEARTBEAT_STALE_SECONDS
+
+    this.heartbeat.classList.toggle('heartbeat--warn', stale)
+    this.heartbeatText.textContent = stale ? '监控任务延迟' : '自动化运行中'
+
+    if (this.lastRunNode) {
+      this.lastRunNode.textContent = generatedAt
+        ? new Date(generatedAt).toLocaleTimeString('zh-CN', {
+            hour: '2-digit',
+            minute: '2-digit',
+          })
+        : '尚未运行'
+    }
   }
 
   private renderErrorBanner(state: Readonly<AppState>): void {
@@ -338,9 +370,7 @@ export class App {
     if (!banner) return
 
     const hasError = state.overviewError.length > 0
-    banner.classList.toggle('hidden', !hasError)
-    banner.classList.toggle('flex', hasError)
-
+    banner.hidden = !hasError
     if (!hasError) {
       banner.replaceChildren()
       return
@@ -348,10 +378,10 @@ export class App {
 
     replaceChildren(
       banner,
-      iconSvg(icons.alert, 14),
-      el('span', { class: 'flex-1 leading-relaxed', text: state.overviewError }),
+      iconSvg(icons.alert, 16),
+      el('span', { text: state.overviewError }),
       el('button', {
-        class: 'btn btn-ghost btn-sm',
+        class: 'button button--secondary button--small',
         type: 'button',
         text: '重试',
         on: { click: () => void loadOverview() },
@@ -359,91 +389,75 @@ export class App {
     )
   }
 
-  private renderSummary(accounts: AccountOverview[]): void {
-    if (!this.summaryGrid) return
+  /** 四格汇总。 */
+  private renderMetrics(accounts: AccountOverview[]): void {
+    if (!this.metricStrip) return
 
     let totalUsedGb = 0
     let running = 0
-    let stopped = 0
     let triggered = 0
-    let enabled = 0
     for (const account of accounts) {
       totalUsedGb += account.traffic_used_gb
-      if (account.enabled) enabled += 1
       if (account.threshold_triggered) triggered += 1
       for (const instance of account.instances) {
-        const status = instance.status.toLowerCase()
-        if (status === 'running') running += 1
-        else if (status === 'stopped') stopped += 1
+        if (instance.status.toLowerCase() === 'running') running += 1
       }
     }
 
-    const metric = (
-      label: string,
-      value: string,
-      hint: string,
-      icon: typeof icons.dashboard,
-      tone: 'brand' | 'ok' | 'warn' | 'danger' | 'muted',
-    ): HTMLElement => {
-      const toneMap = {
-        brand: ['var(--color-brand)', 'var(--color-brand-soft)'],
-        ok: ['var(--color-ok)', 'var(--color-ok-soft)'],
-        warn: ['var(--color-warn)', 'var(--color-warn-soft)'],
-        danger: ['var(--color-danger)', 'var(--color-danger-soft)'],
-        muted: ['var(--color-ink-muted)', 'var(--color-surface-muted)'],
-      } as const
-      const [fg, bg] = toneMap[tone]
-      return el(
-        'div',
-        {
-          class: 'flex items-center gap-3 px-4 py-3',
-        },
+    const metric = (options: {
+      icon: IconNode
+      label: string
+      value: string
+      suffix: string
+      tone: string
+    }): HTMLElement =>
+      el(
+        'article',
+        { class: `metric metric--${options.tone}` },
+        el('span', { class: 'metric-icon' }, iconSvg(options.icon, 20)),
         el(
           'div',
-          {
-            class: 'grid shrink-0 place-items-center rounded-lg',
-            style: { width: '36px', height: '36px', color: fg, backgroundColor: bg },
-          },
-          iconSvg(icon, 17),
-        ),
-        el(
-          'div',
-          { class: 'min-w-0' },
-          el('label', {
-            class: 'mb-1 block text-xs font-medium',
-            style: { color: 'var(--color-ink-muted)' },
-            text: label,
-          }),
+          {},
+          el('label', { text: options.label }),
           el(
-            'div',
-            { class: 'flex items-baseline' },
-            el('strong', {
-              class: 'text-lg font-semibold tabular-nums',
-              style: { color: fg },
-              text: value,
-            }),
-            el('small', {
-              class: 'ml-1 text-xs',
-              style: { color: 'var(--color-ink-subtle)' },
-              text: hint,
-            }),
+            'strong',
+            {},
+            options.value,
+            el('small', { text: options.suffix }),
           ),
         ),
       )
-    }
 
     replaceChildren(
-      this.summaryGrid,
-      metric('账号', `${enabled}`, `/ ${accounts.length}`, icons.server, 'brand'),
-      metric('本月流量', totalUsedGb.toFixed(1), 'GB', icons.chart, 'brand'),
-      metric('实例', `${running}`, `运行 / ${stopped} 停止`, icons.serverCog, 'ok'),
-      metric(
-        '熔断',
-        String(triggered),
-        triggered > 0 ? '已禁止拉起' : '正常',
-        icons.shield,
-        triggered > 0 ? 'danger' : 'muted',
-      ),
+      this.metricStrip,
+      metric({
+        icon: icons.server,
+        label: '实例总数',
+        value: String(accounts.length),
+        suffix: '台',
+        tone: 'blue',
+      }),
+      metric({
+        icon: icons.activity,
+        label: '运行中',
+        value: String(running),
+        suffix: '台',
+        tone: 'green',
+      }),
+      metric({
+        icon: icons.chart,
+        label: '累计流量',
+        value: totalUsedGb.toFixed(1),
+        suffix: 'GB',
+        tone: 'cyan',
+      }),
+      metric({
+        icon: icons.alert,
+        label: '阈值告警',
+        value: String(triggered),
+        suffix: '项',
+        tone: triggered > 0 ? 'red' : 'amber',
+      }),
     )
   }
 
@@ -457,8 +471,7 @@ export class App {
       state.overview !== null &&
       !state.overviewLoading &&
       accounts.length === 0
-    card.classList.toggle('hidden', !empty)
-    card.classList.toggle('flex', empty)
+    card.hidden = !empty
   }
 
   // -------------------------------------------------------------------------
@@ -471,10 +484,15 @@ export class App {
     this.settingsModal = null
     this.logDrawer = null
     this.shell = null
-    this.refreshButton = null
     this.errorBanner = null
-    this.summaryGrid = null
+    this.metricStrip = null
+    this.heartbeat = null
+    this.heartbeatText = null
+    this.lastRunNode = null
     this.emptyCard = null
+    this.refreshButton = null
+    this.mobileMenuButton = null
+    this.menuOpen = false
     clearToasts()
   }
 }

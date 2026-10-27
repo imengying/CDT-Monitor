@@ -5,11 +5,14 @@
  * 让组件代码能像写模板一样声明结构，同时保持零运行时依赖：
  *
  * ```ts
- * el('div', { class: 'card p-4' },
- *   el('h2', { class: 'text-sm' }, '标题'),
- *   el('button', { class: 'btn', onclick: () => save() }, '保存'),
+ * el('article', { class: 'account-card' },
+ *   el('h3', { text: '标题' }),
+ *   el('button', { class: 'button button--primary', on: { click: save } }, '保存'),
  * )
  * ```
+ *
+ * 样式全部是 `style.css` 里的语义类（`.account-card` / `.button` 等），
+ * 不使用 utility 框架，因此写什么类名就得到什么效果，没有扫不到就丢样式的风险。
  *
  * 设计取舍：
  * * **不做虚拟 DOM**：控制台的数据更新粒度很粗（整块重渲染），
@@ -19,6 +22,8 @@
  * * `attrs` 的键若不认识，就按 HTML 属性设置；`on*` 一律走
  *   `addEventListener`，不写内联事件。
  */
+
+import { icons, type IconNode } from './icons'
 
 /** 子节点允许的类型。 */
 export type Child = Node | string | number | null | undefined | false
@@ -167,4 +172,170 @@ export function onEscape(handler: () => void): () => void {
   }
   document.addEventListener('keydown', listener)
   return () => document.removeEventListener('keydown', listener)
+}
+
+// ---------------------------------------------------------------------------
+// 语义化构件
+// ---------------------------------------------------------------------------
+// 这几个在上面 `el()` 的基础上封装出全站统一的写法，避免每个组件各拼一遍。
+
+/** 小号大写标签。 */
+export function eyebrow(text: string): HTMLElement {
+  return el('p', { class: 'eyebrow', text })
+}
+
+/** 品牌标识：方形图标 + 两行文字。 */
+export function brandLockup(centered = false): HTMLElement {
+  return el(
+    'div',
+    { class: `brand-lockup${centered ? ' brand-lockup--center' : ''}` },
+    el('span', { class: 'brand-mark' }, iconSvg(icons.cloud, 21)),
+    el(
+      'div',
+      {},
+      el('b', { text: 'CDT MONITOR' }),
+      el('span', { text: 'CONTROL PLANE' }),
+    ),
+  )
+}
+
+/** 图标按钮（顶栏与卡片操作区通用）。 */
+export function iconButton(options: {
+  label: string
+  icon: IconNode
+  onClick: () => void
+  tone?: 'positive' | 'danger'
+  disabled?: boolean
+  className?: string
+  size?: number
+}): HTMLButtonElement {
+  const button = el('button', {
+    class: `icon-button${options.tone ? ` icon-button--${options.tone}` : ''}${options.className ? ` ${options.className}` : ''}`,
+    type: 'button',
+    'aria-label': options.label,
+    title: options.label,
+    on: { click: options.onClick },
+  }) as HTMLButtonElement
+  button.disabled = Boolean(options.disabled)
+  button.append(iconSvg(options.icon, options.size ?? 18))
+  return button
+}
+
+/** 字段容器：大写标签 + 内容。 */
+export function field(label: string, ...children: Child[]): HTMLElement {
+  return el('div', { class: 'field' }, el('label', { text: label }), ...children)
+}
+
+/** 带图标外壳的输入框。 */
+export function inputShell(options: {
+  icon?: IconNode
+  input: HTMLInputElement | HTMLTextAreaElement
+  suffix?: string
+  wide?: boolean
+}): HTMLElement {
+  const children: Child[] = []
+  if (options.icon) children.push(iconSvg(options.icon, 17))
+  children.push(options.input)
+  if (options.suffix) children.push(el('span', { class: 'suffix', text: options.suffix }))
+  return el('div', { class: 'input-shell' }, ...children)
+}
+
+/** 输入框本身（不带外壳样式，靠外层 `.input-shell` 呈现）。 */
+export function textInput(options: {
+  type?: string
+  value?: string
+  placeholder?: string
+  id?: string
+  autocomplete?: string
+  min?: number | string
+  max?: number | string
+  step?: number | string
+  spellcheck?: boolean
+}): HTMLInputElement {
+  return el('input', {
+    type: options.type ?? 'text',
+    value: options.value ?? '',
+    placeholder: options.placeholder ?? '',
+    id: options.id ?? '',
+    autocomplete: options.autocomplete ?? 'off',
+    spellcheck: options.spellcheck === false ? 'false' : undefined,
+    min: options.min,
+    max: options.max,
+    step: options.step,
+  }) as HTMLInputElement
+}
+
+/** 分段控件。 */
+export function segmented<T extends string>(options: {
+  value: T
+  items: readonly (readonly [T, string])[]
+  onChange: (value: T) => void
+}): HTMLElement {
+  return el(
+    'div',
+    { class: 'segmented', role: 'group' },
+    ...options.items.map(([key, label]) =>
+      el(
+        'button',
+        {
+          class: options.value === key ? 'active' : '',
+          type: 'button',
+          'data-value': key,
+          'aria-pressed': String(options.value === key),
+          text: label,
+          on: { click: () => options.onChange(key) },
+        },
+      ),
+    ),
+  )
+}
+
+/** 开关行：图标 + 标题 + 滑动开关。 */
+export function toggleRow(options: {
+  title: string
+  icon: IconNode
+  checked: boolean
+  onChange: (checked: boolean) => void
+}): HTMLElement {
+  const input = el('input', { type: 'checkbox' }) as HTMLInputElement
+  input.checked = options.checked
+  input.addEventListener('change', () => options.onChange(input.checked))
+
+  return el(
+    'label',
+    { class: 'toggle-row' },
+    el('span', {}, iconSvg(options.icon, 17)),
+    el('b', { text: options.title }),
+    input,
+    el('i', { class: 'toggle' }, el('em', {})),
+  )
+}
+
+/** 区块标题：图标方块 + 副标题 + 标题。 */
+export function sectionTitle(options: {
+  icon: IconNode
+  title: string
+  subtitle: string
+}): HTMLElement {
+  return el(
+    'div',
+    { class: 'section-title' },
+    el('span', {}, iconSvg(options.icon, 19)),
+    el(
+      'div',
+      {},
+      el('p', { text: options.subtitle }),
+      el('h3', { text: options.title }),
+    ),
+  )
+}
+
+/** 空状态块（无交互）。 */
+export function subtleEmpty(text: string, icon: IconNode): HTMLElement {
+  return el(
+    'div',
+    { class: 'subtle-empty' },
+    iconSvg(icon, 28),
+    el('span', { text }),
+  )
 }

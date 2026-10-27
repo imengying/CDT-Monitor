@@ -1,11 +1,12 @@
 /**
  * 登录卡片
  * ============================================================================
- * 居中登录卡片 + Cloudflare Turnstile。
+ * 居中登录卡片 + Cloudflare Turnstile，布局照搬上游 `Login`：
+ * 品牌锁定组 → 「ADMIN ACCESS / 欢迎回来 / 使用管理员凭据进入控制台」
+ * → 字段 → 主按钮。
  *
  * Turnstile 使用 `appearance: 'interaction-only'`：静默验证通过时卡片上
  * 不出现任何人机校验痕迹，仅在 Cloudflare 判定可疑时原地展开复选框。
- * 容器的可见性完全交由 Cloudflare 控制，不手动设置 `display`。
  *
  * 三个约束：
  *
@@ -19,7 +20,16 @@
  */
 
 import { api, ApiError } from '@/api/client'
-import { el, iconSvg, replaceChildren } from '@/lib/dom'
+import {
+  brandLockup,
+  el,
+  eyebrow,
+  field,
+  iconSvg,
+  inputShell,
+  replaceChildren,
+  textInput,
+} from '@/lib/dom'
 import { icons } from '@/lib/icons'
 import { afterLogin } from '@/lib/actions'
 import { store } from '@/lib/store'
@@ -28,7 +38,7 @@ const TURNSTILE_SCRIPT_TIMEOUT_MS = 10_000
 
 /** 登录卡片组件。 */
 export class LoginModal {
-  readonly element: HTMLDivElement
+  readonly element: HTMLElement
 
   private readonly card: HTMLFormElement
   private readonly usernameInput: HTMLInputElement
@@ -44,45 +54,36 @@ export class LoginModal {
   private pollTimer: number | null = null
 
   constructor(private readonly siteKey: string) {
-    this.usernameInput = el('input', {
-      class: 'input',
-      id: 'admin-username',
+    this.usernameInput = textInput({
       type: 'text',
-      autocomplete: 'username',
-      autocapitalize: 'off',
-      spellcheck: 'false',
+      id: 'admin-username',
       placeholder: '管理员用户名',
+      autocomplete: 'username',
+      spellcheck: false,
     })
 
     this.passwordInput = el('input', {
-      class: 'input',
-      id: 'admin-password',
       type: 'password',
-      autocomplete: 'current-password',
+      id: 'admin-password',
       placeholder: '请输入管理员密码',
-    })
+      autocomplete: 'current-password',
+    }) as HTMLInputElement
 
     this.submitButton = el(
       'button',
-      { class: 'btn btn-primary w-full', type: 'submit' },
-      '登录',
+      { class: 'button button--primary button--full', type: 'submit' },
+      el('span', { text: '安全登录' }),
     ) as HTMLButtonElement
 
     this.widgetHost = el('div', { class: 'cf-turnstile' })
 
-    this.errorBox = el('div', {
-      class: 'mb-4 hidden items-start gap-2 rounded-lg px-3 py-2 text-xs',
-      role: 'alert',
-      style: {
-        backgroundColor: 'var(--color-danger-soft)',
-        color: 'var(--color-danger)',
-      },
-    })
+    this.errorBox = el('div', { class: 'inline-error', role: 'alert' })
+    this.errorBox.hidden = true
 
     this.card = el(
       'form',
       {
-        class: 'card p-6',
+        class: 'glass-card auth-card',
         on: {
           submit: (event) => {
             event.preventDefault()
@@ -90,43 +91,33 @@ export class LoginModal {
           },
         },
       },
+      el('div', { class: 'large-icon' }, iconSvg(icons.shield, 28)),
+      eyebrow('ADMIN ACCESS'),
+      el('h1', { text: '欢迎回来' }),
+      el('p', { class: 'muted', text: '使用管理员凭据进入控制台' }),
       el(
         'div',
-        { class: 'mb-3' },
-        el(
-          'label',
-          { class: 'label', for: 'admin-username' },
-          el(
-            'span',
-            { class: 'inline-flex items-center gap-1.5' },
-            iconSvg(icons.cloud, 13),
-            '用户名',
-          ),
-        ),
-        this.usernameInput,
+        { class: 'form-stack' },
+        field('管理员用户名', inputShell({ icon: icons.cloud, input: this.usernameInput })),
+        field('管理员密码', inputShell({ icon: icons.key, input: this.passwordInput })),
+        this.buildTurnstileSection(),
       ),
-      el(
-        'div',
-        { class: 'mb-5' },
-        el(
-          'label',
-          { class: 'label', for: 'admin-password' },
-          el('span', { class: 'inline-flex items-center gap-1.5' }, iconSvg(icons.key, 13), '密码'),
-        ),
-        this.passwordInput,
-      ),
-      this.buildTurnstileSection(),
       this.errorBox,
       this.submitButton,
     )
 
     this.element = el(
-      'div',
-      { class: 'flex min-h-full items-center justify-center px-4 py-10' },
+      'main',
+      { class: 'login-shell' },
       el(
         'div',
-        { class: 'w-full max-w-sm' },
-        this.buildBrand(),
+        { class: 'login-card-stack' },
+        el(
+          'div',
+          { class: 'login-brand' },
+          brandLockup(true),
+          el('p', { text: '阿里云 CDT 流量与实例自动化控制台' }),
+        ),
         this.card,
       ),
     )
@@ -139,26 +130,6 @@ export class LoginModal {
     }
   }
 
-  /** 品牌区。 */
-  private buildBrand(): HTMLDivElement {
-    return el(
-      'div',
-      { class: 'mb-6 flex flex-col items-center gap-3 text-center' },
-      el(
-        'div',
-        {
-          class: 'flex h-12 w-12 items-center justify-center rounded-2xl text-white shadow-lg',
-          style: { background: 'linear-gradient(135deg, #2563eb, #0ea5e9)' },
-        },
-        iconSvg(icons.shield, 24),
-      ),
-      el('h1', {
-        class: 'text-xl font-semibold tracking-tight',
-        text: 'CDT Monitor',
-      }),
-    )
-  }
-
   /**
    * Turnstile 区域。
    *
@@ -166,21 +137,12 @@ export class LoginModal {
    * 已保证无交互需求时不渲染可见内容。被 `display: none` 隐藏的容器内
    * Turnstile 不会执行校验，token 无法获取。
    */
-  private buildTurnstileSection(): HTMLDivElement {
-    const available = this.siteKey.trim().length > 0
-
-    if (!available) {
+  private buildTurnstileSection(): HTMLElement {
+    if (!this.siteKey.trim()) {
       // 后台没启用 Turnstile（默认状态）：什么都不渲染，卡片保持干净。
-      // 不显示"未配置"告警 —— 这是正常配置，不是故障。
-      return el('div', { class: 'hidden', dataset: { role: 'turnstile-off' } })
+      return el('div', { hidden: true, dataset: { role: 'turnstile-off' } })
     }
-
-    // 不给容器加固定高度：静默通过时它自然塌陷为 0，不影响卡片布局。
-    return el(
-      'div',
-      { class: 'mb-5', dataset: { role: 'turnstile-section' } },
-      this.widgetHost,
-    )
+    return el('div', { dataset: { role: 'turnstile-section' } }, this.widgetHost)
   }
 
   /** 等待 Turnstile 脚本加载完成。 */
@@ -220,12 +182,11 @@ export class LoginModal {
       return
     }
 
-
     if (this.widgetId !== null) return
 
     this.widgetId = window.turnstile.render(this.widgetHost, {
       sitekey: this.siteKey,
-      theme: 'auto',
+      theme: 'light',
       size: 'flexible',
       language: 'zh-CN',
       // 关键：默认不显示，仅在需要人工交互时才展开复选框
@@ -237,13 +198,6 @@ export class LoginModal {
         this.token = token
         this.hideError()
         this.syncSubmitState()
-      },
-
-      // Turnstile 在需要人工确认时会自己画出复选框，无需额外文字说明。
-      'before-interactive-callback': () => {
-      },
-
-      'after-interactive-callback': () => {
       },
 
       'expired-callback': () => {
@@ -263,7 +217,6 @@ export class LoginModal {
       },
 
       'unsupported-callback': () => {
-        // 浏览器不支持 / 站点配置异常：明确提示，别留下静默失败的卡片
         this.showError('当前浏览器不支持人机校验组件，请更换浏览器后重试')
       },
     })
@@ -282,8 +235,7 @@ export class LoginModal {
    * 读取当前 token。
    *
    * `interaction-only` 下静默校验通过时，`callback` 会带上 token；
-   * 但极少数情况下（例如回调时序）内部状态已就绪而本地变量还是空，
-   * 此时用 `getResponse()` 兜底，避免误判为「未通过校验」。
+   * 极少数情况下内部状态已就绪而本地变量还是空，此时用 `getResponse()` 兜底。
    */
   private currentToken(): string {
     if (this.token) return this.token
@@ -304,34 +256,30 @@ export class LoginModal {
    *
    * 不要求 token 非空：`interaction-only` 下的静默校验由 Cloudflare
    * 异步完成，耗时不可预期，等待 token 会造成按钮长时间不可点。
-   * 条件为「已填密码且未在提交中」，token 于提交瞬间读取，
-   * 未就绪时给出提示（见 `submit()`）。
    */
   private syncSubmitState(): void {
     const ready = !this.submitting && this.passwordInput.value.length > 0
-
     this.submitButton.disabled = !ready
+
     replaceChildren(
       this.submitButton,
       ...(this.submitting
-        ? [iconSvg(icons.spinner, 15, 'animate-spin'), el('span', { text: '验证中…' })]
-        : [el('span', { text: '登录' })]),
+        ? [iconSvg(icons.spinner, 18, 'spin'), el('span', { text: '验证中…' })]
+        : [iconSvg(icons.arrowRight, 18), el('span', { text: '安全登录' })]),
     )
   }
 
   private showError(message: string): void {
-    this.errorBox.classList.remove('hidden')
-    this.errorBox.classList.add('flex')
+    this.errorBox.hidden = false
     replaceChildren(
       this.errorBox,
-      iconSvg(icons.alert, 14),
-      el('span', { class: 'leading-relaxed', text: message }),
+      iconSvg(icons.alert, 16),
+      el('span', { text: message }),
     )
   }
 
   private hideError(): void {
-    this.errorBox.classList.add('hidden')
-    this.errorBox.classList.remove('flex')
+    this.errorBox.hidden = true
     this.errorBox.replaceChildren()
   }
 
@@ -342,7 +290,6 @@ export class LoginModal {
 
     const token = this.currentToken()
     if (this.siteKey.trim() && !token) {
-      // 静默校验尚未完成：提示用户稍候，而不是静默失败
       this.showError('人机校验尚未完成，请稍候重试')
       return
     }

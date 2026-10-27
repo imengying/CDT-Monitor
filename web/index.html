@@ -1,10 +1,11 @@
 <!doctype html>
-<html lang="zh-CN" class="h-full">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#F2F2F7" />
     <meta name="robots" content="noindex, nofollow" />
+    <meta name="description" content="CDT Monitor 云资源流量与实例控制台" />
     <title>CDT Monitor</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="apple-touch-icon" href="/favicon.svg" />
@@ -14,25 +15,9 @@
       async
       defer
     ></script>
-    <style>
-      /* 首屏防闪烁：脚本执行前先按系统主题铺底色 */
-      html {
-        background-color: #f8fafc;
-      }
-      @media (prefers-color-scheme: dark) {
-        html {
-          background-color: #0b1120;
-        }
-      }
-      /* Turnstile 小组件在暗色下的边框更协调 */
-      .cf-turnstile {
-        border-radius: 0.5rem;
-        overflow: hidden;
-      }
-    </style>
   </head>
-  <body class="h-full">
-    <div id="app" class="h-full"></div>
+  <body>
+    <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

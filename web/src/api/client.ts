@@ -643,10 +643,3 @@ export function relativeTime(ms: number | null): string {
   if (hours < 24) return `${hours} 小时前`
   return `${Math.floor(hours / 24)} 天前`
 }
-
-/** 进度条配色：按占用比例升级危险等级。 */
-export function percentTone(percent: number): 'ok' | 'warn' | 'danger' {
-  if (percent >= 100) return 'danger'
-  if (percent >= 80) return 'warn'
-  return 'ok'
-}

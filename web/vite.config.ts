@@ -1,9 +1,11 @@
 import { fileURLToPath, URL } from 'node:url'
 import { defineConfig } from 'vite'
-import tailwindcss from '@tailwindcss/vite'
 
 /**
  * 前端构建配置（纯 TypeScript，无框架）。
+ *
+ * 样式是手写 CSS（`src/style.css`），不经过任何 utility 框架的按需扫描 ——
+ * 类名全部显式写出来，产物里不会有「没被扫到就丢样式」的隐患。
  *
  * 产物输出到 `web/dist`，由 Worker 的 `ASSETS` 绑定托管
  * （见根目录 wrangler.toml 的 `[assets]`）。
@@ -13,7 +15,6 @@ import tailwindcss from '@tailwindcss/vite'
  * SameSite=Strict，跨端口会被浏览器丢弃。
  */
 export default defineConfig({
-  plugins: [tailwindcss()],
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),

@@ -1,29 +1,34 @@
 /**
- * 设置弹窗（对应原版 `SettingsModal.vue`）
+ * 设置弹窗
  * ============================================================================
- * 五个标签页：阿里云账号 CRUD / Telegram / Bark / 日报 / 系统。
+ * 结构照搬上游 `SettingsPanel`：
+ *
+ *   modal-layer
+ *   ├ modal-scrim
+ *   └ settings-panel
+ *     ├ header         SYSTEM PREFERENCES / 控制台设置 / 关闭
+ *     ├ settings-tabs  横排标签
+ *     ├ settings-content 逐页内容（settings-section / section-title / form-grid）
+ *     └ settings-footer  保存变更
  *
  * 交互约定：
- * * 所有保存都在弹窗内就地反馈（顶部提示条），不关闭弹窗；
- * * 凭据字段（Secret / Token / Device Key）永不回显，只显示「已配置」；
- *   留空表示不修改，另有显式「清除」勾选框；
- * * 「测试发送」「立即推送日报」走异步 Job，期间按钮禁用。
- *
- * 表单状态统一放在 `draft` 对象里，渲染时读它、输入时写它。
- * 这样切换标签页再切回来，用户填了一半的内容不会丢。
+ * * 凭据字段（Secret / Token / Device Key）永不回显，只显示「已配置」，
+ *   留空表示不修改；
+ * * 表单状态统一放在 `draft` 对象里，渲染时读它、输入时写它，
+ *   切换标签页再切回来不会丢用户填了一半的内容。
  */
 
 import {
   api,
   ApiError,
+  formatTime,
+  relativeTime,
   type AccountDto,
   type AccountInput,
   type BarkUpdate,
   type NotifyChannel,
   type OverLimitAction,
   type PushLevel,
-  formatTime,
-  relativeTime,
   type SessionDevice,
   type SettingsResponse,
   type SiteType,
@@ -31,7 +36,20 @@ import {
   type TelegramUpdate,
   type TurnstileUpdate,
 } from '@/api/client'
-import { el, iconSvg, onEscape, replaceChildren } from '@/lib/dom'
+import {
+  el,
+  eyebrow,
+  field,
+  iconButton,
+  iconSvg,
+  inputShell,
+  onEscape,
+  replaceChildren,
+  sectionTitle,
+  subtleEmpty,
+  textInput,
+  toggleRow,
+} from '@/lib/dom'
 import { icons, type IconNode } from '@/lib/icons'
 import { afterSettingsChanged, pushDailyReport, testNotification } from '@/lib/actions'
 import { toast } from '@/lib/store'
@@ -103,6 +121,26 @@ function blankAccountForm(): AccountForm {
   }
 }
 
+/** 由 DTO 生成表单（Secret 永远留空）。 */
+function formFromAccount(account: AccountDto): AccountForm {
+  return {
+    id: account.id,
+    name: account.name,
+    siteType: account.site_type,
+    accessKeyId: account.access_key_id,
+    accessKeySecret: '',
+    regionId: account.region_id,
+    instanceId: account.instance_id ?? '',
+    trafficThresholdGb: account.traffic_threshold_gb,
+    overLimitAction: account.over_limit_action,
+    stopMode: account.stop_mode,
+    scheduleStart: account.schedule_start_time ?? '',
+    scheduleStop: account.schedule_stop_time ?? '',
+    spotKeepAlive: account.spot_keep_alive,
+    enabled: account.enabled,
+  }
+}
+
 /** 从 UA 提炼可读设备名（与后端 short_device 保持一致的粒度）。 */
 function deviceName(ua: string): string {
   const lower = ua.toLowerCase()
@@ -135,25 +173,15 @@ function deviceName(ua: string): string {
   return platform ? `${browser} · ${platform}` : browser
 }
 
-/** 由 DTO 生成表单（Secret 永远留空）。 */
-function formFromAccount(account: AccountDto): AccountForm {
-  return {
-    id: account.id,
-    name: account.name,
-    siteType: account.site_type,
-    accessKeyId: account.access_key_id,
-    accessKeySecret: '',
-    regionId: account.region_id,
-    instanceId: account.instance_id ?? '',
-    trafficThresholdGb: account.traffic_threshold_gb,
-    overLimitAction: account.over_limit_action,
-    stopMode: account.stop_mode,
-    scheduleStart: account.schedule_start_time ?? '',
-    scheduleStop: account.schedule_stop_time ?? '',
-    spotKeepAlive: account.spot_keep_alive,
-    enabled: account.enabled,
-  }
-}
+/** 选项卡定义。 */
+const TABS: { key: Tab; label: string; icon: IconNode }[] = [
+  { key: 'accounts', label: '实例', icon: icons.server },
+  { key: 'turnstile', label: '人机校验', icon: icons.shield },
+  { key: 'telegram', label: 'Telegram', icon: icons.send },
+  { key: 'bark', label: 'Bark', icon: icons.phone },
+  { key: 'report', label: '日报', icon: icons.bell },
+  { key: 'system', label: '系统', icon: icons.settings },
+]
 
 /** 设置弹窗。 */
 export class SettingsModal {
@@ -163,7 +191,9 @@ export class SettingsModal {
   private activeTab: Tab = 'accounts'
 
   private readonly content: HTMLDivElement
+  private readonly footer: HTMLElement
   private readonly tabButtons = new Map<Tab, HTMLButtonElement>()
+  private readonly saveButton: HTMLButtonElement
 
   private form: AccountForm = blankAccountForm()
   private formOpen = false
@@ -171,18 +201,8 @@ export class SettingsModal {
   private saving = false
   private testing: NotifyChannel | 'report' | null = null
 
-  private turnstileDraft = {
-    enabled: false,
-    siteKey: '',
-    secretKey: '',
-  }
-
-  private telegramDraft = {
-    enabled: false,
-    chatId: '',
-    token: '',
-  }
-
+  private turnstileDraft = { enabled: false, siteKey: '', secretKey: '' }
+  private telegramDraft = { enabled: false, chatId: '', token: '' }
   private barkDraft = {
     enabled: false,
     serverUrl: 'https://api.day.app',
@@ -190,54 +210,66 @@ export class SettingsModal {
     normalLevel: 'active' as PushLevel,
     alertLevel: 'critical' as PushLevel,
   }
-
   private reportDraft = { enabled: false, time: '09:00' }
   private timezoneDraft = 'UTC+8'
-  private advancedDraft = {
-    logLevel: 'error',
-    jobLockMinutes: 10,
-    sessionDays: 7,
-  }
+  private advancedDraft = { logLevel: 'error', jobLockMinutes: 10, sessionDays: 14 }
+
   private devices: SessionDevice[] = []
   private devicesLoaded = false
   private kicking: string | null = null
-  /** 设备列表容器。数据更新时只替换内部节点，不重渲染整个设置页。 */
   private deviceListHost: HTMLDivElement | null = null
-  /** 地域多选浮层（挂在 body 上，需手动清理）。 */
-  private regionPanel: HTMLDivElement | null = null
-  /** 浮层的滚动跟随解绑函数；随面板一起清理。 */
-  private regionPanelCleanup: (() => void) | null = null
 
   private removeEscListener: (() => void) | null = null
 
   constructor() {
-    this.content = el('div', { class: 'scroll-thin min-h-0 flex-1 overflow-y-auto p-6' })
+    this.content = el('div', { class: 'settings-content' })
+    this.saveButton = el('button', {
+      class: 'button button--primary',
+      type: 'button',
+      on: { click: () => this.saveActiveTab() },
+    }) as HTMLButtonElement
+    this.footer = el('footer', { class: 'settings-footer' }, this.saveButton)
+
+    const nav = el('nav', { class: 'settings-tabs' })
+    for (const tab of TABS) {
+      const button = el('button', {
+        type: 'button',
+        on: {
+          click: () => {
+            this.activeTab = tab.key
+            this.formOpen = false
+            this.confirmDeleteId = null
+            this.renderNav()
+            this.renderContent()
+          },
+        },
+      }) as HTMLButtonElement
+      replaceChildren(button, iconSvg(tab.icon, 17), el('span', { text: tab.label }))
+      this.tabButtons.set(tab.key, button)
+      nav.append(button)
+    }
 
     this.element = el(
       'div',
-      {
-        class: 'overlay hidden',
-        on: {
-          click: (event) => {
-            if (event.target === this.element) this.close()
-          },
-        },
-      },
+      { class: 'modal-layer', hidden: true },
+      el('div', { class: 'modal-scrim', on: { click: () => this.close() } }),
       el(
-        'div',
+        'section',
         {
-          class: 'card flex h-[min(42rem,88vh)] w-full max-w-5xl flex-col overflow-hidden',
+          class: 'settings-panel',
           role: 'dialog',
           'aria-modal': 'true',
           'aria-label': '系统设置',
         },
-        this.buildHeader(),
         el(
-          'div',
-          { class: 'flex min-h-0 flex-1 flex-col md:flex-row' },
-          this.buildNav(),
-          this.content,
+          'header',
+          {},
+          el('div', {}, eyebrow('SYSTEM PREFERENCES'), el('h2', { text: '控制台设置' })),
+          iconButton({ label: '关闭', icon: icons.close, onClick: () => this.close() }),
         ),
+        nav,
+        this.content,
+        this.footer,
       ),
     )
   }
@@ -250,14 +282,10 @@ export class SettingsModal {
    * 打开弹窗。
    *
    * `startWithNewAccount` 打开后直接进入新增账号表单，供空状态的
-   * 「添加账号」按钮使用。
+   * 「添加实例」按钮使用。
    * `editAccountId` 打开后直接进入指定账号的编辑表单，供卡片上的设置按钮使用。
    */
-  open(
-    settings: SettingsResponse | null,
-    startWithNewAccount = false,
-    editAccountId?: number,
-  ): void {
+  open(settings: SettingsResponse | null, startWithNewAccount = false, editAccountId?: number): void {
     this.settings = settings
     this.syncDrafts()
     this.activeTab = 'accounts'
@@ -270,44 +298,27 @@ export class SettingsModal {
     this.confirmDeleteId = null
     this.devices = []
     this.devicesLoaded = false
-    this.element.classList.remove('hidden')
-    this.element.style.display = 'flex'
+    this.deviceListHost = null
+    this.element.hidden = false
     document.body.style.overflow = 'hidden'
     this.renderNav()
     this.renderContent()
     this.removeEscListener = onEscape(() => this.close())
-    requestAnimationFrame(() => {
-      this.element.querySelector<HTMLElement>('input, button')?.focus()
-    })
   }
 
   /** 关闭弹窗。 */
   close(): void {
-    this.element.classList.add('hidden')
-    this.element.style.display = 'none'
+    this.element.hidden = true
     document.body.style.overflow = ''
-    this.closeRegionPanel()
     this.removeEscListener?.()
     this.removeEscListener = null
-  }
-
-  /** 关闭地域浮层并解绑滚动跟随（幂等）。 */
-  private closeRegionPanel(): void {
-    this.regionPanel?.remove()
-    this.regionPanel = null
-    this.regionPanelCleanup?.()
-    this.regionPanelCleanup = null
   }
 
   /**
    * 外部数据刷新（store 里的 settings 变了）。
    *
    * **只更新数据，不重渲染**。弹窗是一个正在编辑的表单：任何 store 变更
-   * （包括本弹窗自己保存后触发的刷新）都不能冲掉用户已经输入的内容。
-   * 需要重渲染的时机全部由弹窗内部显式控制：
-   * * 保存成功后：`syncDrafts()` + `renderContent()`（用服务端最新值覆盖草稿）
-   * * 切换标签页：`renderContent()`
-   * * 打开弹窗：`open()` 内部同步
+   * 都不能冲掉用户已经输入的内容。
    */
   update(settings: SettingsResponse | null): void {
     this.settings = settings
@@ -323,13 +334,11 @@ export class SettingsModal {
       siteKey: settings.turnstile.site_key,
       secretKey: '',
     }
-
     this.telegramDraft = {
       enabled: settings.telegram.enabled,
       chatId: settings.telegram.chat_id ?? '',
       token: '',
     }
-
     this.barkDraft = {
       enabled: settings.bark.enabled,
       serverUrl: settings.bark.server_url,
@@ -337,7 +346,6 @@ export class SettingsModal {
       normalLevel: settings.bark.normal_level,
       alertLevel: settings.bark.alert_level,
     }
-
     this.reportDraft = {
       enabled: settings.daily_report.enabled,
       time: settings.daily_report.time,
@@ -351,155 +359,57 @@ export class SettingsModal {
   }
 
   // -------------------------------------------------------------------------
-  // 骨架
+  // 通用控件
   // -------------------------------------------------------------------------
 
-  private buildHeader(): HTMLElement {
-    return el(
-      'header',
-      {
-        class: 'flex items-center justify-between gap-3 border-b px-5 py-3',
-        style: { borderColor: 'var(--color-line)' },
-      },
-      el('h2', { class: 'text-sm font-semibold', text: '系统设置' }),
-      el(
-        'button',
-        {
-          class: 'btn btn-ghost btn-sm',
-          type: 'button',
-          'aria-label': '关闭',
-          on: { click: () => this.close() },
-        },
-        iconSvg(icons.close, 14),
-      ),
-    )
-  }
-
-  private buildNav(): HTMLElement {
-    const nav = el('nav', {
-      class:
-        'flex shrink-0 gap-1 overflow-x-auto border-b p-2 md:w-48 md:flex-col md:border-r md:border-b-0',
-      style: { borderColor: 'var(--color-line)' },
-    })
-
-    const tabs: { key: Tab; label: string; icon: IconNode }[] = [
-      { key: 'accounts', label: '阿里云账号', icon: icons.server },
-      { key: 'turnstile', label: '人机校验', icon: icons.shield },
-      { key: 'telegram', label: 'Telegram', icon: icons.send },
-      { key: 'bark', label: 'Bark', icon: icons.phone },
-      { key: 'report', label: '日报', icon: icons.bell },
-      { key: 'system', label: '系统', icon: icons.key },
-    ]
-
-    for (const tab of tabs) {
-      const button = el('button', {
-        class: 'btn btn-sm justify-start whitespace-nowrap',
-        type: 'button',
-        style: { borderColor: 'transparent' },
-        on: {
-          click: () => {
-            this.activeTab = tab.key
-            this.formOpen = false
-            this.confirmDeleteId = null
-            this.renderNav()
-            this.renderContent()
-          },
-        },
-      }) as HTMLButtonElement
-      replaceChildren(button, iconSvg(tab.icon, 13), el('span', { text: tab.label }))
-      this.tabButtons.set(tab.key, button)
-      nav.append(button)
-    }
-
-    // 初始高亮
-    queueMicrotask(() => this.renderNav())
-    return nav
-  }
-
-  private renderNav(): void {
-    for (const [key, button] of this.tabButtons) {
-      button.className =
-        key === this.activeTab
-          ? 'btn btn-primary btn-sm justify-start whitespace-nowrap'
-          : 'btn btn-ghost btn-sm justify-start whitespace-nowrap'
-      button.style.borderColor = 'transparent'
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // 通用表单控件
-  // -------------------------------------------------------------------------
-
-  /** 输入框 + 标签。 */
-  private field(label: string, control: HTMLElement, hint?: string): HTMLElement {
-    return el(
-      'div',
-      {},
-      el('label', { class: 'label', text: label }),
-      control,
-      ...(hint
-        ? [
-            el('p', {
-              class: 'mt-1 text-xs',
-              style: { color: 'var(--color-ink-subtle)' },
-              text: hint,
-            }),
-          ]
-        : []),
-    )
-  }
-
-  /** 文本输入，onInput 立即写回。 */
-  private textInput(
+  /** 单行输入（带外壳）。 */
+  private line(
     initial: string,
     onInput: (value: string) => void,
-    attrs: { type?: string; placeholder?: string; mono?: boolean; autocomplete?: string } = {},
-  ): HTMLInputElement {
-    const input = el('input', {
-      class: attrs.mono === false ? 'input' : 'input font-mono',
-      type: attrs.type ?? 'text',
-      placeholder: attrs.placeholder ?? '',
-      autocomplete: attrs.autocomplete ?? 'off',
-    }) as HTMLInputElement
-    input.value = initial
+    options: {
+      type?: string
+      placeholder?: string
+      icon?: IconNode
+      suffix?: string
+      min?: string
+      step?: string
+    } = {},
+  ): HTMLElement {
+    const input = textInput({
+      type: options.type ?? 'text',
+      value: initial,
+      placeholder: options.placeholder,
+      autocomplete: options.type === 'password' ? 'new-password' : 'off',
+      min: options.min,
+      step: options.step,
+    })
     input.addEventListener('input', () => onInput(input.value))
-    return input
+    return inputShell({ icon: options.icon, input, suffix: options.suffix })
   }
 
-  /** 数值输入。 */
-  /**
-   * 数字输入。
-   *
-   * `min` 默认 0.1（时长、天数这类不该为 0 的字段），
-   * 但「填 0 表示用默认值」的字段必须传 `min: 0`，
-   * 否则浏览器的 min 校验会把 0 判为非法输入。
-   */
-  private numberInput(
+  /** 数字输入。 */
+  private numberLine(
     initial: number,
     onInput: (value: number) => void,
-    min = '0.1',
-  ): HTMLInputElement {
-    const input = el('input', {
-      class: 'input',
-      type: 'number',
-      min,
-      step: '0.1',
-    }) as HTMLInputElement
-    input.value = String(initial)
-    input.addEventListener('input', () => {
-      const parsed = Number(input.value)
-      onInput(Number.isFinite(parsed) ? parsed : 0)
-    })
-    return input
+    options: { min?: string; step?: string; suffix?: string } = {},
+  ): HTMLElement {
+    return this.line(
+      String(initial),
+      (raw) => {
+        const parsed = Number(raw)
+        onInput(Number.isFinite(parsed) ? parsed : 0)
+      },
+      { type: 'number', min: options.min ?? '0.1', step: options.step ?? '1', suffix: options.suffix },
+    )
   }
 
-  /** 下拉框。 */
-  private selectInput<T extends string>(
+  /** 下拉选择。 */
+  private picker<T extends string>(
     initial: T,
     options: { value: T; label: string }[],
     onChange: (value: T) => void,
-  ): HTMLSelectElement {
-    const node = el('select', { class: 'input' }) as HTMLSelectElement
+  ): HTMLElement {
+    const node = el('select', { class: 'native-select' }) as HTMLSelectElement
     for (const option of options) {
       node.append(el('option', { value: option.value, text: option.label }))
     }
@@ -508,50 +418,17 @@ export class SettingsModal {
     return node
   }
 
-  /** 开关。 */
-  private switchControl(
-    label: string,
-    get: () => boolean,
-    set: (value: boolean) => void,
-  ): HTMLElement {
-    const track = el('span', {
-      class: 'switch',
-      role: 'switch',
-      tabindex: '0',
-      'aria-checked': String(get()),
-      'aria-label': label,
-      dataset: { on: String(get()) },
-    })
-    track.append(el('span', { class: 'switch-knob' }))
-
-    const toggle = (event: Event): void => {
-      event.preventDefault()
-      const next = !get()
-      set(next)
-      track.dataset.on = String(next)
-      track.setAttribute('aria-checked', String(next))
-    }
-    track.addEventListener('click', toggle)
-    track.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') toggle(event)
-    })
-
-    return el(
-      'label',
-      { class: 'flex cursor-pointer items-center gap-2 text-xs' },
-      track,
-      el('span', { text: label }),
-    )
+  /** 「已配置」徽章。 */
+  private configuredBadge(configured: boolean): HTMLElement | null {
+    return configured ? el('span', { class: 'badge badge-ok', text: '已配置' }) : null
   }
 
-  /** 复选框行。 */
-  /** 表单提交按钮。 */
-  private submitButton(label: string): HTMLButtonElement {
-    return el(
-      'button',
-      { class: 'btn btn-primary', type: 'submit' },
-      el('span', { text: label }),
-    ) as HTMLButtonElement
+  /** 带徽章的字段标签。 */
+  private labeledField(label: string, control: HTMLElement, badge?: HTMLElement | null): HTMLElement {
+    const labelNode = el('label', {})
+    labelNode.append(el('span', { text: label }))
+    if (badge) labelNode.append(badge)
+    return el('div', { class: 'field' }, labelNode, control)
   }
 
   /** 异步按钮（测试发送 / 推送日报）。 */
@@ -561,13 +438,16 @@ export class SettingsModal {
     key: NotifyChannel | 'report',
     action: () => Promise<void>,
   ): HTMLButtonElement {
-    const button = el('button', { class: 'btn btn-ghost', type: 'button' }) as HTMLButtonElement
+    const button = el('button', {
+      class: 'button button--secondary',
+      type: 'button',
+    }) as HTMLButtonElement
 
     const paint = (busy: boolean): void => {
       button.disabled = busy || this.testing !== null
       replaceChildren(
         button,
-        ...(busy ? [iconSvg(icons.spinner, 13, 'animate-spin')] : [iconSvg(icon, 13)]),
+        iconSvg(busy ? icons.spinner : icon, 18, busy ? 'spin' : ''),
         el('span', { text: label }),
       )
     }
@@ -588,13 +468,25 @@ export class SettingsModal {
   }
 
   // -------------------------------------------------------------------------
-  // 内容分发
+  // 导航与内容分发
   // -------------------------------------------------------------------------
+
+  private renderNav(): void {
+    for (const [key, button] of this.tabButtons) {
+      button.classList.toggle('active', key === this.activeTab)
+      button.setAttribute('aria-selected', String(key === this.activeTab))
+    }
+    // 只有账号 / 通知 / 系统页有独立的保存动作
+    this.footer.hidden = this.activeTab === 'report'
+  }
 
   private renderContent(): void {
     switch (this.activeTab) {
       case 'accounts':
         this.renderAccounts()
+        break
+      case 'turnstile':
+        this.renderTurnstile()
         break
       case 'telegram':
         this.renderTelegram()
@@ -605,153 +497,138 @@ export class SettingsModal {
       case 'report':
         this.renderReport()
         break
-      case 'turnstile':
-        this.renderTurnstile()
-        break
       case 'system':
         this.renderSystem()
         break
     }
   }
 
+  private saveActiveTab(): void {
+    switch (this.activeTab) {
+      case 'turnstile':
+        void this.saveTurnstile()
+        break
+      case 'telegram':
+        void this.saveTelegram()
+        break
+      case 'bark':
+        void this.saveBark()
+        break
+      case 'report':
+        void this.saveReport()
+        break
+      case 'system':
+        void this.saveSystem()
+        break
+      case 'accounts':
+        break
+    }
+  }
+
   // -------------------------------------------------------------------------
-  // 账号
+  // 实例
   // -------------------------------------------------------------------------
 
   private renderAccounts(): void {
     const accounts = this.settings?.accounts ?? []
 
-    const header = el(
+    const addButton = el(
+      'button',
+      {
+        class: 'button button--secondary button--small',
+        type: 'button',
+        on: {
+          click: () => {
+            this.form = blankAccountForm()
+            this.formOpen = true
+            this.renderContent()
+          },
+        },
+      },
+      iconSvg(icons.plus, 18),
+      el('span', { text: '添加实例' }),
+    )
+
+    const heading = el(
       'div',
-      { class: 'flex items-start justify-between gap-3' },
-      el(
-        'div',
-        {},
-        el('h3', { class: 'text-xs font-semibold', text: '阿里云账号' }),
-        el('p', {
-          class: 'mt-0.5 text-[0.8125rem]',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: 'AccessKey Secret 使用 XChaCha20-Poly1305 加密。',
-        }),
-      ),
-      this.formOpen
-        ? el('span')
-        : el(
-            'button',
-            {
-              class: 'btn btn-primary btn-sm',
-              type: 'button',
-              on: {
-                click: () => {
-                  this.form = blankAccountForm()
-                  this.formOpen = true
-                  this.renderContent()
-                },
-              },
-            },
-            iconSvg(icons.plus, 13),
-            el('span', { text: '新增' }),
-          ),
+      { class: 'section-title-row' },
+      sectionTitle({
+        icon: icons.server,
+        title: '云端实例',
+        subtitle: 'ALIYUN ACCOUNTS',
+      }),
+      this.formOpen ? el('span') : addButton,
     )
 
     const body = this.formOpen ? this.buildAccountForm() : this.buildAccountList(accounts)
-    replaceChildren(this.content, el('div', { class: 'space-y-4' }, header, body))
+    replaceChildren(this.content, el('div', { class: 'settings-section' }, heading, body))
   }
 
   private buildAccountList(accounts: AccountDto[]): HTMLElement {
     if (accounts.length === 0) {
-      return el('div', {
-        class: 'rounded-lg border border-dashed px-3 py-6 text-center text-[0.8125rem]',
-        style: {
-          borderColor: 'var(--color-line)',
-          color: 'var(--color-ink-subtle)',
-        },
-        text: '尚未添加账号。',
-      })
+      return subtleEmpty('尚未配置实例', icons.server)
     }
 
-    const list = el('ul', { class: 'space-y-2' })
+    const list = el('div', { class: 'account-settings-list' })
 
     for (const account of accounts) {
-      const titleRow = el(
+      const head = el(
         'div',
-        { class: 'flex flex-wrap items-center gap-1.5' },
-        el('span', { class: 'truncate text-xs font-semibold', text: account.name }),
-        el('span', { class: 'badge badge-brand', text: account.site_label }),
-        ...(account.enabled
-          ? []
-          : [el('span', { class: 'badge badge-muted', text: '已停用' })]),
-      )
-
-      const metaRow = el('div', {
-        class: 'mt-1 font-mono text-[0.8125rem]',
-        style: { color: 'var(--color-ink-subtle)' },
-        text: `${account.access_key_id_masked} · ${account.region_name} · 阈值 ${account.traffic_threshold_gb > 0 ? `${account.traffic_threshold_gb} GB` : '未设'}`,
-      })
-
-      const actions = el(
-        'div',
-        { class: 'flex items-center gap-1.5' },
-        el(
-          'button',
-          {
-            class: 'btn btn-ghost btn-sm',
-            type: 'button',
-            on: {
-              click: () => {
-                this.form = formFromAccount(account)
-                this.formOpen = true
-                this.renderContent()
-              },
-            },
-          },
-          iconSvg(icons.pencil, 12),
-          el('span', { text: '编辑' }),
-        ),
-        el(
-          'button',
-          {
-            class: 'btn btn-danger btn-sm',
-            type: 'button',
-            on: {
-              click: () => {
-                this.confirmDeleteId = this.confirmDeleteId === account.id ? null : account.id
-                this.renderContent()
-              },
-            },
-          },
-          iconSvg(icons.trash, 12),
-          el('span', { text: '删除' }),
-        ),
-      )
-
-      const children: HTMLElement[] = [
+        { class: 'account-editor__head' },
         el(
           'div',
-          { class: 'flex flex-wrap items-center justify-between gap-2' },
-          el('div', { class: 'min-w-0' }, titleRow, metaRow),
-          actions,
+          {},
+          el('b', { text: account.name }),
+          el('small', {
+            text: [
+              account.region_name,
+              account.access_key_id_masked,
+              account.traffic_threshold_gb > 0
+                ? `阈值 ${account.traffic_threshold_gb} GB`
+                : '未设阈值',
+              account.enabled ? '' : '已停用',
+            ]
+              .filter(Boolean)
+              .join(' · '),
+          }),
         ),
-      ]
+        el(
+          'div',
+          { class: 'account-editor__actions' },
+          iconButton({
+            label: '编辑',
+            icon: icons.pencil,
+            onClick: () => {
+              this.form = formFromAccount(account)
+              this.formOpen = true
+              this.renderContent()
+            },
+          }),
+          iconButton({
+            label: '删除',
+            icon: icons.trash,
+            tone: 'danger',
+            onClick: () => {
+              this.confirmDeleteId = this.confirmDeleteId === account.id ? null : account.id
+              this.renderContent()
+            },
+          }),
+        ),
+      )
+
+      const editor = el('div', { class: 'account-editor' }, head)
 
       if (this.confirmDeleteId === account.id) {
-        children.push(
+        editor.append(
           el(
             'div',
-            {
-              class:
-                'mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md px-2.5 py-2 text-[0.8125rem]',
-              style: {
-                backgroundColor: 'var(--color-danger-soft)',
-                color: 'var(--color-danger)',
-              },
-            },
+            { class: 'confirm-strip' },
             el('span', { text: '快照与流量历史将一并删除。' }),
             el(
               'div',
-              { class: 'flex gap-1.5' },
+              { class: 'control-group' },
               el('button', {
-                class: 'btn btn-ghost btn-sm',
+                class: 'button button--secondary button--small',
                 type: 'button',
                 text: '取消',
                 on: {
@@ -761,30 +638,18 @@ export class SettingsModal {
                   },
                 },
               }),
-              el(
-                'button',
-                {
-                  class: 'btn btn-danger btn-sm',
-                  type: 'button',
-                  on: { click: () => void this.deleteAccount(account.id) },
-                },
-                el('span', { text: '确认删除' }),
-              ),
+              el('button', {
+                class: 'button button--primary button--small',
+                type: 'button',
+                text: '确认删除',
+                on: { click: () => void this.deleteAccount(account.id) },
+              }),
             ),
           ),
         )
       }
 
-      list.append(
-        el(
-          'li',
-          {
-            class: 'rounded-lg border px-3 py-2.5',
-            style: { borderColor: 'var(--color-line)' },
-          },
-          ...children,
-        ),
-      )
+      list.append(editor)
     }
 
     return list
@@ -793,18 +658,134 @@ export class SettingsModal {
   private buildAccountForm(): HTMLElement {
     const form = this.form
 
-    const scheduleStart = this.textInput(form.scheduleStart, (value) => {
+    const scheduleStart = this.line(form.scheduleStart, (value) => {
       this.form.scheduleStart = value
     }, { placeholder: '08:00' })
 
-    const scheduleStop = this.textInput(form.scheduleStop, (value) => {
+    const scheduleStop = this.line(form.scheduleStop, (value) => {
       this.form.scheduleStop = value
     }, { placeholder: '23:00' })
+
+    const fields = el(
+      'div',
+      { class: 'form-grid account-fields' },
+      field(
+        '账号名称',
+        this.line(form.name, (value) => {
+          this.form.name = value
+        }, { placeholder: '例如：香港主节点' }),
+      ),
+      field(
+        '站点类型',
+        this.picker(
+          form.siteType,
+          [
+            { value: 'china', label: '中国站（CNY）' },
+            { value: 'intl', label: '国际站（USD）' },
+          ],
+          (value) => {
+            this.form.siteType = value
+          },
+        ),
+      ),
+      field(
+        'AccessKey ID',
+        this.line(form.accessKeyId, (value) => {
+          this.form.accessKeyId = value
+        }, { placeholder: 'LTAI5t…' }),
+      ),
+      field(
+        'AccessKey Secret',
+        this.line(form.accessKeySecret, (value) => {
+          this.form.accessKeySecret = value
+        }, {
+          type: 'password',
+          placeholder: form.id === null ? '输入 Secret' : '留空保持不变',
+        }),
+      ),
+      field(
+        '地域',
+        this.picker(form.regionId, REGION_OPTIONS, (value) => {
+          this.form.regionId = value
+        }),
+      ),
+      field(
+        '实例 ID',
+        this.line(form.instanceId, (value) => {
+          this.form.instanceId = value
+        }, { placeholder: 'i-bp…' }),
+      ),
+      field(
+        '告警阈值（GB）',
+        this.numberLine(
+          form.trafficThresholdGb,
+          (value) => {
+            this.form.trafficThresholdGb = value
+          },
+          { min: '0', suffix: 'GB' },
+        ),
+      ),
+      field(
+        '超限动作',
+        this.picker(
+          form.overLimitAction,
+          [
+            { value: 'stop_and_notify', label: '停机并通知' },
+            { value: 'notify_only', label: '仅通知' },
+          ],
+          (value) => {
+            this.form.overLimitAction = value
+          },
+        ),
+      ),
+      field(
+        '停机模式',
+        this.picker(
+          form.stopMode,
+          [
+            { value: 'StopCharging', label: '节省停机' },
+            { value: 'KeepCharging', label: '普通停机' },
+          ],
+          (value) => {
+            this.form.stopMode = value
+          },
+        ),
+      ),
+      field('每日定时开机', scheduleStart),
+      field('每日定时关机', scheduleStop),
+      el(
+        'div',
+        { class: 'account-fields__full toggle-list' },
+        toggleRow({
+          title: '抢占式实例保活',
+          icon: icons.zap,
+          checked: form.spotKeepAlive,
+          onChange: (checked) => {
+            this.form.spotKeepAlive = checked
+          },
+        }),
+        toggleRow({
+          title: '启用该实例',
+          icon: icons.power,
+          checked: form.enabled,
+          onChange: (checked) => {
+            this.form.enabled = checked
+          },
+        }),
+      ),
+      el(
+        'p',
+        { class: 'field-hint account-fields__full' },
+        el('span', {
+          text: '定时开关与保活按时间格式 HH:MM 填写，留空表示不启用。',
+        }),
+      ),
+    )
 
     return el(
       'form',
       {
-        class: 'space-y-3',
+        class: 'account-editor',
         on: {
           submit: (event) => {
             event.preventDefault()
@@ -814,16 +795,15 @@ export class SettingsModal {
       },
       el(
         'div',
-        { class: 'flex items-center justify-between' },
-        el('h4', {
-          class: 'text-xs font-semibold',
-          text: form.id === null ? '新增账号' : `编辑账号 #${form.id}`,
-        }),
+        { class: 'account-editor__head' },
+        el('b', { text: form.id === null ? '新增实例' : `编辑「${form.name || form.id}」` }),
         el(
-          'button',
-          {
-            class: 'btn btn-ghost btn-sm',
+          'div',
+          { class: 'account-editor__actions' },
+          el('button', {
+            class: 'button button--secondary button--small',
             type: 'button',
+            text: '取消',
             on: {
               click: () => {
                 this.formOpen = false
@@ -831,175 +811,18 @@ export class SettingsModal {
                 this.renderContent()
               },
             },
-          },
-          iconSvg(icons.chevronDown, 12),
-          el('span', { text: '收起' }),
-        ),
-      ),
-
-      el(
-        'div',
-        { class: 'grid gap-3 sm:grid-cols-2' },
-        this.field(
-          '账号名称',
-          this.textInput(form.name, (value) => {
-            this.form.name = value
-          }, { placeholder: '例如：生产环境', mono: false }),
-        ),
-        this.field(
-          '站点',
-          this.selectInput(
-            form.siteType,
-            [
-              { value: 'china', label: '中国站（aliyuncs.com）' },
-              { value: 'intl', label: '国际站（ap-southeast-1）' },
-            ],
-            (value) => {
-              this.form.siteType = value
-            },
-          ),
-        ),
-        this.field(
-          'AccessKey ID',
-          this.textInput(form.accessKeyId, (value) => {
-            this.form.accessKeyId = value
-          }, { placeholder: 'LTAI...' }),
-        ),
-        this.field(
-          'AccessKey Secret',
-          this.textInput(form.accessKeySecret, (value) => {
-            this.form.accessKeySecret = value
-          }, {
-            type: 'password',
-            placeholder: form.id === null ? '必填' : '留空表示不修改',
-            autocomplete: 'new-password',
           }),
-        ),
-      ),
-
-      el(
-        'div',
-        { class: 'grid gap-3 sm:grid-cols-3' },
-        this.field(
-          '地域',
-          this.selectInput(
-            form.regionId,
-            REGION_OPTIONS.map((item) => ({ value: item.value, label: item.label })),
-            (value) => {
-              this.form.regionId = value
-            },
-          ),
-        ),
-        this.field(
-          '实例 ID',
-          this.textInput(form.instanceId, (value) => {
-            this.form.instanceId = value
-          }, { placeholder: 'i-bp…（可留空）' }),
-        ),
-        this.field(
-          '停机模式',
-          this.selectInput(
-            form.stopMode,
-            [
-              { value: 'StopCharging', label: '节省停机' },
-              { value: 'KeepCharging', label: '普通停机' },
-            ],
-            (value) => {
-              this.form.stopMode = value
-            },
+          el(
+            'button',
+            { class: 'button button--primary button--small', type: 'submit' },
+            el('span', { text: form.id === null ? '创建实例' : '保存修改' }),
           ),
         ),
       ),
-
-      el(
-        'div',
-        { class: 'grid gap-3 sm:grid-cols-2' },
-        this.field(
-          '告警阈值（GB）',
-          this.numberInput(
-            form.trafficThresholdGb,
-            (value) => {
-              this.form.trafficThresholdGb = value
-            },
-            '0',
-          ),
-          '达到此值即告警；填 0 表示不限制也不告警',
-        ),
-        this.field(
-          '超限动作',
-          this.selectInput(
-            form.overLimitAction,
-            [
-              { value: 'stop_and_notify', label: '停机并通知' },
-              { value: 'notify_only', label: '仅通知' },
-            ],
-            (value) => {
-              this.form.overLimitAction = value
-            },
-          ),
-        ),
-      ),
-
-      el(
-        'div',
-        { class: 'grid gap-3 sm:grid-cols-2' },
-        this.field('每日定时开机', scheduleStart, '格式 HH:MM，留空表示不启用'),
-        this.field('每日定时关机', scheduleStop, '格式 HH:MM，留空表示不启用'),
-      ),
-
-      el(
-        'div',
-        { class: 'flex flex-wrap items-center gap-4 pt-1' },
-        this.switchControl(
-          '抢占式保活',
-          () => this.form.spotKeepAlive,
-          (value) => {
-            this.form.spotKeepAlive = value
-          },
-        ),
-        this.switchControl(
-          '启用该账号',
-          () => this.form.enabled,
-          (value) => {
-            this.form.enabled = value
-          },
-        ),
-      ),
-
-      el('p', {
-        class: 'text-xs leading-relaxed',
-        style: { color: 'var(--color-ink-subtle)' },
-        text: '仅在允许运行时段内、且当日未执行定时关机时，才会把处于停止状态的抢占实例重新启动。阿里云不区分实例是被系统收回还是手动停机，手动停机前请先关闭保活。',
-      }),
-
-      el(
-        'div',
-        {
-          class: 'flex justify-end gap-2 border-t pt-3',
-          style: { borderColor: 'var(--color-line)' },
-        },
-        el('button', {
-          class: 'btn btn-ghost',
-          type: 'button',
-          text: '取消',
-          on: {
-            click: () => {
-              this.formOpen = false
-              this.form = blankAccountForm()
-              this.renderContent()
-            },
-          },
-        }),
-        el(
-          'button',
-          { class: 'btn btn-primary', type: 'submit' },
-          el('span', { text: form.id === null ? '创建账号' : '保存修改' }),
-        ),
-      ),
+      fields,
     )
   }
 
-  /** 解析地域文本。 */
   private async submitAccount(): Promise<void> {
     if (this.saving) return
     const form = this.form
@@ -1039,10 +862,10 @@ export class SettingsModal {
     try {
       if (form.id === null) {
         await api.createAccount(payload)
-        toast('账号已添加')
+        toast('实例已添加', 'ok')
       } else {
         await api.updateAccount(form.id, payload)
-        toast('账号已更新')
+        toast('实例已更新', 'ok')
       }
       this.formOpen = false
       this.form = blankAccountForm()
@@ -1050,7 +873,7 @@ export class SettingsModal {
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      toast(error instanceof ApiError ? error.message : '保存账号失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '保存失败', 'danger')
     } finally {
       this.saving = false
     }
@@ -1062,138 +885,66 @@ export class SettingsModal {
     try {
       await api.deleteAccount(id)
       this.confirmDeleteId = null
-      toast('账号已删除')
+      toast('实例已删除', 'ok')
       await afterSettingsChanged()
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      toast(error instanceof ApiError ? error.message : '删除账号失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '删除失败', 'danger')
     } finally {
       this.saving = false
     }
   }
 
   // -------------------------------------------------------------------------
-  // 人机校验（Turnstile）
+  // 人机校验
   // -------------------------------------------------------------------------
 
   private renderTurnstile(): void {
     const configured = this.settings?.turnstile.secret_configured ?? false
-    const active = this.settings?.turnstile.enabled ?? false
-
-    const siteInput = this.textInput(
-      this.turnstileDraft.siteKey,
-      (value) => {
-        this.turnstileDraft.siteKey = value
-      },
-      { placeholder: '0x4AAAAAAAA...' },
-    )
-
-    const secretInput = this.textInput(
-      this.turnstileDraft.secretKey,
-      (value) => {
-        this.turnstileDraft.secretKey = value
-      },
-      {
-        type: 'password',
-        placeholder: configured ? '留空表示不修改' : '0x4AAAAAAAA...',
-      },
-    )
-
-    const children: HTMLElement[] = [
-      el(
-        'div',
-        {},
-        el('h3', { class: 'text-xs font-semibold', text: 'Cloudflare Turnstile' }),
-        el('p', {
-          class: 'mt-0.5 text-[0.8125rem] leading-relaxed',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: '配置登录时的人机校验。',
-        }),
-      ),
-      // 仅启用时显示状态；未启用是默认状态，无需额外说明
-      ...(active
-        ? [
-            el(
-              'div',
-              {
-                class: 'flex items-start gap-2 rounded-lg px-3 py-2 text-[0.8125rem]',
-                style: {
-                  backgroundColor: 'var(--color-ok-soft)',
-                  color: 'var(--color-ok)',
-                },
-              },
-              iconSvg(icons.shield, 13),
-              el('span', {
-                class: 'leading-relaxed',
-                text: '已启用。',
-              }),
-            ),
-          ]
-        : []),
-      el(
-        'div',
-        {},
-        el(
-          'label',
-          { class: 'label' },
-          el('span', { text: '站点公钥 Site Key' }),
-        ),
-        siteInput,
-      ),
-      el(
-        'div',
-        {},
-        el(
-          'label',
-          { class: 'label' },
-          el('span', { text: '私钥 Secret Key' }),
-          ...(configured ? [el('span', { class: 'badge badge-ok ml-1', text: '已配置' })] : []),
-        ),
-        secretInput,
-      ),
-      this.switchControl(
-        '启用人机校验',
-        () => this.turnstileDraft.enabled,
-        (value) => {
-          this.turnstileDraft.enabled = value
-        },
-      ),
-    ]
-
-    children.push(
-      el(
-        'p',
-        {
-          class: 'text-[0.8125rem] leading-relaxed',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: '私钥使用 XChaCha20-Poly1305 加密。',
-        },
-      ),
-      el(
-        'div',
-        {
-          class: 'flex flex-wrap justify-end gap-2 border-t pt-3',
-          style: { borderColor: 'var(--color-line)' },
-        },
-        this.submitButton('保存'),
-      ),
-    )
 
     replaceChildren(
       this.content,
       el(
-        'form',
-        {
-          class: 'space-y-4',
-          on: {
-            submit: (event) => {
-              event.preventDefault()
-              void this.saveTurnstile()
+        'div',
+        { class: 'settings-section' },
+        sectionTitle({
+          icon: icons.shield,
+          title: '人机校验',
+          subtitle: 'CLOUDFLARE TURNSTILE',
+        }),
+        el(
+          'div',
+          { class: 'form-grid settings-form' },
+          field(
+            '站点公钥 Site Key',
+            this.line(this.turnstileDraft.siteKey, (value) => {
+              this.turnstileDraft.siteKey = value
+            }, { placeholder: '0x4AAAAAAAA…' }),
+          ),
+          this.labeledField(
+            '私钥 Secret Key',
+            this.line(this.turnstileDraft.secretKey, (value) => {
+              this.turnstileDraft.secretKey = value
+            }, {
+              type: 'password',
+              placeholder: configured ? '留空保持不变' : '0x4AAAAAAAA…',
+            }),
+            this.configuredBadge(configured),
+          ),
+        ),
+        el(
+          'div',
+          { class: 'toggle-list' },
+          toggleRow({
+            title: '启用人机校验',
+            icon: icons.shield,
+            checked: this.turnstileDraft.enabled,
+            onChange: (checked) => {
+              this.turnstileDraft.enabled = checked
             },
-          },
-        },
-        ...children,
+          }),
+        ),
       ),
     )
   }
@@ -1201,27 +952,17 @@ export class SettingsModal {
   private async saveTurnstile(): Promise<void> {
     if (this.saving) return
 
-    const payload: TurnstileUpdate = {
-      enabled: this.turnstileDraft.enabled,
-    }
+    const payload: TurnstileUpdate = { enabled: this.turnstileDraft.enabled }
     const siteKey = this.turnstileDraft.siteKey.trim()
     if (siteKey) payload.site_key = siteKey
     const secretKey = this.turnstileDraft.secretKey.trim()
     if (secretKey) payload.secret_key = secretKey
 
-    this.saving = true
-    try {
-      const settings = await api.updateTurnstile(payload)
-      this.settings = settings
-      toast('人机校验设置已保存')
-      await afterSettingsChanged()
-      this.syncDrafts()
-      this.renderContent()
-    } catch (error) {
-      toast(error instanceof ApiError ? error.message : '保存人机校验设置失败', 'danger')
-    } finally {
-      this.saving = false
-    }
+    await this.runSave(
+      () => api.updateTurnstile(payload),
+      '人机校验设置已保存',
+      '保存人机校验设置失败',
+    )
   }
 
   // -------------------------------------------------------------------------
@@ -1231,79 +972,55 @@ export class SettingsModal {
   private renderTelegram(): void {
     const configured = this.settings?.telegram.token_configured ?? false
 
-    const tokenInput = this.textInput(
-      this.telegramDraft.token,
-      (value) => {
-        this.telegramDraft.token = value
-      },
-      {
-        type: 'password',
-        placeholder: configured ? '留空表示不修改' : '123456:AA...',
-      },
-    )
-
-    const chatInput = this.textInput(this.telegramDraft.chatId, (value) => {
-      this.telegramDraft.chatId = value
-    }, { placeholder: '-1001234567890' })
-
-    const children: HTMLElement[] = [
-      el(
-        'div',
-        {},
-        el('h3', { class: 'text-xs font-semibold', text: 'Telegram 通知' }),
-        el('p', {
-          class: 'mt-0.5 text-[0.8125rem]',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: '直连 api.telegram.org。',
-        }),
-      ),
-      el(
-        'div',
-        {},
-        el(
-          'label',
-          { class: 'label' },
-          el('span', { text: 'Bot Token' }),
-          ...(configured ? [el('span', { class: 'badge badge-ok ml-1', text: '已配置' })] : []),
-        ),
-        tokenInput,
-      ),
-      this.field('Chat ID', chatInput),
-      this.switchControl(
-        '启用 Telegram 通知',
-        () => this.telegramDraft.enabled,
-        (value) => {
-          this.telegramDraft.enabled = value
-        },
-      ),
-    ]
-
-    children.push(
-      el(
-        'div',
-        {
-          class: 'flex flex-wrap justify-between gap-2 border-t pt-3',
-          style: { borderColor: 'var(--color-line)' },
-        },
-        this.asyncButton('测试发送', icons.send, 'telegram', () => testNotification('telegram')),
-        this.submitButton('保存'),
-      ),
-    )
-
     replaceChildren(
       this.content,
       el(
-        'form',
-        {
-          class: 'space-y-4',
-          on: {
-            submit: (event) => {
-              event.preventDefault()
-              void this.saveTelegram()
+        'div',
+        { class: 'settings-section' },
+        sectionTitle({
+          icon: icons.send,
+          title: 'Telegram',
+          subtitle: 'DELIVERY CHANNEL',
+        }),
+        el(
+          'div',
+          { class: 'form-grid settings-form' },
+          this.labeledField(
+            'Bot Token',
+            this.line(this.telegramDraft.token, (value) => {
+              this.telegramDraft.token = value
+            }, {
+              type: 'password',
+              placeholder: configured ? '留空保持不变' : '123456:AA…',
+            }),
+            this.configuredBadge(configured),
+          ),
+          field(
+            'Chat ID',
+            this.line(this.telegramDraft.chatId, (value) => {
+              this.telegramDraft.chatId = value
+            }, { placeholder: '-1001234567890' }),
+          ),
+        ),
+        el(
+          'div',
+          { class: 'toggle-list' },
+          toggleRow({
+            title: '启用 Telegram 通知',
+            icon: icons.send,
+            checked: this.telegramDraft.enabled,
+            onChange: (checked) => {
+              this.telegramDraft.enabled = checked
             },
-          },
-        },
-        ...children,
+          }),
+        ),
+        el(
+          'div',
+          { class: 'notification-action-row' },
+          this.asyncButton('发送测试', icons.send, 'telegram', () =>
+            testNotification('telegram'),
+          ),
+        ),
       ),
     )
   }
@@ -1319,19 +1036,11 @@ export class SettingsModal {
       payload.token = this.telegramDraft.token.trim()
     }
 
-    this.saving = true
-    try {
-      await api.updateTelegram(payload)
-      toast('Telegram 配置已保存')
-      await afterSettingsChanged()
-      // 已保存的 Token 不再回显：用服务端最新状态重置草稿
-      this.syncDrafts()
-      this.renderContent()
-    } catch (error) {
-      toast(error instanceof ApiError ? error.message : '保存 Telegram 配置失败', 'danger')
-    } finally {
-      this.saving = false
-    }
+    await this.runSave(
+      () => api.updateTelegram(payload),
+      'Telegram 配置已保存',
+      '保存 Telegram 配置失败',
+    )
   }
 
   // -------------------------------------------------------------------------
@@ -1341,101 +1050,67 @@ export class SettingsModal {
   private renderBark(): void {
     const configured = this.settings?.bark.device_key_configured ?? false
 
-    const serverInput = this.textInput(this.barkDraft.serverUrl, (value) => {
-      this.barkDraft.serverUrl = value
-    }, { placeholder: 'https://api.day.app' })
-
-    const keyInput = this.textInput(
-      this.barkDraft.deviceKey,
-      (value) => {
-        this.barkDraft.deviceKey = value
-      },
-      {
-        type: 'password',
-        placeholder: configured ? '留空表示不修改' : '设备密钥',
-      },
-    )
-
     const levelOptions: { value: PushLevel; label: string }[] = [
       { value: 'active', label: 'active（安静）' },
       { value: 'timeSensitive', label: 'timeSensitive（时效）' },
       { value: 'critical', label: 'critical（关键）' },
     ]
 
-    const children: HTMLElement[] = [
-      el(
-        'div',
-        {},
-        el('h3', { class: 'text-xs font-semibold', text: 'Bark 通知' }),
-        el('p', {
-          class: 'mt-0.5 text-[0.8125rem]',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: '普通通知与告警可分别设置推送级别。',
-        }),
-      ),
-      this.field('Server URL', serverInput),
-      el(
-        'div',
-        {},
-        el(
-          'label',
-          { class: 'label' },
-          el('span', { text: 'Device Key' }),
-          ...(configured ? [el('span', { class: 'badge badge-ok ml-1', text: '已配置' })] : []),
-        ),
-        keyInput,
-      ),
-      el(
-        'div',
-        { class: 'grid gap-3 sm:grid-cols-2' },
-        this.field(
-          '普通通知级别',
-          this.selectInput(this.barkDraft.normalLevel, levelOptions, (value) => {
-            this.barkDraft.normalLevel = value
-          }),
-        ),
-        this.field(
-          '熔断告警级别',
-          this.selectInput(this.barkDraft.alertLevel, levelOptions, (value) => {
-            this.barkDraft.alertLevel = value
-          }),
-        ),
-      ),
-      this.switchControl(
-        '启用 Bark 通知',
-        () => this.barkDraft.enabled,
-        (value) => {
-          this.barkDraft.enabled = value
-        },
-      ),
-    ]
-
-    children.push(
-      el(
-        'div',
-        {
-          class: 'flex flex-wrap justify-between gap-2 border-t pt-3',
-          style: { borderColor: 'var(--color-line)' },
-        },
-        this.asyncButton('测试发送', icons.send, 'bark', () => testNotification('bark')),
-        this.submitButton('保存'),
-      ),
-    )
-
     replaceChildren(
       this.content,
       el(
-        'form',
-        {
-          class: 'space-y-4',
-          on: {
-            submit: (event) => {
-              event.preventDefault()
-              void this.saveBark()
+        'div',
+        { class: 'settings-section' },
+        sectionTitle({ icon: icons.phone, title: 'Bark', subtitle: 'DELIVERY CHANNEL' }),
+        el(
+          'div',
+          { class: 'form-grid settings-form' },
+          field(
+            'Server URL',
+            this.line(this.barkDraft.serverUrl, (value) => {
+              this.barkDraft.serverUrl = value
+            }, { placeholder: 'https://api.day.app' }),
+          ),
+          this.labeledField(
+            'Device Key',
+            this.line(this.barkDraft.deviceKey, (value) => {
+              this.barkDraft.deviceKey = value
+            }, {
+              type: 'password',
+              placeholder: configured ? '留空保持不变' : '设备密钥',
+            }),
+            this.configuredBadge(configured),
+          ),
+          field(
+            '普通通知级别',
+            this.picker(this.barkDraft.normalLevel, levelOptions, (value) => {
+              this.barkDraft.normalLevel = value
+            }),
+          ),
+          field(
+            '熔断告警级别',
+            this.picker(this.barkDraft.alertLevel, levelOptions, (value) => {
+              this.barkDraft.alertLevel = value
+            }),
+          ),
+        ),
+        el(
+          'div',
+          { class: 'toggle-list' },
+          toggleRow({
+            title: '启用 Bark 通知',
+            icon: icons.phone,
+            checked: this.barkDraft.enabled,
+            onChange: (checked) => {
+              this.barkDraft.enabled = checked
             },
-          },
-        },
-        ...children,
+          }),
+        ),
+        el(
+          'div',
+          { class: 'notification-action-row' },
+          this.asyncButton('发送测试', icons.send, 'bark', () => testNotification('bark')),
+        ),
       ),
     )
   }
@@ -1453,18 +1128,7 @@ export class SettingsModal {
       payload.device_key = this.barkDraft.deviceKey.trim()
     }
 
-    this.saving = true
-    try {
-      await api.updateBark(payload)
-      toast('Bark 配置已保存')
-      await afterSettingsChanged()
-      this.syncDrafts()
-      this.renderContent()
-    } catch (error) {
-      toast(error instanceof ApiError ? error.message : '保存 Bark 配置失败', 'danger')
-    } finally {
-      this.saving = false
-    }
+    await this.runSave(() => api.updateBark(payload), 'Bark 配置已保存', '保存 Bark 配置失败')
   }
 
   // -------------------------------------------------------------------------
@@ -1472,49 +1136,38 @@ export class SettingsModal {
   // -------------------------------------------------------------------------
 
   private renderReport(): void {
-    const timeInput = this.textInput(this.reportDraft.time, (value) => {
-      this.reportDraft.time = value
-    }, { placeholder: '09:00' })
-
     replaceChildren(
       this.content,
       el(
-        'form',
-        {
-          class: 'space-y-4',
-          on: {
-            submit: (event) => {
-              event.preventDefault()
-              void this.saveReport()
-            },
-          },
-        },
+        'div',
+        { class: 'settings-section' },
+        sectionTitle({ icon: icons.bell, title: '每日日报', subtitle: 'DAILY REPORT' }),
         el(
           'div',
-          {},
-          el('h3', { class: 'text-xs font-semibold', text: '每日日报' }),
-          el('p', {
-            class: 'mt-0.5 text-[0.8125rem]',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '每日推送一次。',
+          { class: 'form-grid settings-form' },
+          field(
+            '推送时间（按账号时区）',
+            this.line(this.reportDraft.time, (value) => {
+              this.reportDraft.time = value
+            }, { placeholder: '09:00' }),
+          ),
+        ),
+        el(
+          'div',
+          { class: 'toggle-list' },
+          toggleRow({
+            title: '启用每日日报推送',
+            icon: icons.bell,
+            checked: this.reportDraft.enabled,
+            onChange: (checked) => {
+              this.reportDraft.enabled = checked
+            },
           }),
         ),
-        this.field('推送时间（HH:MM，按账号时区）', timeInput),
-        this.switchControl(
-          '启用每日日报推送',
-          () => this.reportDraft.enabled,
-          (value) => {
-            this.reportDraft.enabled = value
-          },
-        ),
         el(
           'div',
-          {
-            class: 'flex flex-wrap justify-between gap-2 border-t pt-3',
-            style: { borderColor: 'var(--color-line)' },
-          },
+          { class: 'notification-action-row' },
           this.asyncButton('立即推送一次', icons.bell, 'report', () => pushDailyReport()),
-          this.submitButton('保存'),
         ),
       ),
     )
@@ -1526,19 +1179,11 @@ export class SettingsModal {
       toast('日报时间格式应为 HH:MM', 'warn')
       return
     }
-
-    this.saving = true
-    try {
-      await api.updateDailyReport(this.reportDraft.enabled, this.reportDraft.time.trim())
-      toast('日报设置已保存')
-      await afterSettingsChanged()
-      this.syncDrafts()
-      this.renderContent()
-    } catch (error) {
-      toast(error instanceof ApiError ? error.message : '保存日报设置失败', 'danger')
-    } finally {
-      this.saving = false
-    }
+    await this.runSave(
+      () => api.updateDailyReport(this.reportDraft.enabled, this.reportDraft.time.trim()),
+      '日报设置已保存',
+      '保存日报设置失败',
+    )
   }
 
   // -------------------------------------------------------------------------
@@ -1546,22 +1191,21 @@ export class SettingsModal {
   // -------------------------------------------------------------------------
 
   private renderSystem(): void {
-    const tzSelect = el('select', { class: 'input' }) as HTMLSelectElement
-    const options = this.settings?.timezone_options ?? []
-    for (const option of options) {
-      const item = el('option', { value: option.value, text: option.label }) as HTMLOptionElement
-      if (option.value === this.timezoneDraft) item.selected = true
-      tzSelect.append(item)
+    const tzOptions = this.settings?.timezone_options ?? []
+    const tzSelect = el('select', { class: 'native-select' }) as HTMLSelectElement
+    for (const option of tzOptions) {
+      tzSelect.append(el('option', { value: option.value, text: option.label }))
     }
     // 服务端返回的当前值若不在选项内（例如历史配置），补进去以免显示成第一项
-    if (this.timezoneDraft && !options.some((o) => o.value === this.timezoneDraft)) {
-      const legacy = el('option', {
-        value: this.timezoneDraft,
-        text: `${this.timezoneDraft}（当前）`,
-      }) as HTMLOptionElement
-      legacy.selected = true
-      tzSelect.prepend(legacy)
+    if (this.timezoneDraft && !tzOptions.some((o) => o.value === this.timezoneDraft)) {
+      tzSelect.prepend(
+        el('option', {
+          value: this.timezoneDraft,
+          text: `${this.timezoneDraft}（当前）`,
+        }),
+      )
     }
+    tzSelect.value = this.timezoneDraft
     tzSelect.addEventListener('change', () => {
       this.timezoneDraft = tzSelect.value
     })
@@ -1570,117 +1214,66 @@ export class SettingsModal {
       this.content,
       el(
         'div',
-        { class: 'space-y-5' },
+        { class: 'settings-section' },
+        sectionTitle({ icon: icons.calendar, title: '时区', subtitle: 'TIMEZONE' }),
+        el('div', { class: 'form-grid settings-form' }, field('系统时区', tzSelect)),
+
         el(
           'div',
-          {},
-          el('h3', { class: 'text-sm font-semibold', text: '时区' }),
-          el('p', {
-            class: 'mt-1 text-xs leading-relaxed',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '影响账期、定时开关机、日报与图表。',
-          }),
-          el(
-            'form',
-            {
-              class: 'mt-2 flex gap-2',
-              on: {
-                submit: (event) => {
-                  event.preventDefault()
-                  void this.saveTimezone()
-                },
-              },
-            },
-            tzSelect,
-            el(
-              'button',
-              { class: 'btn btn-primary shrink-0', type: 'submit' },
-              el('span', { text: '保存' }),
-            ),
-          ),
-        ),
-        el(
-          'div',
-          { class: 'border-t pt-4', style: { borderColor: 'var(--color-line)' } },
+          { class: 'settings-divider' },
           el(
             'div',
-            { class: 'flex items-center justify-between gap-2' },
-            el('h3', { class: 'text-sm font-semibold', text: '登录设备' }),
-            el(
-              'button',
-              {
-                class: 'btn btn-ghost btn-sm',
-                type: 'button',
-                on: { click: () => void this.loadDevices(true) },
-              },
-              iconSvg(icons.refresh, 12),
-              el('span', { text: '刷新' }),
+            { class: 'section-title-row' },
+            sectionTitle({ icon: icons.settings, title: '高级', subtitle: 'ADVANCED' }),
+          ),
+          el(
+            'div',
+            { class: 'form-grid settings-form' },
+            field(
+              '日志级别',
+              this.picker(
+                this.advancedDraft.logLevel as 'error' | 'warn' | 'info' | 'debug',
+                [
+                  { value: 'error', label: 'error · 仅错误' },
+                  { value: 'warn', label: 'warn · 含警告' },
+                  { value: 'info', label: 'info · 含流程' },
+                  { value: 'debug', label: 'debug' },
+                ],
+                (value) => {
+                  this.advancedDraft.logLevel = value
+                },
+              ),
+            ),
+            field(
+              '任务锁窗口',
+              this.numberLine(this.advancedDraft.jobLockMinutes, (value) => {
+                this.advancedDraft.jobLockMinutes = value
+              }, { min: '1', suffix: '分钟' }),
+            ),
+            field(
+              '会话有效期',
+              this.numberLine(this.advancedDraft.sessionDays, (value) => {
+                this.advancedDraft.sessionDays = value
+              }, { min: '1', suffix: '天' }),
             ),
           ),
-          el('p', {
-            class: 'mt-1 text-xs leading-relaxed',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '可让其它设备下线。',
-          }),
-          el('div', { class: 'mt-3 space-y-2' }, this.buildDeviceList()),
         ),
+
         el(
           'div',
-          { class: 'border-t pt-4', style: { borderColor: 'var(--color-line)' } },
-          el('h3', { class: 'text-sm font-semibold', text: '高级' }),
-          el('p', {
-            class: 'mt-1 text-xs leading-relaxed',
-            style: { color: 'var(--color-ink-subtle)' },
-            text: '存于 D1，即时生效。',
-          }),
+          { class: 'settings-divider' },
           el(
-            'form',
-            {
-              class: 'mt-3 space-y-3',
-              on: {
-                submit: (event) => {
-                  event.preventDefault()
-                  void this.saveAdvanced()
-                },
-              },
-            },
-            el(
-              'div',
-              { class: 'grid gap-3 sm:grid-cols-3' },
-              this.field(
-                '日志级别',
-                this.selectInput(
-                  this.advancedDraft.logLevel,
-                  [
-                    { value: 'error', label: 'error · 仅错误' },
-                    { value: 'warn', label: 'warn · 含警告' },
-                    { value: 'info', label: 'info · 含流程' },
-                    { value: 'debug', label: 'debug' },
-                  ],
-                  (value) => {
-                    this.advancedDraft.logLevel = value
-                  },
-                ),
-              ),
-              this.field(
-                '任务锁窗口（分钟）',
-                this.numberInput(this.advancedDraft.jobLockMinutes, (value) => {
-                  this.advancedDraft.jobLockMinutes = value
-                }),
-              ),
-              this.field(
-                '会话有效期（天）',
-                this.numberInput(this.advancedDraft.sessionDays, (value) => {
-                  this.advancedDraft.sessionDays = value
-                }),
-              ),
-            ),
-            el(
-              'div',
-              { class: 'flex justify-end border-t pt-3', style: { borderColor: 'var(--color-line)' } },
-              this.submitButton('保存'),
-            ),
+            'div',
+            { class: 'section-title-row' },
+            sectionTitle({ icon: icons.phone, title: '登录设备', subtitle: 'ACTIVE SESSIONS' }),
+            el('button', {
+              class: 'button button--secondary button--small',
+              type: 'button',
+              text: '刷新',
+              on: { click: () => void this.loadDevices(true) },
+            }),
           ),
+          this.buildDeviceList(),
         ),
       ),
     )
@@ -1688,21 +1281,22 @@ export class SettingsModal {
     void this.loadDevices(false)
   }
 
-  private async saveAdvanced(): Promise<void> {
+  private async saveSystem(): Promise<void> {
     if (this.saving) return
     this.saving = true
     try {
+      await api.updateTimezone(this.timezoneDraft.trim())
       await api.updateAdvanced({
         log_level: this.advancedDraft.logLevel,
         job_lock_ttl_ms: Math.round(this.advancedDraft.jobLockMinutes * 60_000),
         session_ttl_ms: Math.round(this.advancedDraft.sessionDays * 24 * 60 * 60 * 1000),
       })
-      toast('高级配置已保存')
+      toast('系统设置已保存', 'ok')
       await afterSettingsChanged()
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      toast(error instanceof ApiError ? error.message : '保存高级配置失败', 'danger')
+      toast(error instanceof ApiError ? error.message : '保存失败', 'danger')
     } finally {
       this.saving = false
     }
@@ -1711,123 +1305,71 @@ export class SettingsModal {
   /**
    * 登录设备列表。
    *
-   * 返回一个稳定的容器：数据变化时只替换内部节点。此前直接 `renderContent()`
-   * 重建整个设置页，会把正在展开的 `<select>` 一并销毁 —— 表现为下拉框
-   * 展开一会儿就自己闭合。
+   * 返回一个稳定的容器：数据变化时只替换内部节点，避免重建整个设置页
+   * 把正在展开的 `<select>` 一并销毁。
    */
   private buildDeviceList(): HTMLElement {
     if (!this.deviceListHost) {
-      this.deviceListHost = el('div', {
-        class: 'space-y-2',
-        dataset: { role: 'device-list' },
-      })
+      this.deviceListHost = el('div', { class: 'device-list' })
     }
     const wrapper = this.deviceListHost
 
     if (!this.devicesLoaded) {
-      replaceChildren(
-        wrapper,
-        el('p', {
-          class: 'text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: '正在加载…',
-        }),
-      )
+      replaceChildren(wrapper, subtleEmpty('正在加载…', icons.spinner))
       return wrapper
     }
-
     if (this.devices.length === 0) {
-      replaceChildren(
-        wrapper,
-        el('p', {
-          class: 'text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: '暂无登录设备。',
-        }),
-      )
+      replaceChildren(wrapper, subtleEmpty('暂无登录设备', icons.phone))
       return wrapper
     }
 
-    const others = this.devices.filter((device) => !device.current)
     const nodes: HTMLElement[] = []
-
+    const others = this.devices.filter((device) => !device.current)
     if (others.length > 0) {
       nodes.push(
         el(
           'div',
-          { class: 'flex justify-end' },
-          el(
-            'button',
-            {
-              class: 'btn btn-danger btn-sm',
-              type: 'button',
-              disabled: this.kicking !== null,
-              on: { click: () => void this.kickOthers() },
-            },
-            el('span', { text: '退出其它设备' }),
-          ),
+          { class: 'device-actions' },
+          el('button', {
+            class: 'button button--secondary button--small',
+            type: 'button',
+            text: '退出其它设备',
+            on: { click: () => void this.kickOthers() },
+          }),
         ),
       )
     }
-
     for (const device of this.devices) {
       nodes.push(this.buildDeviceRow(device))
     }
 
-    // 容器是复用的，必须先清空再写入。此前直接 append，导致每次重绘都把
-    // 整份列表再叠一遍，表现为「本机」重复出现且越刷越多。
     replaceChildren(wrapper, ...nodes)
-
     return wrapper
   }
 
   private buildDeviceRow(device: SessionDevice): HTMLElement {
+    const title = el('div', { class: 'device-row__title' })
+    title.append(el('b', { text: deviceName(device.ua) }))
+    if (device.current) title.append(el('span', { class: 'badge badge-ok', text: '本机' }))
+
     return el(
       'div',
-      {
-        class: 'flex items-start justify-between gap-3 rounded-lg border px-3 py-2',
-        style: { borderColor: 'var(--color-line)' },
-      },
-      el(
-        'div',
-        { class: 'min-w-0' },
-        el(
-          'div',
-          { class: 'flex flex-wrap items-center gap-1.5' },
-          el('span', { class: 'text-sm font-medium', text: deviceName(device.ua) }),
-          ...(device.current
-            ? [el('span', { class: 'badge badge-ok', text: '本机' })]
-            : []),
-        ),
-        el('p', {
-          class: 'mt-1 font-mono text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: `${device.ip || '未知来源'} · 登录于 ${formatTime(device.created_at)}`,
-        }),
-        el('p', {
-          class: 'text-xs',
-          style: { color: 'var(--color-ink-subtle)' },
-          text: `最近活跃 ${relativeTime(device.last_seen_at)}`,
-        }),
-      ),
-      ...(device.current
-        ? []
-        : [
-            el(
-              'button',
-              {
-                class: 'btn btn-ghost btn-sm shrink-0',
-                type: 'button',
-                disabled: this.kicking !== null,
-                on: { click: () => void this.kickOne(device.sid) },
-              },
-              el('span', { text: this.kicking === device.sid ? '处理中…' : '下线' }),
-            ),
-          ]),
+      { class: 'device-row' },
+      title,
+      el('span', {
+        text: `${device.ip || '未知来源'} · 登录于 ${formatTime(device.created_at)} · 最近活跃 ${relativeTime(device.last_seen_at)}`,
+      }),
+      device.current
+        ? el('span', { class: 'badge badge-muted', text: '当前' })
+        : el('button', {
+            class: 'button button--secondary button--small',
+            type: 'button',
+            text: this.kicking === device.sid ? '处理中…' : '下线',
+            on: { click: () => void this.kickOne(device.sid) },
+          }),
     )
   }
 
-  /** 只重绘设备列表，不触碰页面其它部分。 */
   private refreshDeviceList(): void {
     if (this.activeTab === 'system') this.buildDeviceList()
   }
@@ -1838,7 +1380,7 @@ export class SettingsModal {
       this.devices = data.sessions
       this.devicesLoaded = true
       this.refreshDeviceList()
-      if (notify) toast('设备列表已刷新')
+      if (notify) toast('设备列表已刷新', 'ok')
     } catch (error) {
       this.devicesLoaded = true
       this.refreshDeviceList()
@@ -1852,7 +1394,7 @@ export class SettingsModal {
     try {
       const data = await api.revokeSession(sid)
       this.devices = data.sessions
-      toast('该设备已下线')
+      toast('该设备已下线', 'ok')
     } catch (error) {
       toast(error instanceof ApiError ? error.message : '下线失败', 'danger')
     } finally {
@@ -1867,7 +1409,7 @@ export class SettingsModal {
     try {
       const data = await api.revokeOtherSessions()
       this.devices = data.sessions
-      toast('其它设备已全部下线')
+      toast('其它设备已全部下线', 'ok')
     } catch (error) {
       toast(error instanceof ApiError ? error.message : '下线失败', 'danger')
     } finally {
@@ -1876,19 +1418,44 @@ export class SettingsModal {
     }
   }
 
-  private async saveTimezone(): Promise<void> {
+  // -------------------------------------------------------------------------
+  // 保存通用流程
+  // -------------------------------------------------------------------------
+
+  /**
+   * 保存 → 提示 → 重新拉取设置 → 用服务端值重置草稿并重绘。
+   *
+   * 所有保存都走同一条路径：凭据字段保存后必须清空本地副本，
+   * 避免「已保存的 Token 停留在输入框里」。
+   */
+  private async runSave(
+    action: () => Promise<unknown>,
+    successMessage: string,
+    failureMessage: string,
+  ): Promise<void> {
     if (this.saving) return
     this.saving = true
+    this.paintSaving(true)
     try {
-      await api.updateTimezone(this.timezoneDraft.trim())
-      toast('时区已保存')
+      await action()
+      toast(successMessage, 'ok')
       await afterSettingsChanged()
       this.syncDrafts()
       this.renderContent()
     } catch (error) {
-      toast(error instanceof ApiError ? error.message : '保存时区失败', 'danger')
+      toast(error instanceof ApiError ? error.message : failureMessage, 'danger')
     } finally {
       this.saving = false
+      this.paintSaving(false)
     }
+  }
+
+  private paintSaving(busy: boolean): void {
+    this.saveButton.disabled = busy
+    replaceChildren(
+      this.saveButton,
+      iconSvg(busy ? icons.spinner : icons.check, 18, busy ? 'spin' : ''),
+      el('span', { text: busy ? '保存中…' : '保存更改' }),
+    )
   }
 }
