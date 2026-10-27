@@ -228,6 +228,7 @@ export class SettingsModal {
       type: 'button',
       on: { click: () => this.saveActiveTab() },
     }) as HTMLButtonElement
+    this.paintSaving(false)
     this.footer = el('footer', { class: 'settings-footer' }, this.saveButton)
 
     const nav = el('nav', { class: 'settings-tabs' })
@@ -476,8 +477,8 @@ export class SettingsModal {
       button.classList.toggle('active', key === this.activeTab)
       button.setAttribute('aria-selected', String(key === this.activeTab))
     }
-    // 只有账号 / 通知 / 系统页有独立的保存动作
-    this.footer.hidden = this.activeTab === 'report'
+    // 实例页自带「创建 / 保存修改」按钮，日报页有「立即推送」，都不需要底部保存栏
+    this.footer.hidden = this.activeTab === 'accounts' || this.activeTab === 'report'
   }
 
   private renderContent(): void {
@@ -1359,14 +1360,16 @@ export class SettingsModal {
       el('span', {
         text: `${device.ip || '未知来源'} · 登录于 ${formatTime(device.created_at)} · 最近活跃 ${relativeTime(device.last_seen_at)}`,
       }),
-      device.current
-        ? el('span', { class: 'badge badge-muted', text: '当前' })
-        : el('button', {
-            class: 'button button--secondary button--small',
-            type: 'button',
-            text: this.kicking === device.sid ? '处理中…' : '下线',
-            on: { click: () => void this.kickOne(device.sid) },
-          }),
+      ...(device.current
+        ? []
+        : [
+            el('button', {
+              class: 'button button--secondary button--small',
+              type: 'button',
+              text: this.kicking === device.sid ? '处理中…' : '下线',
+              on: { click: () => void this.kickOne(device.sid) },
+            }),
+          ]),
     )
   }
 

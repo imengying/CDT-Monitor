@@ -18,25 +18,14 @@
 
 import * as echarts from 'echarts/core'
 import { BarChart, LineChart } from 'echarts/charts'
-import {
-  GridComponent,
-  MarkLineComponent,
-  TooltipComponent,
-} from 'echarts/components'
+import { GridComponent, TooltipComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import type { EChartsType, EChartsCoreOption } from 'echarts/core'
 import type { TrafficHistoryResponse, TrafficSample } from '@/api/client'
 import { el, eyebrow, iconButton, iconSvg, onEscape, replaceChildren, segmented } from '@/lib/dom'
 import { icons } from '@/lib/icons'
 
-echarts.use([
-  LineChart,
-  BarChart,
-  GridComponent,
-  TooltipComponent,
-  MarkLineComponent,
-  CanvasRenderer,
-])
+echarts.use([LineChart, BarChart, GridComponent, TooltipComponent, CanvasRenderer])
 
 const HOUR_MS = 60 * 60 * 1000
 
@@ -235,35 +224,6 @@ export class HistoryModal {
     const values = timeline.map((point) => point.traffic)
     const maxValue = values.reduce<number>((max, value) => Math.max(max, value ?? 0), 0)
 
-    const threshold = this.data?.traffic_threshold_gb ?? 0
-    const quota = this.data?.quota_gb ?? 0
-
-    const markLines: Record<string, unknown>[] = []
-    if (quota > 0) {
-      markLines.push({
-        yAxis: quota,
-        lineStyle: { color: '#bd3645', type: 'dashed', width: 1 },
-        label: {
-          formatter: `免费额度 ${quota} GB`,
-          color: '#bd3645',
-          fontSize: 10,
-          position: 'insideEndTop',
-        },
-      })
-    }
-    if (threshold > 0 && threshold !== quota) {
-      markLines.push({
-        yAxis: threshold,
-        lineStyle: { color: '#2563b8', type: 'dashed', width: 1 },
-        label: {
-          formatter: `阈值 ${threshold} GB`,
-          color: '#2563b8',
-          fontSize: 10,
-          position: 'insideStartTop',
-        },
-      })
-    }
-
     const tickStep = this.range === 'hourly' ? 4 : 5
     const axis = {
       tickLine: false,
@@ -273,7 +233,7 @@ export class HistoryModal {
 
     const common = {
       animation: false,
-      grid: { top: 16, right: 18, bottom: 2, left: -8, containLabel: true },
+      grid: { top: 18, right: 20, bottom: 6, left: 6, containLabel: true },
       tooltip: {
         trigger: 'axis',
         backgroundColor: 'rgba(255, 255, 255, .96)',
@@ -306,11 +266,12 @@ export class HistoryModal {
       yAxis: {
         type: 'value' as const,
         min: 0,
-        // 给 markLine 留出空间：额度线可能远高于实际用量
-        max: Math.max(maxValue, quota > 0 ? quota : 0) * 1.08 || undefined,
+        // 只按实际数据取值域：额度可能远高于当月累计，撑开会让曲线贴底
+        max: maxValue > 0 ? maxValue * 1.15 : undefined,
+        splitNumber: 4,
         axisLabel: {
           ...axis.tick,
-          formatter: (value: number) => Number(value.toFixed(3)).toString(),
+          formatter: (value: number) => Number(value.toFixed(2)).toString(),
         },
         splitLine: { lineStyle: { color: GRID } },
       },
@@ -326,10 +287,6 @@ export class HistoryModal {
             data: values,
             barMaxWidth: 26,
             itemStyle: { color: INK, borderRadius: [4, 4, 0, 0] },
-            markLine:
-              markLines.length > 0
-                ? { silent: true, symbol: 'none', data: markLines }
-                : undefined,
           },
         ],
       } as EChartsCoreOption
@@ -349,10 +306,6 @@ export class HistoryModal {
           symbolSize: 6,
           lineStyle: { width: 2.25, color: INK },
           itemStyle: { color: INK, borderColor: '#fff', borderWidth: 2 },
-          markLine:
-            markLines.length > 0
-              ? { silent: true, symbol: 'none', data: markLines }
-              : undefined,
         },
       ],
     } as EChartsCoreOption

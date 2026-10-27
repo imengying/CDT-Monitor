@@ -190,12 +190,7 @@ export function brandLockup(centered = false): HTMLElement {
     'div',
     { class: `brand-lockup${centered ? ' brand-lockup--center' : ''}` },
     el('span', { class: 'brand-mark' }, iconSvg(icons.cloud, 21)),
-    el(
-      'div',
-      {},
-      el('b', { text: 'CDT MONITOR' }),
-      el('span', { text: 'CONTROL PLANE' }),
-    ),
+    el('b', { text: 'CDT Monitor' }),
   )
 }
 

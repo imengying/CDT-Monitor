@@ -1,13 +1,12 @@
 /**
  * 主控制台外壳
  * ============================================================================
- * 布局层级照搬上游 `Dashboard`：
+ * 页面结构：
  *
  *   app-shell
- *   ├ topbar         品牌 · 心跳 · 刷新/设置/日志/退出
- *   ├ overview-head  大标题 + 日期 + 上次任务时间
+ *   ├ topbar         品牌 · 刷新/设置/日志/退出
  *   ├ metric-strip   四格汇总（共用一张卡，竖线分隔）
- *   ├ section-heading
+ *   ├ error-banner   概览拉取失败时的重试提示
  *   └ account-grid   账号卡片
  *
  * 渲染策略：外壳只构建一次，各区块通过 `update(state)` 增量刷新，
@@ -17,7 +16,7 @@
 import { api, type AccountOverview } from '@/api/client'
 import type { AppState } from '@/lib/store'
 import { clearToasts, store } from '@/lib/store'
-import { brandLockup, el, eyebrow, iconButton, iconSvg, replaceChildren } from '@/lib/dom'
+import { brandLockup, el, iconButton, iconSvg, replaceChildren } from '@/lib/dom'
 import { icons, type IconNode } from '@/lib/icons'
 import { bootstrap, loadOverview, logout, refreshAll, reportError } from '@/lib/actions'
 import { AccountList } from '@/components/AccountCard'
@@ -34,9 +33,6 @@ import { renderToasts } from '@/components/ToastStack'
  * 因此取 5 分钟，保证刷新后能较快看到新数据即可。
  */
 const OVERVIEW_POLL_MS = 5 * 60_000
-
-/** 心跳文案视为「延迟」的秒数阈值。 */
-const HEARTBEAT_STALE_SECONDS = 180
 
 /** 控制台外壳。 */
 export class App {
@@ -55,9 +51,6 @@ export class App {
 
   private errorBanner: HTMLElement | null = null
   private metricStrip: HTMLElement | null = null
-  private heartbeat: HTMLElement | null = null
-  private heartbeatText: HTMLElement | null = null
-  private lastRunNode: HTMLElement | null = null
   private emptyCard: HTMLButtonElement | null = null
   private refreshButton: HTMLButtonElement | null = null
   private mobileMenuButton: HTMLButtonElement | null = null
@@ -189,22 +182,10 @@ export class App {
       'main',
       { class: 'app-shell' },
       this.buildTopbar(),
-      this.buildOverviewHead(),
       this.errorBanner,
       this.metricStrip,
-      el(
-        'div',
-        { class: 'section-heading' },
-        el(
-          'div',
-          {},
-          eyebrow('MANAGED INSTANCES'),
-          el('h2', { text: '实例与流量' }),
-        ),
-        el('span', { dataset: { role: 'account-count' } }),
-      ),
-      this.emptyCard,
       this.accountList.element,
+      this.emptyCard,
     )
 
     replaceChildren(
@@ -217,11 +198,8 @@ export class App {
     this.updateShell(state)
   }
 
-  /** 顶栏：品牌 + 心跳 + 操作区。 */
+  /** 顶栏：品牌 + 操作区。 */
   private buildTopbar(): HTMLElement {
-    this.heartbeatText = el('span', { text: '自动化运行中' })
-    this.heartbeat = el('div', { class: 'heartbeat' }, el('i', {}), this.heartbeatText)
-
     this.refreshButton = iconButton({
       label: '强制刷新全部实例',
       icon: icons.refresh,
@@ -231,7 +209,6 @@ export class App {
     const actions = el(
       'div',
       { class: 'topbar-actions', id: 'dashboard-actions' },
-      this.heartbeat,
       this.refreshButton,
       iconButton({
         label: '设置',
@@ -252,7 +229,7 @@ export class App {
 
     this.mobileMenuButton = iconButton({
       label: '菜单',
-      icon: icons.dashboard,
+      icon: icons.menu,
       className: 'mobile-menu',
       onClick: () => this.toggleMenu(),
     })
@@ -292,37 +269,6 @@ export class App {
     this.logDrawer?.open()
   }
 
-  /** 标题区：大标题 + 星期 + 上次任务时间。 */
-  private buildOverviewHead(): HTMLElement {
-    this.lastRunNode = el('b', { text: '尚未运行' })
-
-    return el(
-      'section',
-      { class: 'overview-head' },
-      el(
-        'div',
-        {},
-        eyebrow('LIVE INFRASTRUCTURE'),
-        el('h1', { text: '资源控制台' }),
-        el('p', {
-          class: 'muted',
-          text: new Date().toLocaleDateString('zh-CN', {
-            month: 'long',
-            day: 'numeric',
-            weekday: 'long',
-          }),
-        }),
-      ),
-      el(
-        'div',
-        { class: 'overview-time' },
-        iconSvg(icons.calendar, 17),
-        el('span', { text: '数据快照' }),
-        this.lastRunNode,
-      ),
-    )
-  }
-
   private updateShell(state: Readonly<AppState>): void {
     const overview = state.overview
     const accounts = overview?.accounts ?? []
@@ -331,38 +277,10 @@ export class App {
       this.refreshButton.disabled = state.refreshingAll || state.overviewLoading
     }
 
-    this.updateHeartbeat(overview?.generated_at ?? null)
     this.renderErrorBanner(state)
     this.renderMetrics(accounts)
     this.renderEmptyState(state, accounts)
     this.accountList.render(accounts)
-
-    const count = this.shell?.querySelector<HTMLElement>('[data-role="account-count"]')
-    if (count) count.textContent = `${accounts.length} 个配置`
-  }
-
-  /**
-   * 心跳与「数据快照」时间。
-   *
-   * `generated_at` 是概览接口的响应时刻，也就是界面数据的新鲜度。
-   * 超过阈值说明自动化任务可能没按时跑（Cron 15 分钟一次）。
-   */
-  private updateHeartbeat(generatedAt: number | null): void {
-    if (!this.heartbeat || !this.heartbeatText) return
-    const stale =
-      generatedAt === null || (Date.now() - generatedAt) / 1000 > HEARTBEAT_STALE_SECONDS
-
-    this.heartbeat.classList.toggle('heartbeat--warn', stale)
-    this.heartbeatText.textContent = stale ? '监控任务延迟' : '自动化运行中'
-
-    if (this.lastRunNode) {
-      this.lastRunNode.textContent = generatedAt
-        ? new Date(generatedAt).toLocaleTimeString('zh-CN', {
-            hour: '2-digit',
-            minute: '2-digit',
-          })
-        : '尚未运行'
-    }
   }
 
   private renderErrorBanner(state: Readonly<AppState>): void {
@@ -486,9 +404,6 @@ export class App {
     this.shell = null
     this.errorBanner = null
     this.metricStrip = null
-    this.heartbeat = null
-    this.heartbeatText = null
-    this.lastRunNode = null
     this.emptyCard = null
     this.refreshButton = null
     this.mobileMenuButton = null
