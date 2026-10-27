@@ -1341,8 +1341,8 @@ h3 {
   grid-template-columns: auto auto;
   justify-content: end;
   align-items: baseline;
-  column-gap: 18px;
-  row-gap: 3px;
+  column-gap: 16px;
+  row-gap: 2px;
   text-align: right;
 }
 
@@ -1361,14 +1361,6 @@ h3 {
   color: var(--ink);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-}
-
-.account-billing small {
-  grid-column: 1 / -1;
-  color: var(--muted-soft);
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0;
 }
 
 .traffic-value {

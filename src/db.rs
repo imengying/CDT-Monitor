@@ -270,8 +270,9 @@ impl Db {
                 region_id, instance_id, traffic_threshold_gb,
                 over_limit_action, stop_mode,
                 schedule_start_time, schedule_stop_time, spot_keep_alive, enabled,
-                last_schedule_start_date, last_schedule_stop_date, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+                last_schedule_start_date, last_schedule_stop_date, last_schedule_stop_at,
+                created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
             &[
                 j_text(name),
                 j_text(site_type),
@@ -396,10 +397,21 @@ impl Db {
         let sql = if is_start {
             "UPDATE accounts SET last_schedule_start_date = ?, updated_at = ? WHERE id = ?"
         } else {
-            "UPDATE accounts SET last_schedule_stop_date = ?, updated_at = ? WHERE id = ?"
+            // 同时记录精确时刻：保活只需避让「刚关机的那一轮」，
+            // 不能用日期判断，否则当天此后被抢占回收也不会再拉起。
+            "UPDATE accounts SET last_schedule_stop_date = ?, last_schedule_stop_at = ?, updated_at = ? WHERE id = ?"
         };
-        self.exec(sql, &[j_text(date), j_i64(now_ms), j_i64(account_id)])
-            .await?;
+        let params = if is_start {
+            vec![j_text(date), j_i64(now_ms), j_i64(account_id)]
+        } else {
+            vec![
+                j_text(date),
+                j_i64(now_ms),
+                j_i64(now_ms),
+                j_i64(account_id),
+            ]
+        };
+        self.exec(sql, &params).await?;
         Ok(())
     }
 

@@ -61,6 +61,12 @@ pub const LOG_RETENTION_DAYS: i64 = 30;
 pub const JOB_RETENTION_DAYS: i64 = 7;
 /// 单实例动作锁 TTL（分钟）。
 pub const INSTANCE_LOCK_TTL_MINUTES: i64 = 30;
+/// 定时关机后保活的避让期（分钟）。
+///
+/// 只需覆盖「刚关机的那一轮 Cron」：Cron 15 分钟一次，留 20 分钟让快照
+/// 追上最新状态即可。不能用「当天已关机」判断——那样当天之后实例若被
+/// 抢占回收，保活会一直不再拉起，与「自动开关机 + 保活并存」的预期冲突。
+pub const KEEP_ALIVE_STOP_GRACE_MINUTES: i64 = 20;
 
 // ===========================================================================
 // 辅助函数
@@ -898,15 +904,24 @@ impl Scheduler {
     ///
     /// 必须重新读库：`run_cron` 手里那份 `AccountRow` 是循环开始时的快照，
     /// 而定时关机就在同一轮里把它写进了 `last_schedule_stop_date`。
-    async fn scheduled_stop_done_today(&self, account: &AccountRow) -> worker::Result<bool> {
+    ///
+    /// 注意这里用「刚刚」而不是「今天」：定时关机后只在
+    /// [`KEEP_ALIVE_STOP_GRACE_MINUTES`] 内让路，之后照常保活。
+    async fn scheduled_stop_just_happened(&self, account: &AccountRow) -> worker::Result<bool> {
         if account.schedule_stop_minutes().is_none() {
             return Ok(false);
         }
-        let today = local_date(self.now, &self.timezone);
         let fresh = self.db.get_account(account.id).await?;
-        Ok(fresh
-            .and_then(|row| row.last_schedule_stop_date)
-            .is_some_and(|date| date == today))
+        let Some(stop_at) = fresh.and_then(|row| row.last_schedule_stop_at) else {
+            return Ok(false);
+        };
+        // 时间戳来自未来（时钟回拨 / 时区变动）时不能当成「刚关机」，
+        // 否则保活会被永久卡住。
+        if stop_at > self.now {
+            return Ok(false);
+        }
+        let elapsed = self.now - stop_at;
+        Ok(elapsed < KEEP_ALIVE_STOP_GRACE_MINUTES * 60 * 1000)
     }
 
     /// 抢占式实例保活：拉起处于 Stopped 的可保活抢占式实例。
@@ -959,9 +974,9 @@ impl Scheduler {
         // 本轮刚被定时关机的不保活。快照里的状态是刷新时抓的，
         // 定时关机发生在其后，若不拦住会在同一轮里把自己刚停的机器拉起来
         // （上游用 statusChangedBySchedule 表达同一件事）。
-        if self.scheduled_stop_done_today(account).await? {
+        if self.scheduled_stop_just_happened(account).await? {
             report.notes.push(format!(
-                "{} 今日已执行定时关机，跳过抢占式保活",
+                "{} 刚执行过定时关机，本轮跳过抢占式保活",
                 account.name
             ));
             return Ok(());
@@ -1602,6 +1617,7 @@ mod tests {
             enabled: 1,
             last_schedule_start_date: None,
             last_schedule_stop_date: None,
+            last_schedule_stop_at: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -1668,6 +1684,29 @@ mod tests {
         let account = account_with_schedule(Some("08:00"), Some("08:00"));
         assert!(in_allowed_window(&account, 3 * 60));
         assert!(in_allowed_window(&account, 8 * 60));
+    }
+
+    /// 保活避让只看「刚刚关过机」：关机后 20 分钟内让路，
+    /// 之后必须恢复保活，否则当天被抢占回收就再也不会拉起。
+    #[test]
+    fn keep_alive_stop_grace_window() {
+        let grace_ms = KEEP_ALIVE_STOP_GRACE_MINUTES * 60 * 1000;
+        let now = 1_000_000_000_000i64;
+
+        let elapsed = |stop_at: i64| if stop_at > now { None } else { Some(now - stop_at) };
+        let in_grace = |stop_at: i64| matches!(elapsed(stop_at), Some(gap) if gap < grace_ms);
+
+        // 同一轮：刚关机，必须让路
+        assert!(in_grace(now));
+        assert!(in_grace(now - 5 * 60 * 1000));
+        assert!(in_grace(now - 19 * 60 * 1000));
+
+        // 20 分钟之后：恢复正常保活（这正是旧实现的缺陷所在）
+        assert!(!in_grace(now - 20 * 60 * 1000));
+        assert!(!in_grace(now - 6 * 60 * 60 * 1000));
+
+        // 时钟回拨：未来时间戳不得被误判为「刚关机」
+        assert!(!in_grace(now + 60 * 60 * 1000));
     }
 
     #[test]

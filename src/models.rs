@@ -604,6 +604,9 @@ pub struct AccountRow {
     pub enabled: i64,
     pub last_schedule_start_date: Option<String>,
     pub last_schedule_stop_date: Option<String>,
+    /// 最近一次定时关机的毫秒时间戳，供保活避让同一轮刚关机的实例。
+    #[serde(default)]
+    pub last_schedule_stop_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -675,6 +678,7 @@ impl AccountRow {
             enabled: self.is_enabled(),
             last_schedule_start_date: self.last_schedule_start_date.clone(),
             last_schedule_stop_date: self.last_schedule_stop_date.clone(),
+            last_schedule_stop_at: self.last_schedule_stop_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -1160,6 +1164,7 @@ pub struct AccountDto {
     pub enabled: bool,
     pub last_schedule_start_date: Option<String>,
     pub last_schedule_stop_date: Option<String>,
+    pub last_schedule_stop_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }

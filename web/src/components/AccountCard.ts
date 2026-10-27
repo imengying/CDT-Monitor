@@ -170,8 +170,6 @@ export class AccountCard {
         el('span', { text: '本月额度' }),
         el('b', { text: `${account.quota_gb.toFixed(0)} GB` }),
       ),
-      // 站点类型放说明行：与余额/额度并排会把三列挤成一团
-      el('small', { text: account.site_label }),
     )
 
     return el(
@@ -228,14 +226,6 @@ export class AccountCard {
       iconSvg(icons.chart, 17),
     )
 
-    const refreshButton = this.actionButton({
-      key: 'refresh',
-      label: '刷新实例',
-      icon: icons.refresh,
-      mini: true,
-      onClick: () => void this.refreshAccount(),
-    })
-
     return el(
       'div',
       {},
@@ -249,7 +239,7 @@ export class AccountCard {
           el('strong', { text: account.traffic_used_gb.toFixed(2) }),
           el('small', { text: ` / ${account.quota_gb.toFixed(0)} GB` }),
         ),
-        el('div', { class: 'control-group' }, historyButton, refreshButton),
+        historyButton,
       ),
       el(
         'div',
@@ -295,7 +285,7 @@ export class AccountCard {
       group.append(
         this.actionButton({
           key: 'refresh',
-          label: '强制刷新实例状态',
+          label: '刷新实例',
           icon: icons.refresh,
           onClick: () => void this.refreshAccount(),
         }),

@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS accounts (
   enabled                     INTEGER NOT NULL DEFAULT 1,
   last_schedule_start_date    TEXT,
   last_schedule_stop_date     TEXT,
+  -- 最近一次定时关机的毫秒时间戳。保活只在这之后的短时间内避让，
+  -- 与「当天已关机」无关：当天稍后被抢占回收仍应重新拉起。
+  last_schedule_stop_at       INTEGER,
   created_at                  INTEGER NOT NULL,
   updated_at                  INTEGER NOT NULL
 );

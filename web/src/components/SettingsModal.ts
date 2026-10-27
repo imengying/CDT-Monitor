@@ -778,7 +778,7 @@ export class SettingsModal {
         'p',
         { class: 'field-hint account-fields__full' },
         el('span', {
-          text: '定时开关与保活按时间格式 HH:MM 填写，留空表示不启用。',
+          text: '时间格式 HH:MM，留空表示不启用。保活与定时开关可同时开启：定时关机后不再拉起，定时开机后若被抢占回收则由保活补上。',
         }),
       ),
     )
