@@ -141,10 +141,13 @@ export class App {
   /** 打开某账号的历史流量弹窗。数据按需拉取，不进 store。 */
   private async openHistory(account: AccountOverview): Promise<void> {
     if (!this.historyModal) return
+    // 先开弹窗：图表模块与数据都在并行加载，用户立刻看到反馈而不是无响应
+    this.historyModal.show(account.name)
     try {
       const data = await api.history(account.id)
       this.historyModal.open(account.name, data)
     } catch (error) {
+      this.historyModal.close()
       reportError(error, '加载历史流量失败')
     }
   }

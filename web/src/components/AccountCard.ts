@@ -14,6 +14,7 @@
 import { api, humanAmount, relativeTime, type AccountOverview, type InstanceInfo } from '@/api/client'
 import { el, iconSvg, iconButton, replaceChildren } from '@/lib/dom'
 import { icons, type IconNode } from '@/lib/icons'
+import { preloadHistoryChart } from '@/components/HistoryModal'
 import { afterAccountChanged, reportError } from '@/lib/actions'
 import { toast } from '@/lib/store'
 
@@ -222,7 +223,12 @@ export class AccountCard {
         type: 'button',
         'aria-label': '查看历史流量',
         'data-tip': '历史流量',
-        on: { click: () => this.onHistory?.(this.account) },
+        on: {
+          click: () => this.onHistory?.(this.account),
+          // 悬停即开始下载图表模块，点下去时通常已就绪
+          pointerenter: () => preloadHistoryChart(),
+          focus: () => preloadHistoryChart(),
+        },
       },
       iconSvg(icons.chart, 17),
     )

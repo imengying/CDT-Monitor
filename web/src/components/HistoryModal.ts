@@ -16,16 +16,33 @@
  * 由 `connectNulls: false` 断开线段，真实缺口一眼可见。
  */
 
-import * as echarts from 'echarts/core'
-import { BarChart, LineChart } from 'echarts/charts'
-import { GridComponent, TooltipComponent } from 'echarts/components'
-import { CanvasRenderer } from 'echarts/renderers'
 import type { EChartsType, EChartsCoreOption } from 'echarts/core'
 import type { TrafficHistoryResponse, TrafficSample } from '@/api/client'
 import { el, eyebrow, iconButton, iconSvg, onEscape, replaceChildren, segmented } from '@/lib/dom'
 import { icons } from '@/lib/icons'
 
-echarts.use([LineChart, BarChart, GridComponent, TooltipComponent, CanvasRenderer])
+/**
+ * echarts 按需加载。
+ *
+ * 图表模块（含 echarts 本体）压缩后约 500 kB，静态 import 会被打进主 bundle
+ * 拖慢首屏，而只有点「历史流量」时才用得到。这里做成单例 Promise：
+ * 首次打开才开始下载，后续复用同一份。
+ */
+type EChartsModule = typeof import('@/lib/echarts')
+
+let echartsPromise: Promise<EChartsModule['default']> | null = null
+
+function loadECharts(): Promise<EChartsModule['default']> {
+  if (!echartsPromise) {
+    echartsPromise = import('@/lib/echarts').then((module) => module.default)
+  }
+  return echartsPromise
+}
+
+/** 悬停历史按钮时预热，点击时就不必等下载。 */
+export function preloadHistoryChart(): void {
+  void loadECharts()
+}
 
 const HOUR_MS = 60 * 60 * 1000
 
@@ -92,9 +109,12 @@ export class HistoryModal {
   private readonly subtitle: HTMLParagraphElement
   private readonly chartHost: HTMLDivElement
   private readonly emptyState: HTMLDivElement
+  private readonly loadingState: HTMLDivElement
   private readonly rangeHost: HTMLDivElement
 
   private chart: EChartsType | null = null
+  /** 递增序号，用于丢弃过期的异步绘制结果 */
+  private renderToken = 0
   private data: TrafficHistoryResponse | null = null
   private range: Range = 'hourly'
   private removeEsc: (() => void) | null = null
@@ -112,9 +132,25 @@ export class HistoryModal {
     this.emptyState.style.height = '100%'
     this.emptyState.hidden = true
 
+    // 数据与图表模块加载中时先显示这个，避免弹窗空白
+    this.loadingState = el(
+      'div',
+      { class: 'subtle-empty' },
+      iconSvg(icons.chart, 28, 'spin'),
+      el('span', { text: '加载中…' }),
+    )
+    this.loadingState.style.height = '100%'
+    this.loadingState.hidden = true
+
     this.rangeHost = el('div', {})
 
-    const body = el('div', { class: 'chart-area' }, this.chartHost, this.emptyState)
+    const body = el(
+      'div',
+      { class: 'chart-area' },
+      this.chartHost,
+      this.emptyState,
+      this.loadingState,
+    )
 
     this.element = el(
       'div',
@@ -144,8 +180,36 @@ export class HistoryModal {
     )
   }
 
+  /**
+   * 先行打开弹窗并显示加载态。
+   *
+   * 点击到图表出现原本要等两件事：拉数据和下载 echarts chunk。
+   * 先开弹窗能让点击立刻有反馈，后两者并行进行。
+   */
+  show(name: string): void {
+    this.title.textContent = name
+    this.subtitle.textContent = ''
+    this.data = null
+    this.range = 'hourly'
+    replaceChildren(this.rangeHost)
+
+    this.chart?.dispose()
+    this.chart = null
+    this.chartHost.hidden = true
+    this.emptyState.hidden = true
+    this.loadingState.hidden = false
+
+    this.element.hidden = false
+    document.body.style.overflow = 'hidden'
+    this.removeEsc = onEscape(() => this.close())
+
+    // 同时开始下载图表模块，数据到时通常已就绪
+    void loadECharts()
+  }
+
   /** 打开并展示某账号的历史数据。 */
   open(name: string, data: TrafficHistoryResponse): void {
+    this.loadingState.hidden = true
     this.title.textContent = name
     this.data = data
     this.range = 'hourly'
@@ -172,6 +236,8 @@ export class HistoryModal {
     document.body.style.overflow = ''
     this.removeEsc?.()
     this.removeEsc = null
+    // 让正在等待 echarts 的绘制自然作废
+    this.renderToken += 1
     this.chart?.dispose()
     this.chart = null
   }
@@ -212,6 +278,20 @@ export class HistoryModal {
       return
     }
 
+    void this.paintChart(timeline, sampled)
+  }
+
+  /** 等 echarts 就绪后绘制。期间先显示加载态，避免弹窗空白。 */
+  private async paintChart(timeline: DisplayPoint[], sampled: number): Promise<void> {
+    const token = ++this.renderToken
+    this.chartHost.classList.add('is-loading')
+
+    const echarts = await loadECharts()
+
+    // 等待期间可能已关闭弹窗或切了范围，丢弃这次结果
+    if (token !== this.renderToken || this.element.hidden) return
+
+    this.chartHost.classList.remove('is-loading')
     if (!this.chart) {
       this.chart = echarts.init(this.chartHost)
     }
