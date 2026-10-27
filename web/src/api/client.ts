@@ -190,7 +190,8 @@ export interface AccountDto {
   name: string
   site_type: SiteType
   site_label: string
-  access_key_id: string
+  /** AccessKey ID 是否已配置（后端不回传明文） */
+  access_key_id_configured: boolean
   region_id: string
   region_name: string
   instance_id: string
@@ -214,6 +215,7 @@ export interface AccountDto {
 export interface AccountInput {
   name: string
   site_type: SiteType
+  /** 编辑时留空表示沿用原值 */
   access_key_id: string
   /** 编辑时留空表示沿用原密钥 */
   access_key_secret?: string
@@ -230,7 +232,8 @@ export interface AccountInput {
 
 export interface TelegramSettings {
   enabled: boolean
-  chat_id: string | null
+  /** 会话 ID 是否已配置（后端不回传明文） */
+  chat_id_configured: boolean
   token_configured: boolean
 }
 
@@ -264,7 +267,8 @@ export interface SessionsResponse {
 
 export interface TurnstileSettings {
   enabled: boolean
-  site_key: string
+  /** 站点公钥是否已配置（后端不回传明文） */
+  site_key_configured: boolean
   secret_configured: boolean
 }
 
@@ -298,7 +302,8 @@ export interface SettingsResponse {
 
 export interface TelegramUpdate {
   enabled: boolean
-  chat_id: string | null
+  /** 留空表示保持原值 */
+  chat_id: string
   token?: string
 }
 

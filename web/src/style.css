@@ -1804,6 +1804,15 @@ h3 {
   box-shadow: 0 0 0 1px var(--line);
 }
 
+/* 列表里的单行卡片：高度更矮，标题区不再留底部间距 */
+.account-editor--row {
+  padding: 14px 18px;
+}
+
+.account-editor--row .account-editor__head {
+  margin-bottom: 0;
+}
+
 /* 提交按钮贴在表单底部右侧，视觉上与设置页的悬浮保存栏一致。 */
 .account-editor__submit {
   display: flex;

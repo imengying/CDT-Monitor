@@ -787,6 +787,10 @@ async fn handle_create_account(app: &AppCtx, mut req: Request) -> worker::Result
         return error_response(400, message);
     }
 
+    if payload.access_key_id.trim().is_empty() {
+        return error_response(400, "新增账号必须提供 AccessKey ID");
+    }
+
     let secret = match payload.access_key_secret.as_deref().map(str::trim) {
         Some(secret) if !secret.is_empty() => secret,
         _ => return error_response(400, "新增账号必须提供 AccessKey Secret"),
@@ -862,12 +866,22 @@ async fn handle_update_account(
         _ => None,
     };
 
+    // AccessKey ID 留空表示沿用原值（前端不回填明文，避免密钥暴露给页面）
+    let access_key_id = {
+        let trimmed = payload.access_key_id.trim();
+        if trimmed.is_empty() {
+            existing.access_key_id.clone()
+        } else {
+            trimmed.to_string()
+        }
+    };
+
     app.db
         .update_account(
             account_id,
             payload.name.trim(),
             payload.site_type.as_str(),
-            payload.access_key_id.trim(),
+            &access_key_id,
             encrypted.as_deref(),
             &payload.normalized_region(),
             payload.require_instance_id()?,
@@ -948,7 +962,11 @@ async fn handle_get_settings(app: &AppCtx) -> worker::Result<Response> {
         advanced: AdvancedSettingsDto::from(&advanced),
         turnstile: TurnstileSettingsDto {
             enabled: turnstile.enabled,
-            site_key: turnstile.site_key.clone().unwrap_or_default(),
+            site_key_configured: turnstile
+                .site_key
+                .as_deref()
+                .map(|key| !key.trim().is_empty())
+                .unwrap_or(false),
             secret_configured: turnstile
                 .secret_enc
                 .as_deref()
@@ -957,7 +975,11 @@ async fn handle_get_settings(app: &AppCtx) -> worker::Result<Response> {
         },
         telegram: TelegramSettingsDto {
             enabled: telegram.enabled,
-            chat_id: telegram.chat_id.clone(),
+            chat_id_configured: telegram
+                .chat_id
+                .as_deref()
+                .map(|id| !id.trim().is_empty())
+                .unwrap_or(false),
             token_configured: telegram
                 .token_enc
                 .as_deref()
@@ -1014,12 +1036,16 @@ async fn handle_update_telegram(app: &AppCtx, mut req: Request) -> worker::Resul
         );
     }
 
-    config.chat_id = payload
+    // Chat ID 留空表示保持原值（前端不回填明文）；想清空需显式传空字符串以外的标记，
+    // 这里按「非空才覆盖」处理，与 Bot Token 一致。
+    if let Some(chat_id) = payload
         .chat_id
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .map(|v| v.to_string());
+    {
+        config.chat_id = Some(chat_id.to_string());
+    }
     config.enabled = payload.enabled;
 
     if config.enabled && (config.token_enc.is_none() || config.chat_id.is_none()) {

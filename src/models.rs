@@ -660,7 +660,7 @@ impl AccountRow {
             name: self.name.clone(),
             site_type: self.site(),
             site_label: self.site().label().to_string(),
-            access_key_id: self.access_key_id.clone(),
+            access_key_id_configured: !self.access_key_id.trim().is_empty(),
             region_id: self.region_id.clone(),
             region_name: RegionName::of(&self.region_id).to_string(),
             instance_id: self.instance_id.clone().unwrap_or_default(),
@@ -1143,7 +1143,8 @@ pub struct AccountDto {
     pub name: String,
     pub site_type: SiteType,
     pub site_label: String,
-    pub access_key_id: String,
+    /// AccessKey ID 是否已配置（不回传明文）
+    pub access_key_id_configured: bool,
     pub region_id: String,
     pub region_name: String,
     /// 实例 ID：一个账号固定作用于此实例，必填。
@@ -1173,6 +1174,8 @@ pub struct AccountDto {
 pub struct AccountInput {
     pub name: String,
     pub site_type: SiteType,
+    /// 修改时留空表示沿用原值。
+    #[serde(default)]
     pub access_key_id: String,
     /// 修改时留空表示沿用原密钥。
     #[serde(default)]
@@ -1245,7 +1248,9 @@ impl AccountInput {
         if self.name.trim().is_empty() {
             return Err("账号名称不能为空".to_string());
         }
-        if self.access_key_id.trim().len() < 8 {
+        // 编辑时留空表示沿用原值，合法性由 handler 根据是否有旧值判断
+        let access_key_id = self.access_key_id.trim();
+        if !access_key_id.is_empty() && access_key_id.len() < 8 {
             return Err("AccessKey ID 不合法".to_string());
         }
         if self.normalized_region().is_empty() {
@@ -1355,11 +1360,12 @@ pub struct TrafficHistoryResponse {
 
 // --------------------------- 设置相关 DTO ---------------------------------
 
-/// Telegram 设置（脱敏）。
+/// Telegram 设置（脱敏：token 与 chat_id 都只回配置状态）。
 #[derive(Debug, Clone, Serialize)]
 pub struct TelegramSettingsDto {
     pub enabled: bool,
-    pub chat_id: Option<String>,
+    /// 会话 ID 是否已配置（不回传明文）
+    pub chat_id_configured: bool,
     pub token_configured: bool,
 }
 
@@ -1444,11 +1450,13 @@ pub fn timezone_options() -> Vec<TimeZoneOption> {
         .collect()
 }
 
-/// Turnstile 设置（脱敏：私钥只回 `secret_configured`）。
+/// Turnstile 设置（全部脱敏：两个密钥都只回配置状态）。
 #[derive(Debug, Clone, Serialize)]
 pub struct TurnstileSettingsDto {
     pub enabled: bool,
-    pub site_key: String,
+    /// 站点公钥是否已配置（不回传明文）
+    pub site_key_configured: bool,
+    /// 私钥是否已配置
     pub secret_configured: bool,
 }
 

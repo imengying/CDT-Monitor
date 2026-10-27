@@ -121,13 +121,13 @@ function blankAccountForm(): AccountForm {
   }
 }
 
-/** 由 DTO 生成表单（Secret 永远留空）。 */
+/** 由 DTO 生成表单（AccessKey 类字段永远留空，留空即保持原值）。 */
 function formFromAccount(account: AccountDto): AccountForm {
   return {
     id: account.id,
     name: account.name,
     siteType: account.site_type,
-    accessKeyId: account.access_key_id,
+    accessKeyId: '',
     accessKeySecret: '',
     regionId: account.region_id,
     instanceId: account.instance_id,
@@ -330,14 +330,15 @@ export class SettingsModal {
     const settings = this.settings
     if (!settings) return
 
+    // 敏感字段一律不回填：留空即保持原值
     this.turnstileDraft = {
       enabled: settings.turnstile.enabled,
-      siteKey: settings.turnstile.site_key,
+      siteKey: '',
       secretKey: '',
     }
     this.telegramDraft = {
       enabled: settings.telegram.enabled,
-      chatId: settings.telegram.chat_id ?? '',
+      chatId: '',
       token: '',
     }
     this.barkDraft = {
@@ -612,7 +613,7 @@ export class SettingsModal {
         ),
       )
 
-      const editor = el('div', { class: 'account-editor' }, head)
+      const editor = el('div', { class: 'account-editor account-editor--row' }, head)
 
       if (this.confirmDeleteId === account.id) {
         editor.append(
@@ -688,7 +689,10 @@ export class SettingsModal {
         'AccessKey ID',
         this.line(form.accessKeyId, (value) => {
           this.form.accessKeyId = value
-        }, { type: 'password', placeholder: 'LTAI5t…' }),
+        }, {
+          type: 'password',
+          placeholder: form.id === null ? 'LTAI5t…' : '留空保持不变',
+        }),
       ),
       field(
         'AccessKey Secret',
@@ -816,7 +820,7 @@ export class SettingsModal {
       toast('请填写账号名称', 'warn')
       return
     }
-    if (!form.accessKeyId.trim()) {
+    if (form.id === null && !form.accessKeyId.trim()) {
       toast('请填写 AccessKey ID', 'warn')
       return
     }
@@ -902,7 +906,8 @@ export class SettingsModal {
   // -------------------------------------------------------------------------
 
   private renderTurnstile(): void {
-    const configured = this.settings?.turnstile.secret_configured ?? false
+    const secretConfigured = this.settings?.turnstile.secret_configured ?? false
+    const siteKeyConfigured = this.settings?.turnstile.site_key_configured ?? false
 
     replaceChildren(
       this.content,
@@ -921,7 +926,10 @@ export class SettingsModal {
             '站点公钥 Site Key',
             this.line(this.turnstileDraft.siteKey, (value) => {
               this.turnstileDraft.siteKey = value
-            }, { type: 'password', placeholder: '0x4AAAAAAAA…' }),
+            }, {
+              type: 'password',
+              placeholder: siteKeyConfigured ? '留空保持不变' : '0x4AAAAAAAA…',
+            }),
           ),
           this.labeledField(
             '私钥 Secret Key',
@@ -929,9 +937,9 @@ export class SettingsModal {
               this.turnstileDraft.secretKey = value
             }, {
               type: 'password',
-              placeholder: configured ? '留空保持不变' : '0x4AAAAAAAA…',
+              placeholder: secretConfigured ? '留空保持不变' : '0x4AAAAAAAA…',
             }),
-            this.configuredBadge(configured),
+            this.configuredBadge(secretConfigured),
           ),
         ),
         el(
@@ -971,7 +979,8 @@ export class SettingsModal {
   // -------------------------------------------------------------------------
 
   private renderTelegram(): void {
-    const configured = this.settings?.telegram.token_configured ?? false
+    const tokenConfigured = this.settings?.telegram.token_configured ?? false
+    const chatConfigured = this.settings?.telegram.chat_id_configured ?? false
 
     replaceChildren(
       this.content,
@@ -992,15 +1001,19 @@ export class SettingsModal {
               this.telegramDraft.token = value
             }, {
               type: 'password',
-              placeholder: configured ? '留空保持不变' : '123456:AA…',
+              placeholder: tokenConfigured ? '留空保持不变' : '123456:AA…',
             }),
-            this.configuredBadge(configured),
+            this.configuredBadge(tokenConfigured),
           ),
-          field(
+          this.labeledField(
             'Chat ID',
             this.line(this.telegramDraft.chatId, (value) => {
               this.telegramDraft.chatId = value
-            }, { placeholder: '-1001234567890' }),
+            }, {
+              type: 'password',
+              placeholder: chatConfigured ? '留空保持不变' : '-1001234567890',
+            }),
+            this.configuredBadge(chatConfigured),
           ),
         ),
         el(
@@ -1031,7 +1044,7 @@ export class SettingsModal {
 
     const payload: TelegramUpdate = {
       enabled: this.telegramDraft.enabled,
-      chat_id: this.telegramDraft.chatId.trim() || null,
+      chat_id: this.telegramDraft.chatId.trim(),
     }
     if (this.telegramDraft.token.trim()) {
       payload.token = this.telegramDraft.token.trim()
@@ -1216,47 +1229,37 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({ icon: icons.calendar, title: '时区', subtitle: 'TIMEZONE' }),
-        el('div', { class: 'form-grid settings-form' }, field('系统时区', tzSelect)),
-
+        sectionTitle({ icon: icons.settings, title: '系统设置', subtitle: 'SYSTEM' }),
         el(
           'div',
-          { class: 'settings-divider' },
-          el(
-            'div',
-            { class: 'section-title-row' },
-            sectionTitle({ icon: icons.settings, title: '高级', subtitle: 'ADVANCED' }),
+          { class: 'form-grid settings-form' },
+          field('系统时区', tzSelect),
+          field(
+            '日志级别',
+            this.picker(
+              this.advancedDraft.logLevel as 'error' | 'warn' | 'info' | 'debug',
+              [
+                { value: 'error', label: 'error · 仅错误' },
+                { value: 'warn', label: 'warn · 含警告' },
+                { value: 'info', label: 'info · 含流程' },
+                { value: 'debug', label: 'debug' },
+              ],
+              (value) => {
+                this.advancedDraft.logLevel = value
+              },
+            ),
           ),
-          el(
-            'div',
-            { class: 'form-grid settings-form' },
-            field(
-              '日志级别',
-              this.picker(
-                this.advancedDraft.logLevel as 'error' | 'warn' | 'info' | 'debug',
-                [
-                  { value: 'error', label: 'error · 仅错误' },
-                  { value: 'warn', label: 'warn · 含警告' },
-                  { value: 'info', label: 'info · 含流程' },
-                  { value: 'debug', label: 'debug' },
-                ],
-                (value) => {
-                  this.advancedDraft.logLevel = value
-                },
-              ),
-            ),
-            field(
-              '任务锁窗口',
-              this.numberLine(this.advancedDraft.jobLockMinutes, (value) => {
-                this.advancedDraft.jobLockMinutes = value
-              }, { min: '1', suffix: '分钟' }),
-            ),
-            field(
-              '会话有效期',
-              this.numberLine(this.advancedDraft.sessionDays, (value) => {
-                this.advancedDraft.sessionDays = value
-              }, { min: '1', suffix: '天' }),
-            ),
+          field(
+            '任务锁窗口',
+            this.numberLine(this.advancedDraft.jobLockMinutes, (value) => {
+              this.advancedDraft.jobLockMinutes = value
+            }, { min: '1', suffix: '分钟' }),
+          ),
+          field(
+            '会话有效期',
+            this.numberLine(this.advancedDraft.sessionDays, (value) => {
+              this.advancedDraft.sessionDays = value
+            }, { min: '1', suffix: '天' }),
           ),
         ),
 
