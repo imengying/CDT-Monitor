@@ -275,8 +275,13 @@ export class AccountCard {
     const account = this.account
     const primary = account.instances[0]
     const status = primary?.status.toLowerCase() ?? ''
-    const running = status === 'running'
-    const stopped = status === 'stopped'
+    // Starting / Stopping 是阿里云的过渡态（StopInstance 返回后还要几十秒才真正
+    // 停下）。这时两个按钮都要显示、但置灰：否则过渡期内按钮全消失，用户以为
+    // 功能坏了，要等下一轮 Cron 采集回来才看得到开机按钮。
+    const starting = status === 'starting'
+    const stopping = status === 'stopping'
+    const running = status === 'running' || stopping
+    const stopped = status === 'stopped' || starting
 
     const group = el('div', { class: 'control-group' })
 
@@ -302,9 +307,10 @@ export class AccountCard {
         group.append(
           this.actionButton({
             key: 'start',
-            label: '开机',
+            label: starting ? '正在启动…' : '开机',
             icon: icons.play,
             tone: 'positive',
+            disabled: starting,
             onClick: () => void this.toggleInstance(primary, true),
           }),
         )
@@ -315,10 +321,10 @@ export class AccountCard {
         group.append(
           this.actionButton({
             key: 'stop',
-            label: keepAlive ? '保活启用，不能关机' : '关机',
+            label: stopping ? '正在停止…' : keepAlive ? '保活启用，不能关机' : '关机',
             icon: icons.power,
             tone: 'danger',
-            disabled: keepAlive,
+            disabled: keepAlive || stopping,
             onClick: () => void this.toggleInstance(primary, false),
           }),
         )
