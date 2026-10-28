@@ -200,6 +200,8 @@ export class SettingsModal {
   private readonly footer: HTMLElement
   private readonly tabButtons = new Map<Tab, HTMLButtonElement>()
   private readonly saveButton: HTMLButtonElement
+  /** 实例表单的「创建 / 保存修改」，与 saveButton 共用同一个悬浮栏 */
+  private readonly formSubmitButton: HTMLButtonElement
 
   private form: AccountForm = blankAccountForm()
   private formOpen = false
@@ -235,6 +237,11 @@ export class SettingsModal {
       on: { click: () => this.saveActiveTab() },
     }) as HTMLButtonElement
     this.paintSaving(false)
+    this.formSubmitButton = el('button', {
+      class: 'button button--primary',
+      type: 'button',
+      on: { click: () => void this.submitAccount() },
+    }) as HTMLButtonElement
     this.footer = el('footer', { class: 'settings-footer' }, this.saveButton)
 
     const nav = el('nav', { class: 'settings-tabs' })
@@ -486,8 +493,39 @@ export class SettingsModal {
       button.classList.toggle('active', key === this.activeTab)
       button.setAttribute('aria-selected', String(key === this.activeTab))
     }
-    // 实例页自带「创建 / 保存修改」按钮，日报页有「立即推送」，都不需要底部保存栏
-    this.footer.hidden = this.activeTab === 'accounts' || this.activeTab === 'report'
+    this.paintFooter()
+  }
+
+  /**
+   * 底部悬浮栏。
+   *
+   * 实例页在编辑表单打开时显示「创建实例 / 保存修改」，
+   * 其余标签页用「保存更改」；日报页自带「立即推送」，不显示浮动栏。
+   */
+  private paintFooter(): void {
+    if (this.activeTab === 'report') {
+      this.footer.hidden = true
+      return
+    }
+
+    // 实例页只有表单打开时才需要保存动作，列表状态无需底栏
+    const wantsForm = this.activeTab === 'accounts' && this.formOpen
+    this.footer.hidden = this.activeTab === 'accounts' && !this.formOpen
+
+    if (wantsForm) {
+      const busy = this.saving
+      this.formSubmitButton.disabled = busy
+      this.formSubmitButton.textContent = busy
+        ? '保存中…'
+        : this.form.id === null
+          ? '创建实例'
+          : '保存修改'
+      this.footer.replaceChildren(this.formSubmitButton)
+      return
+    }
+
+    this.paintSaving(this.saving)
+    this.footer.replaceChildren(this.saveButton)
   }
 
   private renderContent(): void {
@@ -511,6 +549,8 @@ export class SettingsModal {
         this.renderSystem()
         break
     }
+    // 表单开合会改变底栏内容（保存修改 / 创建实例 / 无），统一在这里刷新
+    this.paintFooter()
   }
 
   private saveActiveTab(): void {
@@ -805,16 +845,7 @@ export class SettingsModal {
         el('b', { text: form.id === null ? '新增实例' : `编辑「${form.name || form.id}」` }),
       ),
       fields,
-      // 提交按钮悬浮在弹窗右下角，与其它设置页的保存栏位置一致
-      el(
-        'div',
-        { class: 'account-editor__submit' },
-        el(
-          'button',
-          { class: 'button button--primary', type: 'submit' },
-          el('span', { text: form.id === null ? '创建实例' : '保存修改' }),
-        ),
-      ),
+      // 提交按钮不放这里：它复用设置弹窗的悬浮底栏（见 paintFooter）
     )
   }
 
@@ -858,6 +889,7 @@ export class SettingsModal {
     }
 
     this.saving = true
+    this.paintFooter()
     try {
       if (form.id === null) {
         const created = await api.createAccount(payload)
@@ -887,6 +919,7 @@ export class SettingsModal {
       toast(error instanceof ApiError ? error.message : '保存失败', 'danger')
     } finally {
       this.saving = false
+      this.paintFooter()
     }
   }
 
@@ -1466,8 +1499,10 @@ export class SettingsModal {
     this.saveButton.disabled = busy
     replaceChildren(
       this.saveButton,
-      iconSvg(busy ? icons.spinner : icons.check, 18, busy ? 'spin' : ''),
-      el('span', { text: busy ? '保存中…' : '保存更改' }),
+      // 空闲时纯文字，只有保存中才带转圈图标
+      ...(busy
+        ? [iconSvg(icons.spinner, 18, 'spin'), el('span', { text: '保存中…' })]
+        : [el('span', { text: '保存更改' })]),
     )
   }
 }
