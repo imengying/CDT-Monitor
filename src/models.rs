@@ -675,9 +675,6 @@ impl AccountRow {
             schedule_stop_time: self.schedule_stop_time.clone(),
             spot_keep_alive: self.is_spot_keep_alive(),
             enabled: self.is_enabled(),
-            last_schedule_start_date: self.last_schedule_start_date.clone(),
-            last_schedule_stop_date: self.last_schedule_stop_date.clone(),
-            last_schedule_stop_at: self.last_schedule_stop_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -1162,9 +1159,6 @@ pub struct AccountDto {
     pub schedule_stop_time: Option<String>,
     pub spot_keep_alive: bool,
     pub enabled: bool,
-    pub last_schedule_start_date: Option<String>,
-    pub last_schedule_stop_date: Option<String>,
-    pub last_schedule_stop_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1297,9 +1291,7 @@ pub struct AccountOverview {
     pub quota_gb: f64,
     pub quota_label: String,
     pub over_limit_action: OverLimitAction,
-    pub over_limit_action_label: String,
     pub stop_mode: StopMode,
-    pub stop_mode_label: String,
     pub schedule_start_time: Option<String>,
     pub schedule_stop_time: Option<String>,
     pub spot_keep_alive: bool,
@@ -1314,10 +1306,6 @@ pub struct AccountOverview {
     pub traffic_used_gb: f64,
     /// 相对免费额度的百分比。
     pub percentage: f64,
-    /// 相对账号阈值的百分比（阈值为 0 时为 0）。
-    pub threshold_percentage: f64,
-    /// 是否已达到账号设定的告警阈值。
-    pub over_threshold: bool,
     pub billing_month: String,
     /// 本月是否已触发流量熔断（熔断后禁止任何自动/手动开机）。
     pub threshold_triggered: bool,
@@ -1331,7 +1319,6 @@ pub struct OverviewResponse {
     pub accounts: Vec<AccountOverview>,
     pub timezone: String,
     pub billing_month: String,
-    pub generated_at: i64,
 }
 
 /// 任务状态 DTO。
@@ -1570,9 +1557,7 @@ pub fn build_overview(
         quota_gb: account.quota_pool().quota_gb(),
         quota_label: account.quota_pool().label().to_string(),
         over_limit_action: account.action(),
-        over_limit_action_label: account.action().label().to_string(),
         stop_mode: account.stop_mode(),
-        stop_mode_label: account.stop_mode().label().to_string(),
         schedule_start_time: account.schedule_start_time.clone(),
         schedule_stop_time: account.schedule_stop_time.clone(),
         spot_keep_alive: account.is_spot_keep_alive(),
@@ -1583,8 +1568,6 @@ pub fn build_overview(
         balance_credit,
         traffic_used_gb: used_gb,
         percentage: percent_of(used_gb, quota_gb),
-        threshold_percentage: percent_of(used_gb, account.traffic_threshold_gb),
-        over_threshold: threshold_reached(used_gb, account.traffic_threshold_gb),
         billing_month: month,
         threshold_triggered: triggered,
         snapshot_updated_at: updated_at,

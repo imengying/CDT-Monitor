@@ -18,6 +18,7 @@
 use std::time::Duration;
 
 use serde::Serialize;
+#[cfg(test)]
 use serde_json::json;
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit};
 
@@ -652,7 +653,7 @@ fn truncate(input: &str, max_chars: usize) -> String {
 }
 
 /// 构造 Bark 载荷的 JSON 字符串（供测试断言使用）。
-#[allow(dead_code)]
+#[cfg(test)]
 fn bark_payload_json(channel: &BarkChannel, message: &Message) -> String {
     let level = message
         .level

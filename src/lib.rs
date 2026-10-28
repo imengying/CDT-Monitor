@@ -690,7 +690,6 @@ async fn handle_overview(app: &AppCtx) -> worker::Result<Response> {
         accounts: overviews,
         timezone: app.timezone.clone(),
         billing_month: crate::models::billing_month(app.now, &app.timezone),
-        generated_at: app.now,
     })
 }
 

@@ -62,6 +62,12 @@ type Tab = 'accounts' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'system'
  * 与上游保持同一份清单和叫法（「华东 1（杭州）」这种官方编号）。
  * 一个账号只对应一个地域，下拉单选即可。
  */
+/**
+ * 地域下拉项。
+ *
+ * 与后端 `models::RegionName::of()` 保持同步 —— 那里是「地域 ID → 中文名」
+ * 的唯一映射，这里只多承担一个「可选列表」的职责。新增地域时两处都要改。
+ */
 const REGION_OPTIONS: { value: string; label: string }[] = [
   { value: 'cn-hongkong', label: '中国香港' },
   { value: 'cn-hangzhou', label: '华东 1（杭州）' },

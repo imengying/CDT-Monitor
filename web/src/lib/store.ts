@@ -35,8 +35,6 @@ export interface AppState {
 
   settings: SettingsResponse | null
 
-
-
   toasts: Toast[]
 }
 

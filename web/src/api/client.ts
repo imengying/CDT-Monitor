@@ -115,9 +115,7 @@ export interface AccountOverview {
   balance_cash: number | null
   balance_credit: number | null
   over_limit_action: OverLimitAction
-  over_limit_action_label: string
   stop_mode: StopMode
-  stop_mode_label: string
   schedule_start_time: string | null
   schedule_stop_time: string | null
   spot_keep_alive: boolean
@@ -126,8 +124,6 @@ export interface AccountOverview {
   balance_currency: string | null
   traffic_used_gb: number
   percentage: number
-  threshold_percentage: number
-  over_threshold: boolean
   billing_month: string
   threshold_triggered: boolean
   snapshot_updated_at: number | null
@@ -138,7 +134,6 @@ export interface OverviewResponse {
   accounts: AccountOverview[]
   timezone: string
   billing_month: string
-  generated_at: number
 }
 
 export interface TrafficSample {
@@ -206,8 +201,6 @@ export interface AccountDto {
   schedule_stop_time: string | null
   spot_keep_alive: boolean
   enabled: boolean
-  last_schedule_start_date: string | null
-  last_schedule_stop_date: string | null
   created_at: number
   updated_at: number
 }
