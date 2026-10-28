@@ -35,15 +35,15 @@ import { renderToasts } from '@/components/ToastStack'
 const OVERVIEW_POLL_MS = 5 * 60_000
 
 /**
- * 过渡态加速轮询间隔（毫秒）。
+ * 过渡态轮询间隔（毫秒）。
  *
- * 实例处于 `Starting` / `Stopping` 时，阿里云几十秒后就会切到终态，
- * 但常规轮询要等 5 分钟。这段时间单独用 5 秒轮询，状态一稳定就退回常规间隔。
- * 只读 `/overview`（走 D1 快照，不打阿里云），开销可忽略。
+ * 对齐上游的 1 分钟：阿里云从 `Stopping` 到 `Stopped` 通常 30~60 秒，
+ * 更短的间隔并不会让用户更快看到结果，却会放大阿里云 API 调用量。
+ * 常规轮询是 5 分钟，状态一稳定就退回。
  */
-const TRANSITION_POLL_MS = 5_000
+const TRANSITION_POLL_MS = 60_000
 
-/** 实例是否处于阿里云的过渡态。 */
+/** 实例是否处于阿里云的过渡态（与后端 `InstanceInfo::is_transitional` 一致）。 */
 function hasTransitionalInstance(state: Readonly<AppState>): boolean {
   return (state.overview?.accounts ?? []).some((account) =>
     account.instances.some((instance) => {

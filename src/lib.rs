@@ -683,7 +683,7 @@ async fn handle_overview(app: &AppCtx, req: &Request) -> worker::Result<Response
         .collect();
 
     // `?refresh=transitional`：仅当存在处于过渡态的实例时，才对这些账号补一次采集。
-    // 过渡态只持续几十秒，光靠 Cron（15 分钟）读不到终态，前端 5 秒轮询也只会
+    // 过渡态只持续几十秒，光靠 Cron（15 分钟）读不到终态，前端 1 分钟轮询也只会
     // 反复读到旧快照。这里按需触发，不会让常规轮询打阿里云。
     if query_str(&params, "refresh") == Some("transitional") {
         let stale: Vec<_> = accounts

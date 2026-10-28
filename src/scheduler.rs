@@ -61,8 +61,11 @@ pub const LOG_RETENTION_DAYS: i64 = 30;
 pub const JOB_RETENTION_DAYS: i64 = 7;
 /// 单实例动作锁 TTL（分钟）。
 pub const INSTANCE_LOCK_TTL_MINUTES: i64 = 30;
-/// 过渡态按需采集的防抖窗口（毫秒）。前端 5 秒轮询一次，压到这里最多 10 秒一采。
-pub const TRANSITION_REFRESH_TTL_MS: i64 = 10_000;
+/// 过渡态按需采集的防抖窗口（毫秒）。
+///
+/// 前端过渡态每 1 分钟轮询一次（对齐上游），锁留 45 秒让同一次轮询里的
+/// 多个请求（多标签页）只触发一次采集，下一分钟又能正常采。
+pub const TRANSITION_REFRESH_TTL_MS: i64 = 45_000;
 /// 定时关机后保活的避让期（分钟）。
 ///
 /// 只需覆盖「刚关机的那一轮 Cron」：Cron 15 分钟一次，留 20 分钟让快照
@@ -364,11 +367,11 @@ impl Scheduler {
         }
     }
 
-    /// 过渡态下的按需采集：带 10 秒防抖。
+    /// 过渡态下的按需采集：带 45 秒防抖。
     ///
-    /// 前端在实例处于 `Starting` / `Stopping` 时会每 5 秒请求一次 overview，
-    /// 若每个请求都打阿里云，多标签页同时开着就会成倍放大调用量。
-    /// 这里用短 TTL 锁把同一账号的采集频率压到最多 10 秒一次。
+    /// 前端在实例处于 `Starting` / `Stopping` 时每分钟请求一次 overview，
+    /// 多标签页同时开着仍会成倍放大调用量。这里用 TTL 锁把同一账号的采集
+    /// 频率压到最多 45 秒一次（下一分钟轮询时锁已过期，可正常再采）。
     pub async fn refresh_account_throttled(&self, account: &AccountRow) -> Option<RefreshOutcome> {
         let owner = random_hex(8).ok()?;
         let key = format!("transition-refresh:{}", account.id);
