@@ -34,6 +34,25 @@ import { renderToasts } from '@/components/ToastStack'
  */
 const OVERVIEW_POLL_MS = 5 * 60_000
 
+/**
+ * 过渡态加速轮询间隔（毫秒）。
+ *
+ * 实例处于 `Starting` / `Stopping` 时，阿里云几十秒后就会切到终态，
+ * 但常规轮询要等 5 分钟。这段时间单独用 5 秒轮询，状态一稳定就退回常规间隔。
+ * 只读 `/overview`（走 D1 快照，不打阿里云），开销可忽略。
+ */
+const TRANSITION_POLL_MS = 5_000
+
+/** 实例是否处于阿里云的过渡态。 */
+function hasTransitionalInstance(state: Readonly<AppState>): boolean {
+  return (state.overview?.accounts ?? []).some((account) =>
+    account.instances.some((instance) => {
+      const status = instance.status.toLowerCase()
+      return status === 'starting' || status === 'stopping' || status === 'pending'
+    }),
+  )
+}
+
 /** 控制台外壳。 */
 export class App {
   private readonly root: HTMLElement
@@ -57,6 +76,8 @@ export class App {
   private menuOpen = false
 
   private pollTimer: number | null = null
+  /** 当前是否处于过渡态加速轮询，用于避免重复重排定时器 */
+  private fastPolling = false
   private lastPhase: AppState['phase'] | null = null
 
   constructor(root: HTMLElement) {
@@ -67,18 +88,38 @@ export class App {
   /** 启动应用。 */
   start(): void {
     void bootstrap()
-
-    this.pollTimer = window.setInterval(() => {
-      const state = store.get()
-      if (state.phase === 'ready' && !state.refreshingAll && !state.overviewLoading) {
-        void loadOverview()
-      }
-    }, OVERVIEW_POLL_MS)
+    this.schedulePoll()
 
     window.addEventListener('beforeunload', () => {
-      if (this.pollTimer !== null) window.clearInterval(this.pollTimer)
+      if (this.pollTimer !== null) window.clearTimeout(this.pollTimer)
       clearToasts()
     })
+  }
+
+  /**
+   * 安排下一次概览轮询。
+   *
+   * 用 setTimeout 自我重排而不是 setInterval：间隔要随「是否有实例处于过渡态」
+   * 动态变化，固定间隔做不到。
+   */
+  private schedulePoll(): void {
+    if (this.pollTimer !== null) window.clearTimeout(this.pollTimer)
+
+    const state = store.get()
+    const fast = state.phase === 'ready' && hasTransitionalInstance(state)
+
+    this.pollTimer = window.setTimeout(() => {
+      this.pollTimer = null
+      void this.runPoll()
+    }, fast ? TRANSITION_POLL_MS : OVERVIEW_POLL_MS)
+  }
+
+  private async runPoll(): Promise<void> {
+    const state = store.get()
+    if (state.phase === 'ready' && !state.refreshingAll && !state.overviewLoading) {
+      await loadOverview()
+    }
+    this.schedulePoll()
   }
 
   // -------------------------------------------------------------------------
@@ -91,6 +132,13 @@ export class App {
       this.switchPhase(state)
     } else if (state.phase === 'ready') {
       this.updateShell(state)
+    }
+
+    // 进出过渡态时立刻切换轮询节奏，不必等当前这一轮定时器到点
+    const fast = state.phase === 'ready' && hasTransitionalInstance(state)
+    if (fast !== this.fastPolling) {
+      this.fastPolling = fast
+      this.schedulePoll()
     }
 
     this.settingsModal?.update(state.settings)
