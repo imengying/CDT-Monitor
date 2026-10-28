@@ -765,6 +765,15 @@ impl InstanceInfo {
         self.status.eq_ignore_ascii_case("Stopped")
     }
 
+    /// 是否处于阿里云的过渡态（`Starting` / `Stopping` / `Pending`）。
+    ///
+    /// 这些状态持续几十秒就会落到终态，前端据此决定要不要加速轮询。
+    pub fn is_transitional(&self) -> bool {
+        ["Starting", "Stopping", "Pending"]
+            .iter()
+            .any(|s| self.status.eq_ignore_ascii_case(s))
+    }
+
     /// 抢占式实例的可保活判断：必须是抢占式 + 已打开逐实例开关 + 当前处于运行态。
     pub fn keep_alive_active(&self, account_master_switch: bool) -> bool {
         self.spot && self.keep_alive && account_master_switch
@@ -1578,6 +1587,27 @@ pub fn build_overview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 过渡态判断：前端据此决定是否加速轮询、后端是否按需补采。
+    /// 阿里云状态大小写不固定（`Stopping` / `stopping` 都出现过），按忽略大小写比较。
+    #[test]
+    fn instance_transitional_states() {
+        // 其余字段都有 #[serde(default)]，直接反序列化最省事
+        let make = |status: &str| {
+            serde_json::from_value::<InstanceInfo>(serde_json::json!({
+                "instance_id": "i-test",
+                "status": status,
+            }))
+            .expect("InstanceInfo 应能从最小 JSON 构造")
+        };
+
+        for transitional in ["Starting", "Stopping", "Pending", "starting", "STOPPING"] {
+            assert!(make(transitional).is_transitional(), "{transitional} 应算过渡态");
+        }
+        for terminal in ["Running", "Stopped", "running", "stopped", ""] {
+            assert!(!make(terminal).is_transitional(), "{terminal} 不该算过渡态");
+        }
+    }
 
     /// 实例 ID 必填：留空会让熔断停机 / 定时开关机 / 保活
     /// 作用到该地域内的所有实例。

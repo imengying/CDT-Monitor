@@ -117,7 +117,8 @@ export class App {
   private async runPoll(): Promise<void> {
     const state = store.get()
     if (state.phase === 'ready' && !state.refreshingAll && !state.overviewLoading) {
-      await loadOverview()
+      // 过渡态下让后端顺带采集一次，否则光读快照永远等不到终态
+      await loadOverview(hasTransitionalInstance(state))
     }
     this.schedulePoll()
   }

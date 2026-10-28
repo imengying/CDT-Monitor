@@ -83,10 +83,13 @@ export async function logout(): Promise<void> {
 // 概览
 // ---------------------------------------------------------------------------
 
-export async function loadOverview(): Promise<void> {
-  store.patch({ overviewLoading: true, overviewError: '' })
+export async function loadOverview(refreshTransitional = false): Promise<void> {
+  // 静默轮询不显示加载态，只有显式调用（登录后、动作后）才置 loading
+  if (!refreshTransitional) {
+    store.patch({ overviewLoading: true, overviewError: '' })
+  }
   try {
-    const overview = await api.overview()
+    const overview = await api.overview(refreshTransitional)
     store.patch({ overview, overviewLoading: false })
   } catch (error) {
     store.patch({ overviewLoading: false })

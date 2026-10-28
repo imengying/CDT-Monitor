@@ -671,15 +671,59 @@ async fn handle_delete_other_sessions(app: &AppCtx, current_sid: &str) -> worker
 // ===========================================================================
 
 /// `GET /api/v1/overview`
-async fn handle_overview(app: &AppCtx) -> worker::Result<Response> {
+async fn handle_overview(app: &AppCtx, req: &Request) -> worker::Result<Response> {
+    let params = query_map(req);
     let accounts = app.db.list_accounts(false).await?;
-    let snapshots: HashMap<i64, crate::models::SnapshotRow> = app
+    let mut snapshots: HashMap<i64, crate::models::SnapshotRow> = app
         .db
         .list_snapshots()
         .await?
         .into_iter()
         .map(|snapshot| (snapshot.account_id, snapshot))
         .collect();
+
+    // `?refresh=transitional`：仅当存在处于过渡态的实例时，才对这些账号补一次采集。
+    // 过渡态只持续几十秒，光靠 Cron（15 分钟）读不到终态，前端 5 秒轮询也只会
+    // 反复读到旧快照。这里按需触发，不会让常规轮询打阿里云。
+    if query_str(&params, "refresh") == Some("transitional") {
+        let stale: Vec<_> = accounts
+            .iter()
+            .filter(|account| {
+                snapshots
+                    .get(&account.id)
+                    .map(|snapshot| {
+                        let instances = snapshot.instances();
+                        // 没有实例时也算「需要采集」：可能是首次配置还没拉过
+                        instances.is_empty() || instances.iter().any(|i| i.is_transitional())
+                    })
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+
+        if !stale.is_empty() {
+            let scheduler = crate::scheduler::Scheduler::new(&app.env).await?;
+            let mut refreshed = false;
+            for account in &stale {
+                // 带防抖：多标签页同时轮询时不会成倍打阿里云
+                if let Some(outcome) = scheduler.refresh_account_throttled(account).await
+                    && outcome.success
+                {
+                    refreshed = true;
+                }
+            }
+            // 有新数据时重读快照，保证本次响应就返回最新状态
+            if refreshed {
+                snapshots = app
+                    .db
+                    .list_snapshots()
+                    .await?
+                    .into_iter()
+                    .map(|snapshot| (snapshot.account_id, snapshot))
+                    .collect();
+            }
+        }
+    }
 
     let overviews = accounts
         .iter()
@@ -1589,7 +1633,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
         (Method::Delete, ["sessions", sid]) => handle_delete_session(&app, &claims.sid, sid).await,
 
         // ------------------------------------------------------------ 概览
-        (Method::Get, ["overview"]) => handle_overview(&app).await,
+        (Method::Get, ["overview"]) => handle_overview(&app, &req).await,
         (Method::Get, ["history"]) => handle_history(&app, &req).await,
         (Method::Get, ["logs"]) => handle_logs(&app, &req).await,
 
