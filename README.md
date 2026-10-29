@@ -363,7 +363,7 @@ bun run dev:web                  # :5173
 
 ```
 1. housekeeping（每日一次，锁保护）
-     清理过期锁 / 90 天前历史 / 30 天前日志 / 7 天前 Job
+     清理过期锁 / 32 天前历史 / 32 天前日志 / 7 天前 Job
 2. 逐账号：CDT 流量 + 余额 + 各地域 ECS 实例 → 写快照 → 采样历史
 3. 额度判定：任一池（内地 / 非内地）超出各自额度
      首次超限 → 标记账期 + 通知 [+ 停机（stop_and_notify）]
@@ -430,6 +430,7 @@ bun run dev:web                  # :5173
 | GET | `/api/v1/overview` | 首页数据（读快照表） |
 | GET | `/api/v1/history?account_id&bucket=hour\|day&limit` | 流量历史 |
 | GET | `/api/v1/logs?account_id&action&q&limit` | 操作日志（类型前缀 + 关键字） |
+| DELETE | `/api/v1/logs?account_id&action&q` | 按同一套条件清空日志 |
 | GET | `/api/v1/jobs[/{id}]` | 任务状态 |
 | POST | `/api/v1/refresh` | 刷新全部 → 202 |
 | POST | `/api/v1/accounts` | 新增账号 |

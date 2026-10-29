@@ -495,6 +495,18 @@ export const api = {
     return request<ActionLog[]>(`/api/v1/logs?${params.toString()}`)
   },
 
+  /** 按当前筛选条件清空日志；不传条件则全部清空。 */
+  clearLogs(options: { action?: string } = {}): Promise<{ removed: number }> {
+    const params = new URLSearchParams()
+    if (options.action) {
+      params.set('action', options.action)
+    }
+    const query = params.toString()
+    return request<{ removed: number }>(`/api/v1/logs${query ? `?${query}` : ''}`, {
+      method: 'DELETE',
+    })
+  },
+
   // ---------------------------------------------------------------- 任务
   job(jobId: string): Promise<JobDto> {
     return request<JobDto>(`/api/v1/jobs/${encodeURIComponent(jobId)}`)

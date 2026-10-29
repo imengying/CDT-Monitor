@@ -1769,6 +1769,15 @@ h3 {
   padding: 6px 12px;
 }
 
+/* 清空确认条：跟随日志内容区的左右边距，空时不占高度 */
+.log-confirm-host {
+  margin: 0 28px;
+}
+
+.log-confirm-host:empty {
+  display: none;
+}
+
 .log-body {
   padding: 18px 28px 26px;
   overflow-y: auto;

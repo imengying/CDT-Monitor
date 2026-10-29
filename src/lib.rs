@@ -795,6 +795,20 @@ async fn handle_logs(app: &AppCtx, req: &Request) -> worker::Result<Response> {
     ok(&logs)
 }
 
+/// `DELETE /api/v1/logs[?account_id=&action=&q=]`：按同一套条件清空日志。
+async fn handle_clear_logs(app: &AppCtx, req: &Request) -> worker::Result<Response> {
+    let params = query_map(req);
+    let filter = crate::models::LogFilter {
+        account_id: query_i64(&params, "account_id"),
+        action_prefix: query_str(&params, "action").map(|v| v.to_string()),
+        keyword: query_str(&params, "q").map(|v| v.to_string()),
+        limit: 0,
+    };
+    let removed = app.db.clear_logs(&filter).await?;
+    log_info!("清空日志：{removed} 条");
+    ok(&serde_json::json!({ "removed": removed }))
+}
+
 /// `GET /api/v1/jobs/{id}` 与 `GET /api/v1/jobs`
 async fn handle_job(app: &AppCtx, job_id: &str) -> worker::Result<Response> {
     match app.db.get_job(job_id).await? {
@@ -1637,6 +1651,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
         (Method::Get, ["overview"]) => handle_overview(&app, &req).await,
         (Method::Get, ["history"]) => handle_history(&app, &req).await,
         (Method::Get, ["logs"]) => handle_logs(&app, &req).await,
+        (Method::Delete, ["logs"]) => handle_clear_logs(&app, &req).await,
 
         // ------------------------------------------------------------ 任务
         (Method::Get, ["jobs"]) => handle_job_list(&app, &req).await,

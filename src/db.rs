@@ -776,6 +776,34 @@ impl Db {
         .await
     }
 
+    /// 清空日志，可按同一套过滤条件收窄（不传则全清）。
+    ///
+    /// 条件与 [`Self::list_logs`] 保持一致：界面上看到什么，就能只清掉什么。
+    pub async fn clear_logs(&self, filter: &LogFilter) -> Result<usize> {
+        let mut clauses: Vec<&str> = Vec::new();
+        let mut params: Vec<JsValue> = Vec::new();
+
+        if let Some(account_id) = filter.account_id {
+            clauses.push("account_id = ?");
+            params.push(j_i64(account_id));
+        }
+        if let Some(prefix) = filter.action_prefix.as_deref().filter(|v| !v.is_empty()) {
+            clauses.push("action_type LIKE ?");
+            params.push(j_text(&format!("{prefix}%")));
+        }
+        if let Some(keyword) = filter.keyword.as_deref().filter(|v| !v.is_empty()) {
+            clauses.push("detail LIKE ?");
+            params.push(j_text(&format!("%{keyword}%")));
+        }
+
+        let sql = if clauses.is_empty() {
+            "DELETE FROM action_logs".to_string()
+        } else {
+            format!("DELETE FROM action_logs WHERE {}", clauses.join(" AND "))
+        };
+        self.exec(&sql, &params).await
+    }
+
     // =======================================================================
     // locks（幂等）
     // =======================================================================

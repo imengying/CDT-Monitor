@@ -53,9 +53,15 @@ pub const REPORT_WINDOW_MINUTES: u32 = 60;
 /// 保证小时粒度图表不断线。
 pub const HISTORY_HEARTBEAT_MS: i64 = 30 * 60 * 1000;
 /// 历史数据保留天数。
-pub const HISTORY_RETENTION_DAYS: i64 = 90;
+///
+/// 图表日视图最多 31 个点，更早的采样写了也读不到。
+/// 留 32 天而非 31 天，是为了让边界那天的采样在被裁掉前完整保留一个整天。
+pub const HISTORY_RETENTION_DAYS: i64 = 32;
 /// 操作日志保留天数。
-pub const LOG_RETENTION_DAYS: i64 = 30;
+///
+/// 与流量历史保持一致：一个自然月的图表窗口 + 1 天边界。
+/// 真实排障走数据库直查，界面抽屉只作最近状态参考。
+pub const LOG_RETENTION_DAYS: i64 = 32;
 /// 任务记录保留天数。
 pub const JOB_RETENTION_DAYS: i64 = 7;
 /// 单实例动作锁 TTL（分钟）。

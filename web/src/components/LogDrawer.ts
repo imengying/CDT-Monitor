@@ -14,6 +14,7 @@
 import { api, ApiError, formatTime, type ActionLog } from '@/api/client'
 import { el, eyebrow, iconButton, iconSvg, onEscape, replaceChildren, segmented } from '@/lib/dom'
 import { icons } from '@/lib/icons'
+import { toast } from '@/lib/store'
 
 /** action_type 的中文标签（未收录的直出原文）。 */
 const ACTION_LABELS: Record<string, string> = {
@@ -87,11 +88,15 @@ export class LogDrawer {
   private readonly errorBox: HTMLDivElement
   private readonly filterHost: HTMLDivElement
   private readonly refreshButton: HTMLButtonElement
+  private readonly clearButton: HTMLButtonElement
+  private readonly confirmHost: HTMLDivElement
 
   private logs: ActionLog[] = []
   private keyword = ''
   private filter: FilterKey = ''
   private loading = false
+  /** 清空确认条是否展开 */
+  private confirming = false
   private removeEscListener: (() => void) | null = null
 
   constructor() {
@@ -116,6 +121,18 @@ export class LogDrawer {
       onClick: () => void this.load(),
     })
 
+    this.confirmHost = el('div', { class: 'log-confirm-host' })
+
+    this.clearButton = iconButton({
+      label: '清空日志',
+      icon: icons.trash,
+      tone: 'danger',
+      onClick: () => {
+        this.confirming = true
+        this.renderConfirm()
+      },
+    })
+
     this.element = el(
       'div',
       { class: 'modal-layer', hidden: true },
@@ -135,11 +152,13 @@ export class LogDrawer {
           el(
             'div',
             { class: 'control-group' },
+            this.clearButton,
             this.refreshButton,
             iconButton({ label: '关闭', icon: icons.close, onClick: () => this.close() }),
           ),
         ),
         el('div', { class: 'log-toolbar' }, this.filterHost, this.searchInput),
+        this.confirmHost,
         this.errorBox,
         el('div', { class: 'log-body' }, this.listHost),
       ),
@@ -170,6 +189,8 @@ export class LogDrawer {
     document.body.style.overflow = 'hidden'
     this.keyword = ''
     this.filter = ''
+    this.confirming = false
+    this.renderConfirm()
     this.searchInput.value = ''
     this.renderFilter()
     this.removeEscListener = onEscape(() => this.close())
@@ -215,6 +236,69 @@ export class LogDrawer {
       this.loading = false
       this.refreshButton.disabled = false
       replaceChildren(this.refreshButton, iconSvg(icons.refresh, 18))
+    }
+  }
+
+  /** 渲染清空确认条（默认隐藏）。 */
+  private renderConfirm(): void {
+    if (!this.confirming) {
+      replaceChildren(this.confirmHost)
+      return
+    }
+    const scope = this.filter ? '当前筛选范围内的日志' : '全部日志'
+    replaceChildren(
+      this.confirmHost,
+      el(
+        'div',
+        { class: 'confirm-strip' },
+        el('span', { text: `${scope}将被永久删除，无法恢复。` }),
+        el(
+          'div',
+          { class: 'control-group' },
+          el('button', {
+            class: 'button button--secondary button--small',
+            type: 'button',
+            text: '取消',
+            on: {
+              click: () => {
+                this.confirming = false
+                this.renderConfirm()
+              },
+            },
+          }),
+          el('button', {
+            class: 'button button--primary button--small',
+            type: 'button',
+            text: '确认清空',
+            on: { click: () => void this.clear() },
+          }),
+        ),
+      ),
+    )
+  }
+
+  /** 按当前筛选条件清空日志。 */
+  private async clear(): Promise<void> {
+    if (this.loading) return
+    this.loading = true
+    this.confirming = false
+    this.renderConfirm()
+    this.clearButton.disabled = true
+    this.errorBox.hidden = true
+
+    try {
+      const { removed } = await api.clearLogs({ action: this.filter || undefined })
+      toast(removed > 0 ? `已清空 ${removed} 条日志` : '没有可清空的日志', 'ok')
+      this.logs = []
+      this.renderList()
+      await this.load()
+    } catch (error) {
+      this.errorBox.hidden = false
+      this.errorBox.textContent =
+        error instanceof ApiError ? error.message : '清空日志失败'
+    } finally {
+      this.loading = false
+      this.clearButton.disabled = false
     }
   }
 
