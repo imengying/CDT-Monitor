@@ -6,25 +6,236 @@
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│  Cloudflare 边缘                                                   │
+│  Cloudflare 边缘                                                  │
 │                                                                   │
-│  纯 TypeScript 前端 (DOM + ECharts + Tailwind)   ← ASSETS 绑定    │
-│         │ fetch /api/v1/*（同源 Cookie）                           │
+│  纯 TypeScript 前端 (DOM + ECharts)              ← ASSETS 绑定    │
+│         │ fetch /api/v1/*（同源 Cookie）                          │
 │         ▼                                                         │
 │  Worker (Rust → Wasm)                                             │
-│    ├─ fetch:     路由 + 登录 + Cookie 鉴权                         │
-│    ├─ scheduled: */15 * * * * 巡检                                 │
-│    └─ wait_until: 异步 Job（刷新 / 开关机 / 通知测试 / 日报）        │
+│    ├─ fetch:     路由 + 登录 + Cookie 鉴权                        │
+│    ├─ scheduled: */15 * * * * 巡检                                │
+│    └─ wait_until: 异步 Job（刷新 / 开关机 / 通知测试 / 日报）     │
 │         │                                                         │
-│         ├─ D1：accounts / snapshots / history / jobs / logs        │
-│         └─ fetch → 阿里云 RPC（CDT / ECS / BSS）                    │
+│         ├─ D1：accounts / snapshots / history / jobs / logs       │
+│         └─ fetch → 阿里云 RPC（CDT / ECS / BSS）                  │
 │                       Telegram · Bark                             │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 目录结构
+## 一、准备阿里云子账号
+
+CDT-Monitor 需要一对 AccessKey 才能读流量、查实例、按阈值停机。不要用主账号的
+AccessKey——主账号密钥拥有全部权限，泄露后整个云账号都会失守。
+
+### 1. 创建 RAM 子账号
+
+1. 进入阿里云 RAM 用户控制台（[🇨🇳 国内站](https://ram.console.aliyun.com/users) | [🌍 国际站](https://ram.console.alibabacloud.com/users)），点 **创建用户**。
+2. 填写登录名称（例如 `cdt-monitor`），访问方式勾选 **「使用永久 AccessKey 访问」**。
+3. 创建完成后，把页面上生成的 **AccessKey ID** 和 **AccessKey Secret** 复制保存下来，后面填进 CDT-Monitor 就用这两个值。
+
+### 2. 创建自定义权限策略
+
+官方预置的系统策略权限过宽，这里用「脚本编辑」写一份最小权限策略。
+
+1. 前往权限策略控制台（[🇨🇳 国内站](https://ram.console.aliyun.com/policies) | [🌍 国际站](https://ram.console.alibabacloud.com/policies)），点 **创建权限策略**。
+2. 切到 **脚本编辑** 标签页，清空默认内容，粘贴：
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "cdt:ListCdtInternetTraffic",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "bssapi:QueryAccountBalance",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "ecs:DescribeInstances",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecs:StartInstance",
+        "ecs:StopInstance"
+      ],
+      "Resource": "acs:ecs:<region>:<主账号 UID>:instance/<实例 ID>"
+    }
+  ]
+}
+```
+
+> **`bssapi:QueryAccountBalance` 可能提示「无效授权」**：忽略即可，实测余额可以正常
+> 查到。若连这一行都不想保留，删掉它也不影响其他功能，只是余额一栏显示 `—`。
+
+### 3. 替换成你的实例信息
+
+最后一段的 `acs:ecs:<region>:<主账号 UID>:instance/<实例 ID>` 用来限制子账号只能开关
+指定的机器，三个占位符都要换成实际值：
+
+| 占位符 | 含义 | 去哪找 | 示例 |
+|---|---|---|---|
+| `<region>` | 地域 ID | 目标 ECS 所在的地域代号 | `cn-hongkong` |
+| `<主账号 UID>` | 阿里云账号 ID | 鼠标移到控制台右上角头像即可看到 | `1234567890123456` |
+| `<实例 ID>` | ECS 实例 ID | `instance` 后面**必须保留斜杠 `/`** | `i-bp1234567890abcdef` |
+
+本项目是「一个账号对应一个地域和一台实例」，直接写死最安全，不需要 `*` 通配符：
+
+```json
+"Resource": "acs:ecs:cn-hongkong:1234567890123456:instance/i-bp1234567890abcdef"
+```
+
+要用同一个子账号管理多台机器时，`Resource` 改成数组：
+
+```json
+"Resource": [
+  "acs:ecs:cn-hongkong:1234567890123456:instance/i-bp1111111111abcdef",
+  "acs:ecs:cn-hangzhou:1234567890123456:instance/i-bp2222222222abcdef"
+]
+```
+
+### 4. 绑定到子账号
+
+1. 回到 **RAM 用户列表**，找到刚才创建的账号，点右侧 **新增授权**。
+2. **授权范围** 保持默认的「账号级别（整个云账号）」。
+3. 在 **权限策略** 里切到「自定义策略」，搜索并勾选刚建的策略，确认授权。
+
+完成后，用第 1 步保存的 AK/SK 填进 CDT-Monitor 即可。
+
+---
+
+## 二、部署到 Cloudflare
+
+Cloudflare 控制台支持简体中文（右上角头像 → **Language / 语言** → 简体中文），
+下面用中文界面写路径，英文界面对应位置在括号里。
+
+### 1. 连接仓库
+
+**Workers 和 Pages**（Workers & Pages）→ **创建**（Create）→ **Workers** →
+**从 Git 导入**（Connect to Git），选中本仓库，然后填两项：
+
+| 项 | 值 |
+|---|---|
+| 构建命令（Build command） | `bun run build` |
+| 部署命令（Deploy command） | `bun run deploy` |
+
+### 2. 设置 `BUN_VERSION`
+
+在同一个页面往下找 **构建变量**（Build variables）或「变量和机密」，添加一项：
+
+| 变量名 | 值 | 类型 |
+|---|---|---|
+| `BUN_VERSION` | `1.4.4` | 构建变量（非机密） |
+
+这一项**必须配**。Cloudflare 构建镜像预装的是 Bun 1.2.5，不指定版本就会用旧版编译，
+可能直接失败。`build-ci.sh` 检测到版本不符会自行装指定版本；完全没设时脚本直接报错退出。
+
+> 它和后面的 `MASTER_KEY` 不是一回事：`BUN_VERSION` 只在**构建阶段**可见，
+> 用来装对 Bun 版本；`MASTER_KEY` 是**运行时**机密，构建时完全不需要它，
+> 但 Worker 跑起来必须靠它解密。两处别填错位置。
+
+### 3. 配置三个运行时 Secret
+
+**设置**（Settings）→ **变量和机密**（Variables and Secrets），添加三项，
+类型都选 **机密**（Secret，加密存储、存后不可回读）：
+
+| 名称 | 值 |
+|---|---|
+| `MASTER_KEY` | 见下方说明 |
+| `ADMIN_USERNAME` | 你自己定的管理员用户名 |
+| `ADMIN_PASSWORD` | 你自己定的管理员密码 |
+
+#### `MASTER_KEY` 怎么填
+
+**它不是让你手写的一串固定值**，而是随机生成的一段密钥，用来加密数据库里存的
+AccessKey Secret。在任意一台装有 OpenSSL 的电脑上执行：
+
+```bash
+openssl rand -hex 32
+```
+
+会输出 64 个十六进制字符，例如：
+
+```
+9f3c1a7e4b2d8f605a9e7c3b1d4f8a2e6c9b0d3f5a8e1c4b7d2f9a6e3c0b5d81
+```
+
+把这串完整复制，粘贴到 `MASTER_KEY` 的值里。**不要**把命令本身填进去。
+
+没有 OpenSSL 时，任意 32 字节的随机串也可以（64 位 Hex、44 位 Base64 均可）；
+随手编一串短字符串虽然能启动，但强度不够，不建议。
+
+`ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 是登录后台用的账号密码，自己定即可。
+这两项不写进数据库，也没有后台改密码入口；修改 Secret 后 Cloudflare 会自动
+重启 Worker，新值立即生效，不需要重新部署。
+
+### 4. 部署
+
+点 **部署**（Deploy）。`deploy.ts` 会依次完成：建 D1 库、执行 `migrations/`
+下未应用的 SQL、上传 Worker。
+
+`wrangler.toml` 里不写 `database_id`，由 `database_name` 在部署时解析，所以首次
+部署不需要手动建库。
+
+> 改了 `MASTER_KEY` 会让已存的密文全部解不开，需要到设置页把每个账号的
+> AccessKey Secret 重填一遍。
+
+### 5. 添加第一个实例
+
+登录后到 **设置 → 实例**，填：
+
+| 字段 | 说明 |
+|---|---|
+| 账号名称 | 自己起，例如「香港主节点」 |
+| 站点类型 | 国内站选「中国站（CNY）」，国际站选对应项 |
+| AccessKey ID / Secret | 第一步保存的那一对 |
+| 地域 / 实例 ID | 与上面 RAM 策略里写的必须一致 |
+| 告警阈值 | 单位 GB，`0` 表示不限制也不告警 |
+| 超限动作 | `stop_and_notify` 停机并通知 / `notify_only` 只通知 |
+| 停机模式 | `StopCharging` 节省停机 / `KeepCharging` 保留停机 |
+| 定时开关机 | 留空表示不启用 |
+| 抢占式保活 | 被回收后自动拉起 |
+
+保存后会立即采集一次，卡片直接出数据。其余配置同样在 **设置** 里：
+
+| 配置 | 位置 |
+|---|---|
+| Turnstile 人机校验 | 设置 → 人机校验 |
+| Telegram / Bark 通知 | 设置 → Telegram / Bark |
+| 日报时间 | 设置 → 日报 |
+| 时区、日志级别、任务锁窗口、会话有效期 | 设置 → 系统 |
+
+---
+
+## 三、技术说明
+
+以下几节给维护者看，普通部署不需要读。
+
+### 日志与可观测性
+
+| 项目 | 默认 | 调整方式 |
+|---|---|---|
+| 应用日志 | 仅 `error` | 设置 → 系统 → 日志级别 |
+| Workers Logs | 关闭 | `wrangler.toml` 的 `[observability] enabled`，或控制台开关 |
+
+```text
+error  解密失败、D1 不可用、任务失败
+warn   单地域查询失败、通知发送失败
+info   Cron 汇总、任务完成、保活拉起实例
+debug  同 info
+```
+
+---
+
+### 目录结构
 
 ```
 cdt-monitor/
@@ -63,6 +274,7 @@ cdt-monitor/
         ├── lib/
         │   ├── dom.ts          el() / iconSvg() 等 DOM 工具
         │   ├── icons.ts        按需引入的 lucide 图标
+        │   ├── echarts.ts      按需注册的 ECharts 模块（动态 import）
         │   ├── store.ts        状态容器 + toast
         │   └── actions.ts      API 调用与状态写入
         └── components/
@@ -78,69 +290,7 @@ cdt-monitor/
 
 ---
 
-## 部署
-
-### 1. 连接仓库
-
-**Workers & Pages → Create → Workers → Connect to Git**，选中本仓库。
-
-| 项 | 值 |
-|---|---|
-| Build command | `bun run build` |
-| Deploy command | `bun run deploy` |
-| Build variable | `BUN_VERSION=1.4.4` |
-
-`BUN_VERSION` **必须配置**。构建镜像预装 Bun 1.2.5，不指定会用它编译。
-`build-ci.sh` 检测到版本不符时会安装指定版本，未设置则直接失败。
-
-`deploy.ts` 完成首次部署：创建 D1 库、应用 `migrations/` 下未执行的 SQL、
-上传 Worker。`wrangler.toml` 不写 `database_id`，由 `database_name` 解析。
-
-### 2. Secret
-
-**Settings → Variables and Secrets**，三项均选 **Secret**：
-
-| 名称 | 说明 |
-|---|---|
-| `MASTER_KEY` | `openssl rand -hex 32` |
-| `ADMIN_USERNAME` | 管理员用户名 |
-| `ADMIN_PASSWORD` | 管理员密码 |
-
-`MASTER_KEY` 轮换会使已存密文全部失效。凭证不落库，后台无改密入口，
-修改后需重新部署。
-
-### 3. 登录
-
-访问 Worker 域名，使用上述凭证登录。其余配置在「设置」中维护：
-
-| 配置 | 位置 |
-|---|---|
-| 阿里云账号、额度、停机策略、定时、保活 | 设置 → 阿里云账号 |
-| Turnstile | 设置 → 人机校验 |
-| Telegram | 设置 → Telegram |
-| Bark | 设置 → Bark |
-| 日报时间 | 设置 → 日报 |
-| 时区、日志级别、任务锁窗口、会话有效期 | 设置 → 系统 |
-
----
-
-## 日志与可观测性
-
-| 项目 | 默认 | 调整方式 |
-|---|---|---|
-| 应用日志 | 仅 `error` | 设置 → 系统 → 日志级别 |
-| Workers Logs | 关闭 | `wrangler.toml` 的 `[observability] enabled`，或控制台开关 |
-
-```text
-error  解密失败、D1 不可用、任务失败
-warn   单地域查询失败、通知发送失败
-info   Cron 汇总、任务完成、保活拉起实例
-debug  同 info
-```
-
----
-
-## 本地开发
+### 本地开发
 
 ```bash
 rustup target add wasm32-unknown-unknown
@@ -163,7 +313,7 @@ bun run dev:web                  # :5173
 
 ---
 
-## 配置分布
+### 配置分布
 
 | 类别 | 存放位置 | 内容 |
 |---|---|---|
@@ -175,9 +325,9 @@ bun run dev:web                  # :5173
 
 ---
 
-## 安全模型
+### 安全模型
 
-### 凭据加密
+#### 凭据加密
 
 ```
 明文  ──XChaCha20-Poly1305(随机 24B Nonce)──▶  Base64(Nonce ‖ 密文 ‖ 16B Tag)  ──▶  D1 TEXT
@@ -187,7 +337,7 @@ bun run dev:web                  # :5173
 * 主密钥解析顺序：64 字符 Hex → Base64（三种变体）→ 恰 32 字节原文 → `blake3::derive_key`
 * 任一字节被篡改都会导致 AEAD 认证失败并返回明确错误
 
-### 管理员认证
+#### 管理员认证
 
 | 环节 | 实现 |
 |---|---|
@@ -199,7 +349,7 @@ bun run dev:web                  # :5173
 | 会话 | `v1.<payload>.<sig>`，`HMAC-SHA256(MASTER_KEY)` 签名，payload 含 `iat` / `exp` / `jti` |
 | 传输 | `HttpOnly; Secure; SameSite=Strict` Cookie |
 
-### 纵深防御
+#### 纵深防御
 
 * 写接口校验 `Sec-Fetch-Site` / `Origin` / `Referer`，拒绝跨站请求
 * 所有文本经 `textContent` 写入，不拼接 `innerHTML`；仅静态 SVG 内联
@@ -207,9 +357,9 @@ bun run dev:web                  # :5173
 
 ---
 
-## 业务逻辑
+### 业务逻辑
 
-### Cron（`*/15 * * * *`）
+#### Cron（`*/15 * * * *`）
 
 ```
 1. housekeeping（每日一次，锁保护）
@@ -225,7 +375,7 @@ bun run dev:web                  # :5173
 
 窗口取 60 分钟：巡检间隔 15 分钟，一次网络抖动后下一轮还能补上。
 
-### 抢占式保活
+#### 抢占式保活
 
 阿里云不提供区分「系统回收」与「用户手动停机」的字段 —— 两者都是
 `Status == Stopped`；`OperationLocks` 只在回收前 5 分钟标记，比巡检间隔
@@ -239,7 +389,7 @@ bun run dev:web                  # :5173
 剩余情形（允许时段内手动停机）仍会被拉起，这是接口能力的边界：
 手动停机前请先关闭保活开关。
 
-### 优先级
+#### 优先级
 
 ```
 流量熔断停机  >  抢占式保活  >  定时开机
@@ -248,7 +398,7 @@ bun run dev:web                  # :5173
 当月已熔断且策略为 `stop_and_notify` 时，保活、定时开机、手动开机均不会拉起实例。
 `notify_only` 不停机，不参与闸门。
 
-### 采集失败的处理
+#### 采集失败的处理
 
 * CDT 查询失败 → 沿用上次快照流量值，不写 0
 * 余额查询失败 → 沿用上次快照
@@ -256,7 +406,7 @@ bun run dev:web                  # :5173
 * 未勾选任何地域 → 只采集 CDT 流量与余额，不查询实例（不会回退到默认地域）
 * 逐实例保活开关 → 按 `instance_id` 从旧快照继承
 
-### 异步 Job
+#### 异步 Job
 
 写接口返回 `202 Accepted + { job_id }`，前端轮询 `GET /api/v1/jobs/{job_id}`：
 
@@ -270,7 +420,7 @@ bun run dev:web                  # :5173
 
 ---
 
-## API
+### API
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -303,12 +453,13 @@ bun run dev:web                  # :5173
 
 ---
 
-## 数据模型
+### 数据模型
 
 | 表 | 用途 |
 |---|---|
 | `settings` | KV 配置（时区、日报、TG/Bark 密文、Turnstile 密文） |
-| `accounts` | 阿里云账号（AK、加密 Secret、地域、实例 ID、告警阈值、策略、定时、保活） || `account_snapshots` | 每账号一行最新状态，首页只读此表 |
+| `accounts` | 阿里云账号（AK、加密 Secret、地域、实例 ID、告警阈值、策略、定时、保活） |
+| `account_snapshots` | 每账号一行最新状态，首页只读此表 |
 | `traffic_hourly` / `traffic_daily` | 流量采样（账期累计值），索引 `(account_id, recorded_at)` |
 | `jobs` | 异步任务状态 |
 | `action_logs` | 自动化动作 / 告警 / 登录审计 |
@@ -323,7 +474,7 @@ bun run dev:web                  # :5173
 
 ---
 
-## 阿里云接口
+### 阿里云接口
 
 | 用途 | Action | Version |
 |---|---|---|
@@ -336,7 +487,7 @@ bun run dev:web                  # :5173
 `ECS_Out_Bytes` / `Eip_Out_Bytes` 的底层口径一致），控制台与账单才换算成 GB。
 `traffic_unit_is_bytes` 测试钉死这一点。
 
-### 免费额度与阈值
+#### 免费额度与阈值
 
 CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、不合并计算：
 
@@ -355,78 +506,18 @@ CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、
 * `0` → 不限制也不告警
 * `> 0` → 累计流量达到该值即告警，并按策略停机（`stop_and_notify`）
 
-### RAM 最小权限
+#### RAM 权限的两点补充
 
-阿里云 RAM 用户只授予 CDT 查询、ECS 查询/启停和可选 BSS 查询所需的最小权限。
+完整创建步骤见文首 **一、准备阿里云子账号**，这里只补充容易踩的地方。
 
-只读查询 + 实例启停所需的最小策略：
+`bssapi:QueryAccountBalance` 可以不给 —— 不授权时余额一栏显示 `—`（通知里显示
+「未知」），其余功能不受影响，适合不想让程序读财务数据的场景。
 
-```json
-{
-  "Version": "1",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "cdt:ListCdtInternetTraffic",
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "bssapi:QueryAccountBalance",
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "ecs:DescribeInstances",
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ecs:StartInstance",
-        "ecs:StopInstance"
-      ],
-      "Resource": "acs:ecs:<region>:<主账号 UID>:instance/<实例 ID>"
-    }
-  ]
-}
-```
+> 阿里云文档《QueryAccountBalance》的「授权信息」表写的是 `bss:DescribeAcccount`，
+> 实测 `bssapi:QueryAccountBalance` 同样能查，两种写法都可用。
 
-#### ARN 里三段占位怎么填
-
-`acs:ecs:<region>:<主账号 UID>:instance/<实例 ID>` 三段都要替换成实际值：
-
-| 占位 | 含义 | 说明 | 示例 |
-|---|---|---|---|
-| `<region>` | 地域 ID | 目标实例所在地域。可用 `*` 表示对所有地域生效 | `cn-hongkong` |
-| `<主账号 UID>` | 阿里云账号 ID | 资源所属的主账号。登录控制台后把鼠标移到右上角头像即可看到。可用 `*` 表示不限制账号 | `1234567890123456` |
-| `<实例 ID>` | ECS 实例 ID | 要授权的具体实例，`instance` 后**必须带斜杠 `/`** | `i-bp1234567890abcdef` |
-
-本项目一个账号固定对应一个地域和一台实例，三段都写实际值即可，不必用通配符。
-通配符会把权限放大到该账号下达所有地域/实例，与「一账号一实例」的模型不符：
-
-```json
-"Resource": "acs:ecs:cn-hongkong:1234567890123456:instance/i-bp1234567890abcdef"
-```
-
-需要授权多台实例时，`Resource` 写成数组：
-
-```json
-"Resource": [
-  "acs:ecs:cn-hongkong:1234567890123456:instance/i-bp1111111111abcdef",
-  "acs:ecs:cn-hangzhou:1234567890123456:instance/i-bp2222222222abcdef"
-]
-```
-
-`bssapi:QueryAccountBalance` 是可选的 —— 不授权时余额一栏显示 `—`
-（通知里显示「未知」），其余功能不受影响，适合不想让程序读财务数据的场景。
-
-> 注：阿里云文档《QueryAccountBalance》的「授权信息」表里写的是
-> `bss:DescribeAcccount`，实测 `bssapi:QueryAccountBalance` 同样能正常
-> 查询余额，两种写法都可用。
-
-`ecs:DescribeInstances` 不能省：启停接口内部会先校验实例状态。
-若实例在 VPC 内且报权限错误，再补 `vpc:DescribeVpcs` 等基础网络查询权限。
+`ecs:DescribeInstances` 不能省：启停接口内部会先校验实例状态。若实例在 VPC 内
+且报权限错误，再补 `vpc:DescribeVpcs` 等基础网络查询权限。
 
 签名遵循 RPC V1（`HMAC-SHA1`），含针对官方样例的回归测试：
 
@@ -440,7 +531,7 @@ assert_eq!(sign("testsecret", &to_sign), "OLeaidS1JvxuMvnyHOwuJ+uX5qY=");
 
 ---
 
-## 开发与校验
+### 开发与校验
 
 ```bash
 cargo test                                                    # 92 个单元测试
