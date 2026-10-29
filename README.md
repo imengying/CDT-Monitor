@@ -1,8 +1,13 @@
 # CDT Monitor (Worker)
 
-阿里云 **CDT 流量监控** 与 **ECS 自动化控制**，运行在 Cloudflare Workers 上。
+![Rust](https://img.shields.io/badge/Rust-2024_Edition-black?logo=rust)
+![WebAssembly](https://img.shields.io/badge/Target-wasm32-654FF0?logo=webassembly)
+![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers_%26_D1-F38020?logo=cloudflare)
+![TypeScript](https://img.shields.io/badge/Frontend-Vanilla_TS_%2B_ECharts-3178C6?logo=typescript)
+
+阿里云 **CDT 流量监控** 与 **ECS 自动化控制**面板，运行在 Cloudflare Workers 上。
 参考 [`wang4386/CDT-Monitor`](https://github.com/wang4386/CDT-Monitor) 的业务语义，
-实现为 **Rust/Wasm + D1 + Cron Triggers + Turnstile**。
+实现为 **Rust/Wasm + D1 + Cron Triggers + Turnstile**，前端为无框架纯 TypeScript。
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -21,6 +26,15 @@
 │                       Telegram · Bark                             │
 └───────────────────────────────────────────────────────────────────┘
 ```
+
+## 核心特性
+
+- **流量采样与熔断**：每 15 分钟采集 CDT 公网流量与账户余额，按小时 / 天查看 ECharts
+  趋势，达到阈值自动告警或停机止损。
+- **实例自动化控制**：面板手动启停、每日定时开关机、抢占式实例自动保活拉起。
+- **多渠道推送**：Telegram 与 Bark，覆盖超限熔断、保活拉起与每日流量日报。
+- **纵深安全**：AK Secret 与推送凭据经 XChaCha20-Poly1305 加密落盘，配合 Turnstile、
+  常量时间比对、设备会话管理与跨站请求拦截。
 
 ---
 
@@ -72,8 +86,12 @@
 }
 ```
 
+> [!NOTE]
 > **`bssapi:QueryAccountBalance` 可能提示「无效授权」**：忽略即可，实测余额可以正常
 > 查到。删掉这一行也不影响其他功能，只是余额一栏显示 `—`。
+>
+> **`ecs:DescribeInstances` 不能省**：启停接口内部会先校验实例状态。若实例在 VPC 内
+> 且报权限错误，再补 `vpc:DescribeVpcs` 等基础网络查询权限。
 
 ### 3. 替换成你的实例信息
 
@@ -131,8 +149,9 @@
 |---|---|
 | `BUN_VERSION` | `1.4.4` |
 
-这一项**必须配**。Cloudflare 构建镜像预装的是 Bun 1.2.5，不指定版本就会用旧版编译，
-可能直接失败。`build-ci.sh` 检测到版本不符会自行装指定版本；完全没设时脚本直接报错退出。
+> [!IMPORTANT]
+> 这一项**必须配**。Cloudflare 构建镜像预装的是 Bun 1.2.5，不指定版本就会用旧版编译，
+> 可能直接失败。`build-ci.sh` 检测到版本不符会自行装指定版本；完全没设时脚本直接报错退出。
 
 ### 3. 部署
 
@@ -180,6 +199,7 @@ openssl rand -hex 32
 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 是登录后台用的账号密码，自己定即可。
 修改后 Cloudflare 会自动重启 Worker，新值立即生效。
 
+> [!WARNING]
 > 改了 `MASTER_KEY` 会让已存的密文全部解不开，需要到设置页把每个实例的
 > AccessKey Secret 重填一遍。
 
@@ -209,51 +229,51 @@ debug  同 info
 
 ```
 cdt-monitor/
-├── Cargo.toml                  Rust 2024，cdylib → wasm32
-├── wrangler.toml               D1 / Assets / Cron / 变量
-├── package.json                根脚本（Bun）
+├── Cargo.toml                  # Rust 2024，cdylib → wasm32
+├── wrangler.toml               # D1 / Assets / Cron / 构建入口
+├── package.json                # 根脚本（Bun）
 ├── rust-toolchain.toml
-├── .dev.vars.example           本地开发变量模板
+├── .dev.vars.example           # 本地开发变量模板
 ├── scripts/
-│   ├── build-ci.sh             构建入口：校验配置 → 装工具链 → 构建
-│   ├── check-config.ts         wrangler.toml 结构校验
-│   └── deploy.ts               部署入口：建库 → 迁移 → 发布
+│   ├── build-ci.sh             # 构建入口：校验配置 → 装工具链 → 构建
+│   ├── check-config.ts         # wrangler.toml 结构校验
+│   └── deploy.ts               # 部署入口：建库 → 迁移 → 发布
 ├── migrations/
-│   └── init_001.sql            7 张表 + 10 个索引
+│   └── init_001.sql            # 9 张表 + 12 个索引
 ├── src/
-│   ├── lib.rs                  fetch / scheduled 入口、路由、鉴权、Job 执行器
-│   ├── models.rs               D1 实体行 + 前后端 DTO + 时区/单位换算
-│   ├── db.rs                   D1 SQL 封装（含幂等锁）
-│   ├── crypto.rs               XChaCha20-Poly1305、无状态 Token
-│   ├── logging.rs              分级日志（默认只输出 error）
-│   ├── aliyun.rs               RPC V1 签名器 + CDT/ECS/BSS 客户端
-│   ├── notify.rs               Telegram + Bark
-│   └── scheduler.rs            采样 / 熔断 / 定时开关机 / 保活 / 日报
+│   ├── lib.rs                  # fetch / scheduled 入口、路由、鉴权、Job 执行器
+│   ├── models.rs               # D1 实体行 + 前后端 DTO + 时区/单位换算
+│   ├── db.rs                   # D1 SQL 封装（含幂等锁）
+│   ├── crypto.rs               # XChaCha20-Poly1305、无状态 Token
+│   ├── logging.rs              # 分级日志（默认只输出 error）
+│   ├── aliyun.rs               # RPC V1 签名器 + CDT/ECS/BSS 客户端
+│   ├── notify.rs               # Telegram + Bark
+│   └── scheduler.rs            # 采样 / 熔断 / 定时开关机 / 保活 / 日报
 └── web/
     ├── package.json
     ├── tsconfig.json
     ├── vite.config.ts
-    ├── index.html              以 render=explicit 引入 Turnstile
+    ├── index.html              # 以 render=explicit 引入 Turnstile
     ├── public/favicon.svg
     └── src/
-        ├── main.ts             入口
-        ├── App.ts              主控制台
-        ├── style.css           主题令牌与组件语义类
-        ├── env.d.ts            Turnstile 类型声明
-        ├── api/client.ts       API 客户端 + 202 Job 轮询
+        ├── main.ts             # 入口
+        ├── App.ts              # 主控制台
+        ├── style.css           # 主题令牌与组件语义类
+        ├── env.d.ts            # Turnstile 类型声明
+        ├── api/client.ts       # API 客户端 + 202 Job 轮询
         ├── lib/
-        │   ├── dom.ts          el() / iconSvg() 等 DOM 工具
-        │   ├── icons.ts        按需引入的 lucide 图标
-        │   ├── echarts.ts      按需注册的 ECharts 模块（动态 import）
-        │   ├── store.ts        状态容器 + toast
-        │   └── actions.ts      API 调用与状态写入
+        │   ├── dom.ts          # el() / iconSvg() 等 DOM 工具
+        │   ├── icons.ts        # 按需引入的 lucide 图标
+        │   ├── echarts.ts      # 按需注册的 ECharts 模块（动态 import）
+        │   ├── store.ts        # 状态容器 + toast
+        │   └── actions.ts      # API 调用与状态写入
         └── components/
-            ├── LoginModal.ts   登录卡片 + Turnstile
-            ├── AccountCard.ts  账号卡片 + 实例控制
-            ├── HistoryModal.ts ECharts 历史流量弹窗
-            ├── SettingsModal.ts 设置弹窗（6 个标签页）
-            ├── LogDrawer.ts    日志抽屉
-            └── ToastStack.ts   提示条容器
+            ├── LoginModal.ts   # 登录卡片 + Turnstile
+            ├── AccountCard.ts  # 账号卡片 + 实例控制
+            ├── HistoryModal.ts # ECharts 历史流量弹窗
+            ├── SettingsModal.ts # 设置弹窗（6 个标签页）
+            ├── LogDrawer.ts    # 操作与审计日志抽屉
+            └── ToastStack.ts   # 提示条容器
 ```
 
 前端为纯 TypeScript 类组件，直接操作 DOM，不依赖任何框架。
@@ -262,14 +282,27 @@ cdt-monitor/
 
 ### 本地开发
 
+#### 1. 安装工具链与依赖
+
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install worker-build --version 0.8.7 --locked
 bun install
 bun run install:web
+```
 
+#### 2. 初始化本地环境
+
+```bash
 cp .dev.vars.example .dev.vars
 bun run db:migrate:local
+```
+
+本地 D1 位于 `.wrangler/state/`，与线上隔离。
+
+#### 3. 启动
+
+```bash
 bun run dev                      # 构建前端 + wrangler dev（:8787）
 ```
 
@@ -278,8 +311,6 @@ bun run dev                      # 构建前端 + wrangler dev（:8787）
 ```bash
 bun run dev:web                  # :5173
 ```
-
-本地 D1 位于 `.wrangler/state/`，与线上隔离。
 
 ---
 
@@ -356,8 +387,9 @@ bun run dev:web                  # :5173
 3. 未触发流量熔断
 4. 今天还没执行过定时关机
 
-剩余情形（允许时段内手动停机）仍会被拉起，这是接口能力的边界：
-手动停机前请先关闭保活开关。
+> [!WARNING]
+> 在允许运行时段内手动停止已开启保活的实例，必须先在面板关闭该实例的保活开关，
+> 否则下一次 Cron 巡检会将它重新拉起。
 
 #### 优先级
 
@@ -393,27 +425,26 @@ bun run dev:web                  # :5173
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/v1/auth/session` | 会话探测（公开，返回 Turnstile site key，未启用时为空串） |
-| POST | `/api/v1/auth/login` | 登录（用户名 + 密码，可选 Turnstile） |
-| POST | `/api/v1/auth/logout` | 退出 |
-| GET | `/api/v1/overview` | 首页数据（读快照表） |
-| GET | `/api/v1/history?account_id&bucket=hour\|day&limit` | 流量历史 |
-| GET | `/api/v1/logs?account_id&action&q&limit` | 操作日志（类型前缀 + 关键字） |
-| DELETE | `/api/v1/logs?account_id&action&q` | 按同一套条件清空日志 |
-| GET | `/api/v1/jobs[/{id}]` | 任务状态 |
-| POST | `/api/v1/refresh` | 刷新全部 → 202 |
-| POST | `/api/v1/accounts` | 新增账号 |
-| PUT/DELETE | `/api/v1/accounts/{id}` | 修改 / 删除账号 |
-| POST | `/api/v1/accounts/{id}/refresh` | 刷新单账号 → 202 |
-| POST | `/api/v1/accounts/{id}/instances/{iid}/start\|stop` | 开机 / 关机 → 202 |
-| POST | `/api/v1/accounts/{id}/instances/start-all\|stop-all` | 批量开关机 → 202 |
-| PUT | `/api/v1/accounts/{id}/instances/{iid}/keep-alive` | 逐实例保活开关 |
-| GET | `/api/v1/settings` | 全部设置（脱敏） |
-| PUT | `/api/v1/settings/turnstile\|telegram\|bark\|daily-report\|timezone\|advanced` | 更新设置 |
-| GET | `/api/v1/sessions` | 登录设备 |
-| DELETE | `/api/v1/sessions[/{sid}]` | 踢下线（指定 / 其它全部） |
-| POST | `/api/v1/settings/notify-test` | 测试通知 → 202 |
-| POST | `/api/v1/reports/daily` | 立即推送日报 → 202 |
+| `GET` | `/api/v1/auth/session` | 会话探测（公开，返回 Turnstile site key，未启用时为空串） |
+| `POST` | `/api/v1/auth/login` | 登录（用户名 + 密码，可选 Turnstile） |
+| `POST` | `/api/v1/auth/logout` | 退出 |
+| `GET` | `/api/v1/overview[?refresh=transitional]` | 首页数据（读快照表；`transitional` 时补采一次） |
+| `GET` | `/api/v1/history?account_id` | 流量历史（小时 25 条 + 日 31 条一次返回） |
+| `GET` | `/api/v1/logs?account_id&action&q&limit` | 操作日志（类型前缀 + 关键字） |
+| `DELETE` | `/api/v1/logs?account_id&action&q` | 按同一套条件清空日志 |
+| `GET` | `/api/v1/jobs[/{id}]` | 任务状态 |
+| `POST` | `/api/v1/refresh` | 刷新全部 → 202 |
+| `POST` | `/api/v1/accounts` | 新增账号 |
+| `PUT/DELETE` | `/api/v1/accounts/{id}` | 修改 / 删除账号 |
+| `POST` | `/api/v1/accounts/{id}/refresh` | 刷新单账号 → 202 |
+| `POST` | `/api/v1/accounts/{id}/instances/{iid}/start` / `stop` | 开机 / 关机 → 202 |
+| `PUT` | `/api/v1/accounts/{id}/instances/{iid}/keep-alive` | 逐实例保活开关 |
+| `GET` | `/api/v1/settings` | 全部设置（脱敏） |
+| `PUT` | `/api/v1/settings/{module}` | 更新设置，`module` 为 `turnstile` / `telegram` / `bark` / `daily-report` / `timezone` / `advanced` |
+| `GET` | `/api/v1/sessions` | 登录设备 |
+| `DELETE` | `/api/v1/sessions[/{sid}]` | 踢下线（指定 / 其它全部） |
+| `POST` | `/api/v1/settings/notify-test` | 测试通知 → 202 |
+| `POST` | `/api/v1/reports/daily` | 立即推送日报 → 202 |
 
 错误体格式 `{ "error": "...", "code": "..." }`，`code` 取值：
 
@@ -485,9 +516,6 @@ CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、
 
 > 阿里云文档《QueryAccountBalance》的「授权信息」表写的是 `bss:DescribeAcccount`，
 > 实测 `bssapi:QueryAccountBalance` 同样能查，两种写法都可用。
-
-`ecs:DescribeInstances` 不能省：启停接口内部会先校验实例状态。若实例在 VPC 内
-且报权限错误，再补 `vpc:DescribeVpcs` 等基础网络查询权限。
 
 签名遵循 RPC V1（`HMAC-SHA1`），含针对官方样例的回归测试：
 
