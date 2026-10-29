@@ -575,8 +575,7 @@ pub enum HistoryBucket {
     Day,
 }
 
-impl HistoryBucket {
-}
+impl HistoryBucket {}
 
 // ===========================================================================
 // D1 实体行
@@ -1602,7 +1601,10 @@ mod tests {
         };
 
         for transitional in ["Starting", "Stopping", "Pending", "starting", "STOPPING"] {
-            assert!(make(transitional).is_transitional(), "{transitional} 应算过渡态");
+            assert!(
+                make(transitional).is_transitional(),
+                "{transitional} 应算过渡态"
+            );
         }
         for terminal in ["Running", "Stopped", "running", "stopped", ""] {
             assert!(!make(terminal).is_transitional(), "{terminal} 不该算过渡态");
@@ -1788,7 +1790,13 @@ mod tests {
 
     #[test]
     fn mainland_regions_belong_to_domestic_pool() {
-        for region in ["cn-hangzhou", "cn-beijing", "cn-shanghai", "cn-shenzhen", "cn-chengdu"] {
+        for region in [
+            "cn-hangzhou",
+            "cn-beijing",
+            "cn-shanghai",
+            "cn-shenzhen",
+            "cn-chengdu",
+        ] {
             assert_eq!(
                 QuotaPool::of_region(region),
                 QuotaPool::Domestic,
@@ -1800,7 +1808,12 @@ mod tests {
 
     #[test]
     fn overseas_regions_use_200gb_quota() {
-        for region in ["ap-southeast-1", "ap-northeast-1", "us-west-1", "eu-central-1"] {
+        for region in [
+            "ap-southeast-1",
+            "ap-northeast-1",
+            "us-west-1",
+            "eu-central-1",
+        ] {
             assert_eq!(
                 QuotaPool::of_region(region),
                 QuotaPool::Overseas,

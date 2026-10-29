@@ -37,8 +37,7 @@ use crate::db::Db;
 use crate::models::{
     AccountOverview, AccountRow, BarkConfig, DailyReportConfig, HistoryBucket, InstanceInfo,
     NotifyChannel, OverLimitAction, QuotaPool, SnapshotRow, SnapshotUpdate, TelegramConfig,
-    build_overview, bytes_to_gb, human_amount, local_date,
-    local_day_start_ms,
+    build_overview, bytes_to_gb, human_amount, local_date, local_day_start_ms,
     local_minutes_of_day, now_ms, parse_hhmm, setting_key, threshold_reached, within_window,
 };
 use crate::notify::{
@@ -76,7 +75,6 @@ pub const KEEP_ALIVE_STOP_GRACE_MINUTES: i64 = 20;
 // ===========================================================================
 // 辅助函数
 // ===========================================================================
-
 
 // ===========================================================================
 // 结果结构
@@ -389,12 +387,9 @@ impl Scheduler {
     async fn refresh_account_inner(&self, account: &AccountRow) -> worker::Result<RefreshOutcome> {
         let secret = self.account_secret(account)?;
         let client = AliyunClient::from_account(account, secret);
-        let sync = crate::aliyun::sync_account(
-            &client,
-            &account.region_id,
-            account.instance_id_opt(),
-        )
-        .await;
+        let sync =
+            crate::aliyun::sync_account(&client, &account.region_id, account.instance_id_opt())
+                .await;
 
         let previous = self.db.get_snapshot(account.id).await?;
         let billing_month = crate::models::billing_month(self.now, &self.timezone);
@@ -502,9 +497,7 @@ impl Scheduler {
 
         let mut threshold_fired = false;
         if threshold_reached(used_gb, account.traffic_threshold_gb) && !already_triggered {
-            threshold_fired = self
-                .handle_threshold(account, used_gb, pool)
-                .await?;
+            threshold_fired = self.handle_threshold(account, used_gb, pool).await?;
         }
 
         for warning in &sync.warnings {
@@ -1562,8 +1555,14 @@ impl Scheduler {
         account_id: i64,
     ) -> worker::Result<crate::models::TrafficHistory> {
         Ok(crate::models::TrafficHistory {
-            hourly: self.db.traffic_history(account_id, HistoryBucket::Hour).await?,
-            daily: self.db.traffic_history(account_id, HistoryBucket::Day).await?,
+            hourly: self
+                .db
+                .traffic_history(account_id, HistoryBucket::Hour)
+                .await?,
+            daily: self
+                .db
+                .traffic_history(account_id, HistoryBucket::Day)
+                .await?,
         })
     }
 }
@@ -1667,7 +1666,10 @@ mod tests {
         let account = account_with_schedule(None, Some("22:00"));
         assert!(in_allowed_window(&account, 0));
         assert!(in_allowed_window(&account, 21 * 60 + 59));
-        assert!(!in_allowed_window(&account, 22 * 60), "已到关机点，不应保活");
+        assert!(
+            !in_allowed_window(&account, 22 * 60),
+            "已到关机点，不应保活"
+        );
         assert!(!in_allowed_window(&account, 23 * 60 + 59));
     }
 
@@ -1717,7 +1719,13 @@ mod tests {
         let grace_ms = KEEP_ALIVE_STOP_GRACE_MINUTES * 60 * 1000;
         let now = 1_000_000_000_000i64;
 
-        let elapsed = |stop_at: i64| if stop_at > now { None } else { Some(now - stop_at) };
+        let elapsed = |stop_at: i64| {
+            if stop_at > now {
+                None
+            } else {
+                Some(now - stop_at)
+            }
+        };
         let in_grace = |stop_at: i64| matches!(elapsed(stop_at), Some(gap) if gap < grace_ms);
 
         // 同一轮：刚关机，必须让路

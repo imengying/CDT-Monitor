@@ -927,7 +927,6 @@ impl Db {
             .await?;
         Ok(hourly + daily)
     }
-
 }
 
 /// 任务状态的中文描述，日志里用。

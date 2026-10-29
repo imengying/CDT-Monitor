@@ -545,12 +545,13 @@ impl AliyunClient {
         let data = value.get("Data").cloned().unwrap_or(Value::Null);
         // 金额统一以字符串返回（避免浮点精度问题），这里两种形态都接受。
         let amount_of = |key: &str| -> Option<f64> {
-            data.get(key).and_then(|v| {
-                v.as_str()
-                    .map(|s| s.trim().to_string())
-                    .or_else(|| v.as_f64().map(|f| f.to_string()))
-            })
-            .and_then(|s| s.parse::<f64>().ok())
+            data.get(key)
+                .and_then(|v| {
+                    v.as_str()
+                        .map(|s| s.trim().to_string())
+                        .or_else(|| v.as_f64().map(|f| f.to_string()))
+                })
+                .and_then(|s| s.parse::<f64>().ok())
         };
 
         let amount = amount_of("AvailableAmount");

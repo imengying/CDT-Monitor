@@ -177,7 +177,6 @@ impl MasterKey {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.bytes
     }
-
 }
 
 fn to_array(bytes: Vec<u8>) -> [u8; 32] {
@@ -284,7 +283,6 @@ impl Crypto {
     pub fn try_decrypt(&self, payload: &str) -> Option<String> {
         self.decrypt(payload).ok()
     }
-
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

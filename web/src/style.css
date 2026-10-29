@@ -1145,7 +1145,10 @@ h3 {
 }
 
 .account-card__side {
-  min-width: 168px;
+  /* 用 clamp 而不是固定 168px：卡片在 1200px 左右视口会被挤到 ~360px，
+     固定宽度会把标题压成「香港主…」。这里随可用宽度收缩，
+     下限 132px 仍放得下「本月额度 200 GB」。 */
+  min-width: clamp(132px, 38%, 168px);
   display: flex;
   flex-direction: column;
   align-items: flex-end;
