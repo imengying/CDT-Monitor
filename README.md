@@ -26,8 +26,7 @@
 
 ## 一、准备阿里云子账号
 
-CDT-Monitor 需要一对 AccessKey 才能读流量、查实例、按阈值停机。不要用主账号的
-AccessKey——主账号密钥拥有全部权限，泄露后整个云账号都会失守。
+需要一对 AccessKey 才能读流量、查实例、按阈值停机。不要用主账号的 AccessKey。
 
 ### 1. 创建 RAM 子账号
 
@@ -37,7 +36,7 @@ AccessKey——主账号密钥拥有全部权限，泄露后整个云账号都�
 
 ### 2. 创建自定义权限策略
 
-官方预置的系统策略权限过宽，这里用「脚本编辑」写一份最小权限策略。
+官方预置的系统策略权限过宽，这里写一份最小权限策略。
 
 1. 前往权限策略控制台（[🇨🇳 国内站](https://ram.console.aliyun.com/policies) | [🌍 国际站](https://ram.console.alibabacloud.com/policies)），点 **创建权限策略**。
 2. 切到 **脚本编辑** 标签页，清空默认内容，粘贴：
@@ -74,7 +73,7 @@ AccessKey——主账号密钥拥有全部权限，泄露后整个云账号都�
 ```
 
 > **`bssapi:QueryAccountBalance` 可能提示「无效授权」**：忽略即可，实测余额可以正常
-> 查到。若连这一行都不想保留，删掉它也不影响其他功能，只是余额一栏显示 `—`。
+> 查到。删掉这一行也不影响其他功能，只是余额一栏显示 `—`。
 
 ### 3. 替换成你的实例信息
 
@@ -87,7 +86,7 @@ AccessKey——主账号密钥拥有全部权限，泄露后整个云账号都�
 | `<主账号 UID>` | 阿里云账号 ID | 鼠标移到控制台右上角头像即可看到 | `1234567890123456` |
 | `<实例 ID>` | ECS 实例 ID | `instance` 后面**必须保留斜杠 `/`** | `i-bp1234567890abcdef` |
 
-本项目是「一个账号对应一个地域和一台实例」，直接写死最安全，不需要 `*` 通配符：
+本项目是「一个账号对应一个地域和一台实例」，直接写死：
 
 ```json
 "Resource": "acs:ecs:cn-hongkong:1234567890123456:instance/i-bp1234567890abcdef"
@@ -105,22 +104,19 @@ AccessKey——主账号密钥拥有全部权限，泄露后整个云账号都�
 ### 4. 绑定到子账号
 
 1. 回到 **RAM 用户列表**，找到刚才创建的账号，点右侧 **新增授权**。
-2. **授权范围** 保持默认的「账号级别（整个云账号）」。
+2. **授权范围** 保持默认的「账号级别」。
 3. 在 **权限策略** 里切到「自定义策略」，搜索并勾选刚建的策略，确认授权。
 
-完成后，用第 1 步保存的 AK/SK 填进 CDT-Monitor 即可。
+完成后，保存好 AK/SK 和实例 ID，配置 CDT-Monitor 时会用到。
 
 ---
 
 ## 二、部署到 Cloudflare
 
-Cloudflare 控制台支持简体中文（右上角头像 → **Language / 语言** → 简体中文），
-下面用中文界面写路径，英文界面对应位置在括号里。
-
 ### 1. 连接仓库
 
-**Workers 和 Pages**（Workers & Pages）→ **创建**（Create）→ **Workers** →
-**从 Git 导入**（Connect to Git），选中本仓库，然后填两项：
+**Workers 和 Pages** → **创建应用**（Create）→ **Workers** →
+**从 GitHub 导入**（Connect with GitHub），选中本仓库，填两项：
 
 | 项 | 值 |
 |---|---|
@@ -129,23 +125,29 @@ Cloudflare 控制台支持简体中文（右上角头像 → **Language / 语言
 
 ### 2. 设置 `BUN_VERSION`
 
-在同一个页面往下找 **构建变量**（Build variables）或「变量和机密」，添加一项：
+展开 **高级设置**（Advanced settings），添加一个构建变量：
 
-| 变量名 | 值 | 类型 |
-|---|---|---|
-| `BUN_VERSION` | `1.4.4` | 构建变量（非机密） |
+| 变量名 | 变量值 |
+|---|---|
+| `BUN_VERSION` | `1.4.4` |
 
 这一项**必须配**。Cloudflare 构建镜像预装的是 Bun 1.2.5，不指定版本就会用旧版编译，
 可能直接失败。`build-ci.sh` 检测到版本不符会自行装指定版本；完全没设时脚本直接报错退出。
 
-> 它和后面的 `MASTER_KEY` 不是一回事：`BUN_VERSION` 只在**构建阶段**可见，
-> 用来装对 Bun 版本；`MASTER_KEY` 是**运行时**机密，构建时完全不需要它，
-> 但 Worker 跑起来必须靠它解密。两处别填错位置。
+### 3. 部署
 
-### 3. 配置三个运行时 Secret
+点 **部署**（Deploy）。`deploy.ts` 会依次完成：建 D1 库、执行 `migrations/`
+下未应用的 SQL、上传 Worker。
 
-**设置**（Settings）→ **变量和机密**（Variables and Secrets），添加三项，
-类型都选 **机密**（Secret，加密存储、存后不可回读）：
+`wrangler.toml` 里不写 `database_id`，由 `database_name` 在部署时解析，所以首次
+部署不需要手动建库。
+
+### 4. 配置运行时变量和密钥
+
+**第一次部署完成之后**再进行这一步。
+
+**设置**（Settings）→ **运行时变量和密钥**（Variables and Secrets），添加三项，
+类型都选 **密钥**（Secret）：
 
 | 名称 | 值 |
 |---|---|
@@ -153,10 +155,12 @@ Cloudflare 控制台支持简体中文（右上角头像 → **Language / 语言
 | `ADMIN_USERNAME` | 你自己定的管理员用户名 |
 | `ADMIN_PASSWORD` | 你自己定的管理员密码 |
 
+添加完点 **部署** 使配置生效。
+
 #### `MASTER_KEY` 怎么填
 
-**它不是让你手写的一串固定值**，而是随机生成的一段密钥，用来加密数据库里存的
-AccessKey Secret。在任意一台装有 OpenSSL 的电脑上执行：
+**它不是让你手写的一串固定值**，而是随机生成的一段密钥。在任意一台装有 OpenSSL
+的电脑上执行：
 
 ```bash
 openssl rand -hex 32
@@ -174,44 +178,10 @@ openssl rand -hex 32
 随手编一串短字符串虽然能启动，但强度不够，不建议。
 
 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 是登录后台用的账号密码，自己定即可。
-这两项不写进数据库，也没有后台改密码入口；修改 Secret 后 Cloudflare 会自动
-重启 Worker，新值立即生效，不需要重新部署。
+修改后 Cloudflare 会自动重启 Worker，新值立即生效。
 
-### 4. 部署
-
-点 **部署**（Deploy）。`deploy.ts` 会依次完成：建 D1 库、执行 `migrations/`
-下未应用的 SQL、上传 Worker。
-
-`wrangler.toml` 里不写 `database_id`，由 `database_name` 在部署时解析，所以首次
-部署不需要手动建库。
-
-> 改了 `MASTER_KEY` 会让已存的密文全部解不开，需要到设置页把每个账号的
+> 改了 `MASTER_KEY` 会让已存的密文全部解不开，需要到设置页把每个实例的
 > AccessKey Secret 重填一遍。
-
-### 5. 添加第一个实例
-
-登录后到 **设置 → 实例**，填：
-
-| 字段 | 说明 |
-|---|---|
-| 账号名称 | 自己起，例如「香港主节点」 |
-| 站点类型 | 国内站选「中国站（CNY）」，国际站选对应项 |
-| AccessKey ID / Secret | 第一步保存的那一对 |
-| 地域 / 实例 ID | 与上面 RAM 策略里写的必须一致 |
-| 告警阈值 | 单位 GB，`0` 表示不限制也不告警 |
-| 超限动作 | `stop_and_notify` 停机并通知 / `notify_only` 只通知 |
-| 停机模式 | `StopCharging` 节省停机 / `KeepCharging` 保留停机 |
-| 定时开关机 | 留空表示不启用 |
-| 抢占式保活 | 被回收后自动拉起 |
-
-保存后会立即采集一次，卡片直接出数据。其余配置同样在 **设置** 里：
-
-| 配置 | 位置 |
-|---|---|
-| Turnstile 人机校验 | 设置 → 人机校验 |
-| Telegram / Bark 通知 | 设置 → Telegram / Bark |
-| 日报时间 | 设置 → 日报 |
-| 时区、日志级别、任务锁窗口、会话有效期 | 设置 → 系统 |
 
 ---
 
@@ -317,8 +287,8 @@ bun run dev:web                  # :5173
 
 | 类别 | 存放位置 | 内容 |
 |---|---|---|
-| Secret | Cloudflare 控制台 | `MASTER_KEY`、`ADMIN_USERNAME`、`ADMIN_PASSWORD` |
-| 构建变量 | Settings → Build | `BUN_VERSION` |
+| 运行时密钥 | 设置 → 运行时变量和密钥 | `MASTER_KEY`、`ADMIN_USERNAME`、`ADMIN_PASSWORD` |
+| 构建变量 | 设置 → 构建 → 高级设置 | `BUN_VERSION` |
 | 业务配置 | D1，设置页面 | 阿里云账号、Turnstile、Telegram、Bark、日报、时区、日志级别等 |
 
 `wrangler.toml` 不含 `[vars]` 段。业务配置改动即时生效，无需重新部署。
