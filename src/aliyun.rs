@@ -430,52 +430,39 @@ impl AliyunClient {
     // ECS
     // -----------------------------------------------------------------------
 
-    /// 列出指定地域的全部实例（自动翻页，最多 20 页 = 2000 台）。
-    pub async fn describe_instances(
+    /// 按实例 ID 精确查询一台实例。
+    ///
+    /// 一个账号固定对应一台实例，用 `InstanceIds` 精确查询而不是列出整个
+    /// 地域：返回字段更全，也不会为了过滤一台机器去翻页拉几千条。
+    ///
+    /// 实例不存在时返回 `Ok(None)`（例如刚被释放），由调用方决定如何提示。
+    pub async fn describe_instance(
         &self,
         region_id: &str,
-    ) -> Result<Vec<InstanceInfo>, AliyunError> {
-        const PAGE_SIZE: i64 = 100;
-        const MAX_PAGES: i64 = 20;
-
-        let mut collected: Vec<InstanceInfo> = Vec::new();
-        let mut page = 1i64;
-
-        while page <= MAX_PAGES {
-            let value = self
-                .call(
-                    &self.endpoints.ecs,
-                    "2014-05-26",
-                    "DescribeInstances",
-                    vec![
-                        ("RegionId", region_id.to_string()),
-                        ("PageNumber", page.to_string()),
-                        ("PageSize", PAGE_SIZE.to_string()),
-                    ],
-                )
-                .await?;
-
-            let instances = extract_array(&value, &["Instances", "Instance"]);
-            let count = instances.len();
-            for item in instances {
-                collected.push(parse_instance(&item, region_id));
-            }
-
-            let total = value
-                .get("TotalCount")
-                .and_then(|v| {
-                    v.as_i64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                })
-                .unwrap_or(collected.len() as i64);
-
-            if count == 0 || collected.len() as i64 >= total || count < PAGE_SIZE as usize {
-                break;
-            }
-            page += 1;
+        instance_id: &str,
+    ) -> Result<Option<InstanceInfo>, AliyunError> {
+        let instance_id = instance_id.trim();
+        if instance_id.is_empty() {
+            return Ok(None);
         }
 
-        Ok(collected)
+        // 阿里云要求 `InstanceIds` 是 JSON 数组字符串，形如 `["i-xxx"]`
+        let ids = serde_json::to_string(&[instance_id])
+            .map_err(|e| AliyunError::Local(format!("实例 ID 序列化失败：{e}")))?;
+
+        let value = self
+            .call(
+                &self.endpoints.ecs,
+                "2014-05-26",
+                "DescribeInstances",
+                vec![("RegionId", region_id.to_string()), ("InstanceIds", ids)],
+            )
+            .await?;
+
+        let instances = extract_array(&value, &["Instances", "Instance"]);
+        Ok(instances
+            .first()
+            .map(|item| parse_instance(item, region_id)))
     }
 
     /// 启动实例。
@@ -739,6 +726,56 @@ fn extract_array(value: &Value, path: &[&str]) -> Vec<Value> {
     cursor.as_array().cloned().unwrap_or_default()
 }
 
+/// 从上到下取出第一个非空地址。
+///
+/// 阿里云同一个字段在不同返回里形态不同（字符串 / 数组 / 带 `IpAddress`
+/// 包装的对象），逐层递归比假定某一层是数组更稳。
+fn first_address(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Array(items) => items.iter().find_map(|item| first_address(Some(item))),
+        Value::Object(map) => ["IpAddress", "Ipv6Address", "Address"]
+            .iter()
+            .find_map(|key| first_address(map.get(*key))),
+        _ => None,
+    }
+}
+
+/// 从网卡的 `Ipv6Sets` 里取第一个 IPv6。
+///
+/// 实例分配了 IPv6 但没绑公网带宽时，地址只出现在网卡详情里，
+/// 顶层的 `Ipv6Address` 是空的。
+fn first_network_ipv6(item: &Value) -> Option<String> {
+    let interfaces = item
+        .get("NetworkInterfaces")
+        .and_then(|v| v.get("NetworkInterface"))
+        .or_else(|| item.get("NetworkInterface"));
+
+    let list: Vec<&Value> = match interfaces {
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(single @ Value::Object(_)) => vec![single],
+        _ => return None,
+    };
+
+    list.into_iter().find_map(|nic| {
+        let sets = nic
+            .get("Ipv6Sets")
+            .and_then(|v| v.get("Ipv6Set"))
+            .or_else(|| nic.get("Ipv6Sets"));
+        let entries: Vec<&Value> = match sets {
+            Some(Value::Array(items)) => items.iter().collect(),
+            Some(single @ Value::Object(_)) => vec![single],
+            _ => return None,
+        };
+        entries
+            .into_iter()
+            .find_map(|entry| first_address(entry.get("Ipv6Address")))
+    })
+}
+
 /// 解析单个 ECS 实例对象。
 fn parse_instance(item: &Value, fallback_region: &str) -> InstanceInfo {
     let string_of = |key: &str| -> Option<String> {
@@ -748,60 +785,26 @@ fn parse_instance(item: &Value, fallback_region: &str) -> InstanceInfo {
             .filter(|s| !s.is_empty())
     };
 
-    let public_ip = extract_array(item, &["PublicIpAddress", "IpAddress"])
-        .first()
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            item.get("EipAddress")
-                .and_then(|e| e.get("IpAddress"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .filter(|s| !s.is_empty())
-        });
+    // 取地址：阿里云同一个字段在不同返回里可能是
+    //   "1.2.3.4"                    （单值字符串）
+    //   ["1.2.3.4"]                   （数组）
+    //   { "IpAddress": ["1.2.3.4"] }  （带包装的对象）
+    // 所以用递归取值，而不是假定某一层是数组。
+    let public_ip = first_address(item.get("EipAddress"))
+        .or_else(|| first_address(item.get("PublicIpAddress")));
 
-    let private_ip = extract_array(item, &["InnerIpAddress", "IpAddress"])
-        .first()
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            extract_array(item, &["VpcAttributes", "PrivateIpAddress", "IpAddress"])
-                .first()
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        });
+    let private_ip = first_address(item.get("InnerIpAddress")).or_else(|| {
+        item.get("VpcAttributes")
+            .and_then(|vpc| first_address(vpc.get("PrivateIpAddress")))
+    });
 
-    // 公网 IPv6。阿里云在不同模式下把地址放在不同位置，按优先级回退：
-    //   1. `Ipv6Address`（开了 `Ipv6AddressCount` 时的数组）
-    //   2. `Ipv6Addresses`（兼容旧字段）
-    //   3. 网卡的 `Ipv6Sets`（分配了 IPv6 但没有公网带宽实例时）
-    let public_ipv6 = extract_array(item, &["Ipv6Address", "IpAddress"])
-        .first()
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            extract_array(item, &["Ipv6Addresses", "IpAddress"])
-                .first()
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            // 网卡结构：NetworkInterfaces.NetworkInterface[].Ipv6Sets.Ipv6Set[].Ipv6Address
-            extract_array(item, &["NetworkInterfaces", "NetworkInterface"])
-                .iter()
-                .find_map(|nic| {
-                    extract_array(nic, &["Ipv6Sets", "Ipv6Set"])
-                        .iter()
-                        .find_map(|set| {
-                            set.get("Ipv6Address")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                        })
-                })
-        });
+    // 公网 IPv6。三种存法都要试：
+    //   1. `Ipv6Address`   开了 Ipv6AddressCount 时
+    //   2. `Ipv6Addresses` 兼容旧字段
+    //   3. 网卡 `Ipv6Sets`  分配了 IPv6 但没有公网带宽实例时
+    let public_ipv6 = first_address(item.get("Ipv6Address"))
+        .or_else(|| first_address(item.get("Ipv6Addresses")))
+        .or_else(|| first_network_ipv6(item));
 
     let spot_strategy = string_of("SpotStrategy");
     let spot = spot_strategy
@@ -941,7 +944,8 @@ pub struct AccountSync {
     /// CDT 流量；`None` 表示查询失败（调用方应沿用上次快照，而不是写成 0）。
     pub traffic: Option<CdtTraffic>,
     pub balance: Option<AccountBalance>,
-    /// 该账号地域下的实例（通常就一台）。
+    /// 该账号管理的实例（一个账号固定一台，所以长度始终是 0 或 1）。
+    /// 用 `Vec` 是为了和快照结构 `instances_json` 对齐。
     pub instances: Vec<InstanceInfo>,
     /// 实例查询是否失败：失败时调用方沿用旧快照里的实例。
     pub instances_failed: bool,
@@ -989,14 +993,19 @@ pub async fn sync_account(
         Err(err) => out.warnings.push(format!("余额查询失败：{}", err.short())),
     }
 
+    // 一个账号固定一台实例：按 ID 精确查询，命中则只保留这一台。
     if !region_id.trim().is_empty() {
-        match client.describe_instances(region_id).await {
-            Ok(mut instances) => {
-                if let Some(instance_id) = instance_filter {
-                    instances.retain(|item| item.instance_id == instance_id);
-                }
-                out.instances = instances;
-            }
+        let Some(instance_id) = instance_filter.map(str::trim).filter(|id| !id.is_empty()) else {
+            out.warnings
+                .push("未配置实例 ID，跳过实例状态查询".to_string());
+            return out;
+        };
+        match client.describe_instance(region_id, instance_id).await {
+            // 查不到通常意味着实例已被释放，保留上次快照并提示，不要把卡片清空
+            Ok(None) => out.warnings.push(format!(
+                "{region_id} 未找到实例 {instance_id}（可能已释放）"
+            )),
+            Ok(Some(instance)) => out.instances = vec![instance],
             Err(err) => {
                 out.instances_failed = true;
                 out.warnings
@@ -1291,9 +1300,76 @@ mod tests {
             Some("2408:8207::3")
         );
 
+        // 3.5) 线上真实形态：外层键与内层键都是 Ipv6Address
+        //      （上游 client_test.go 里抓到的返回）
+        let nested = serde_json::json!({
+            "InstanceId": "i-v6real",
+            "Status": "Running",
+            "Ipv6Address": { "Ipv6Address": ["2001:db8::3"] }
+        });
+        assert_eq!(
+            parse_instance(&nested, "cn-hongkong")
+                .public_ipv6
+                .as_deref(),
+            Some("2001:db8::3")
+        );
+
+        // 4) 最常见的形态：Ipv6Address 直接是数组
+        let plain_array = serde_json::json!({
+            "InstanceId": "i-v6e",
+            "Status": "Running",
+            "Ipv6Address": ["2408:8207::4"]
+        });
+        assert_eq!(
+            parse_instance(&plain_array, "cn-hongkong")
+                .public_ipv6
+                .as_deref(),
+            Some("2408:8207::4")
+        );
+
+        // 5) 直接是字符串
+        let plain_string = serde_json::json!({
+            "InstanceId": "i-v6f",
+            "Status": "Running",
+            "Ipv6Address": "2408:8207::5"
+        });
+        assert_eq!(
+            parse_instance(&plain_string, "cn-hongkong")
+                .public_ipv6
+                .as_deref(),
+            Some("2408:8207::5")
+        );
+
+        // 6) 网卡数组直接带 Ipv6Address（没有 Ipv6Sets 包装）
+        let nic_direct = serde_json::json!({
+            "InstanceId": "i-v6g",
+            "Status": "Running",
+            "NetworkInterfaces": {
+                "NetworkInterface": [
+                    { "Ipv6Sets": { "Ipv6Set": [{ "Ipv6Address": "2408:8207::6" }] } }
+                ]
+            }
+        });
+        assert_eq!(
+            parse_instance(&nic_direct, "cn-hongkong")
+                .public_ipv6
+                .as_deref(),
+            Some("2408:8207::6")
+        );
+
         // 没分配时为 None，不能给空串
         let none = serde_json::json!({ "InstanceId": "i-v6d", "Status": "Stopped" });
         assert!(parse_instance(&none, "cn-hongkong").public_ipv6.is_none());
+    }
+
+    /// 精确查询的 `InstanceIds` 参数必须是 JSON 数组字符串。
+    #[test]
+    fn instance_ids_param_is_json_array() {
+        let ids = serde_json::to_string(&["i-bp1abc"]).unwrap();
+        assert_eq!(ids, r#"["i-bp1abc"]"#);
+        // 空 ID 不应该发出请求
+        let empty: &str = "   ";
+        assert!(empty.trim().is_empty());
     }
 
     #[test]
