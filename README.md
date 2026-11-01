@@ -275,6 +275,8 @@ info   Cron 汇总、任务完成、保活拉起实例
 debug  同 info
 ```
 
+两级开关要同时开才看得到日志：级别控制「发不发」，Workers Logs 控制「收不收」。日志在 Cloudflare 控制台 **Workers → 本应用 → Logs** 里查看。
+
 ---
 
 ### 安全模型

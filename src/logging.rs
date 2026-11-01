@@ -9,11 +9,15 @@
 //! | 级别 | 默认 | 内容 |
 //! |---|---|---|
 //! | error | ✅ 开 | 真正需要人介入的失败（解密失败、D1 不可用、任务失败） |
-//! | warn  | ❌ 关 | 可自愈的异常（单地域查询失败、通知发送失败） |
+//! | warn  | ❌ 关 | 可自愈的异常（通知发送失败、动作后刷新失败） |
 //! | info  | ❌ 关 | 正常流程轨迹（任务完成、Cron 汇总、保活拉起实例） |
 //!
-//! 排障时把 Worker 变量 `LOG_LEVEL` 设为 `debug` / `info` / `warn` 即可
-//! 打开对应级别（`wrangler.toml` 的 `[vars]` 里默认写的是 `error`）。
+//! 级别存在 D1 的 `advanced` 配置里，在面板「设置 → 系统 → 日志级别」调，
+//! 改完下一轮请求即生效，不用重新部署。
+//!
+//! 日志走 `worker::console_*`，落在 Cloudflare 的 **Workers Logs**。
+//! 那个开关默认关闭（见 `wrangler.toml` 的 `[observability]`），
+//! 排障时两边都要开：Workers Logs 负责「收」，这里的级别负责「发」。
 //!
 //! 注意：这里的 `error` 级别**刻意保留**。把错误也一起关掉会让线上故障
 //! 完全不可见，那不是「安静」而是「失明」。
@@ -34,7 +38,7 @@ pub enum Level {
 }
 
 impl Level {
-    /// 从 `LOG_LEVEL` 文本解析；无法识别时回落到 `Error`。
+    /// 从配置里的 `log_level` 文本解析；无法识别时回落到 `Error`。
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "debug" | "trace" => Level::Debug,
@@ -64,7 +68,7 @@ thread_local! {
     static CURRENT: Cell<Level> = const { Cell::new(Level::Error) };
 }
 
-/// 设置全局级别（Worker 启动时读 `LOG_LEVEL` 调用一次）。
+/// 设置全局级别（每次请求进入时按 D1 里的配置重置）。
 pub fn set_level(level: Level) {
     CURRENT.with(|cell| cell.set(level));
 }

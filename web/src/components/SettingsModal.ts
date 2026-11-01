@@ -970,6 +970,7 @@ export class SettingsModal {
 
     this.saving = true
     this.paintFooter()
+    let changed = false
     try {
       if (form.id === null) {
         const created = await api.createAccount(payload)
@@ -994,11 +995,13 @@ export class SettingsModal {
       this.form = blankAccountForm()
       await afterSettingsChanged()
       this.syncDrafts()
-      this.renderContent()
+      changed = true
     } catch (error) {
       toast(error instanceof ApiError ? error.message : '保存失败', 'danger')
     } finally {
+      // 同 runSave：先复位 saving 再重绘，否则底栏会停在「保存中…」
       this.saving = false
+      if (changed) this.renderContent()
       this.paintFooter()
     }
   }
@@ -1006,17 +1009,22 @@ export class SettingsModal {
   private async deleteAccount(id: number): Promise<void> {
     if (this.saving) return
     this.saving = true
+    this.paintFooter()
+    let changed = false
     try {
       await api.deleteAccount(id)
       this.confirmDeleteId = null
       toast('实例已删除', 'ok')
       await afterSettingsChanged()
       this.syncDrafts()
-      this.renderContent()
+      changed = true
     } catch (error) {
       toast(error instanceof ApiError ? error.message : '删除失败', 'danger')
     } finally {
+      // 同 runSave：先复位 saving 再重绘，否则底栏会停在「保存中…」
       this.saving = false
+      if (changed) this.renderContent()
+      this.paintFooter()
     }
   }
 
@@ -1613,24 +1621,19 @@ export class SettingsModal {
   }
 
   private async saveSystem(): Promise<void> {
-    if (this.saving) return
-    this.saving = true
-    try {
-      await api.updateTimezone(this.timezoneDraft.trim())
-      await api.updateAdvanced({
-        log_level: this.advancedDraft.logLevel,
-        job_lock_ttl_ms: Math.round(this.advancedDraft.jobLockMinutes * 60_000),
-        session_ttl_ms: Math.round(this.advancedDraft.sessionDays * 24 * 60 * 60 * 1000),
-      })
-      toast('系统设置已保存', 'ok')
-      await afterSettingsChanged()
-      this.syncDrafts()
-      this.renderContent()
-    } catch (error) {
-      toast(error instanceof ApiError ? error.message : '保存失败', 'danger')
-    } finally {
-      this.saving = false
-    }
+    // 时区与进阶配置是两个接口，顺序发送；任一失败就不写第二个
+    await this.runSave(
+      async () => {
+        await api.updateTimezone(this.timezoneDraft.trim())
+        await api.updateAdvanced({
+          log_level: this.advancedDraft.logLevel,
+          job_lock_ttl_ms: Math.round(this.advancedDraft.jobLockMinutes * 60_000),
+          session_ttl_ms: Math.round(this.advancedDraft.sessionDays * 24 * 60 * 60 * 1000),
+        })
+      },
+      '系统设置已保存',
+      '保存系统设置失败',
+    )
   }
 
   /**
@@ -1754,16 +1757,21 @@ export class SettingsModal {
     if (this.saving) return
     this.saving = true
     this.paintSaving(true)
+    let changed = false
     try {
       await action()
       toast(successMessage, 'ok')
       await afterSettingsChanged()
       this.syncDrafts()
-      this.renderContent()
+      changed = true
     } catch (error) {
       toast(error instanceof ApiError ? error.message : failureMessage, 'danger')
     } finally {
       this.saving = false
+      // 必须先把 saving 置回 false 再重绘：renderContent 末尾会调
+      // paintFooter()，而它按 this.saving 决定按钮是不是「保存中…」。
+      // 顺序反了就会永远卡在转圈上。
+      if (changed) this.renderContent()
       this.paintSaving(false)
     }
   }
