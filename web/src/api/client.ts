@@ -92,6 +92,8 @@ export interface InstanceInfo {
   zone_id: string
   status: string
   public_ip: string | null
+  /** 公网 IPv6（未分配则为 null） */
+  public_ipv6: string | null
   private_ip: string | null
   instance_charge_type: string | null
   spot_strategy: string | null

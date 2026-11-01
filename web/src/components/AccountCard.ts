@@ -41,6 +41,40 @@ function statusLabel(status: string): string {
 }
 
 /**
+ * 兜底复制：`navigator.clipboard` 只在安全上下文可用，
+ * 内网 http 部署时退回临时 textarea + execCommand。
+ */
+function fallbackCopy(text: string): boolean {
+  try {
+    const area = document.createElement('textarea')
+    area.value = text
+    area.setAttribute('readonly', '')
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.append(area)
+    area.select()
+    const ok = document.execCommand('copy')
+    area.remove()
+    return ok
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 缩短 IPv6 显示。
+ *
+ * 完整地址 39 字符会撑破卡片标题区，只留第一组与末位：
+ * `2408:8207…9f3c`。悬停时通过 `data-tip` 展示完整值。
+ */
+function shortenIpv6(value: string): string {
+  if (value.length <= 18) return value
+  const head = value.slice(0, 9)
+  const tail = value.slice(-4)
+  return `${head}…${tail}`
+}
+
+/**
  * 计算账号数据的渲染指纹。
  *
  * 排除 `snapshot_updated_at`（采集时间戳，不代表可见内容变化）。
@@ -197,28 +231,36 @@ export class AccountCard {
   }
 
   /**
-   * 公网 IP 行。
+   * 公网地址行（IPv4 / IPv6）。
    *
+   * 点地址本身即复制，不另放按钮——多一个图标反而挤。
    * 实例停机后阿里云收回公网地址，此时显示「未分配」；
    * 快照还没采过（`snapshot_updated_at` 为空）时是「等待同步」。
    */
   private buildAddress(): HTMLElement {
-    const ip = this.account.instances[0]?.public_ip ?? ''
-    if (!ip) {
+    const instance = this.account.instances[0]
+    const addresses = [
+      instance?.public_ip ? { version: 'v4', value: instance.public_ip } : null,
+      instance?.public_ipv6 ? { version: 'v6', value: instance.public_ipv6 } : null,
+    ].filter((item): item is { version: string; value: string } => item !== null)
+
+    if (addresses.length === 0) {
       const text = this.account.snapshot_updated_at ? '未分配公网地址' : '等待同步'
       return el('span', { class: 'account-address account-address--empty', text })
     }
+
     return el(
       'span',
       { class: 'account-address' },
-      el('code', { text: ip }),
-      iconButton({
-        label: '复制公网 IP',
-        icon: icons.copy,
-        size: 13,
-        className: 'account-address__copy',
-        onClick: () => void this.copyAddress(ip),
-      }),
+      ...addresses.map((address) =>
+        el('code', {
+          class: 'account-address__value',
+          text: address.version === 'v6' ? shortenIpv6(address.value) : address.value,
+          // 完整的 IPv6 很长，悬停时才展开
+          'data-tip': address.value,
+          on: { click: () => void this.copyAddress(address.value) },
+        }),
+      ),
     )
   }
 
@@ -228,7 +270,12 @@ export class AccountCard {
       await navigator.clipboard.writeText(ip)
       toast('已复制公网 IP', 'ok')
     } catch {
-      toast('复制失败，请手动选中', 'warn')
+      // 非安全上下文（http）或权限被拒时 clipboard 不可用，退回旧接口
+      if (fallbackCopy(ip)) {
+        toast('已复制公网 IP', 'ok')
+      } else {
+        toast('复制失败，请手动选中', 'warn')
+      }
     }
   }
 

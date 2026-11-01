@@ -771,6 +771,38 @@ fn parse_instance(item: &Value, fallback_region: &str) -> InstanceInfo {
                 .map(|s| s.to_string())
         });
 
+    // 公网 IPv6。阿里云在不同模式下把地址放在不同位置，按优先级回退：
+    //   1. `Ipv6Address`（开了 `Ipv6AddressCount` 时的数组）
+    //   2. `Ipv6Addresses`（兼容旧字段）
+    //   3. 网卡的 `Ipv6Sets`（分配了 IPv6 但没有公网带宽实例时）
+    let public_ipv6 = extract_array(item, &["Ipv6Address", "IpAddress"])
+        .first()
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            extract_array(item, &["Ipv6Addresses", "IpAddress"])
+                .first()
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            // 网卡结构：NetworkInterfaces.NetworkInterface[].Ipv6Sets.Ipv6Set[].Ipv6Address
+            extract_array(item, &["NetworkInterfaces", "NetworkInterface"])
+                .iter()
+                .find_map(|nic| {
+                    extract_array(nic, &["Ipv6Sets", "Ipv6Set"])
+                        .iter()
+                        .find_map(|set| {
+                            set.get("Ipv6Address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        })
+                })
+        });
+
     let spot_strategy = string_of("SpotStrategy");
     let spot = spot_strategy
         .as_deref()
@@ -788,6 +820,7 @@ fn parse_instance(item: &Value, fallback_region: &str) -> InstanceInfo {
         zone_id: string_of("ZoneId").unwrap_or_default(),
         status: string_of("Status").unwrap_or_default(),
         public_ip,
+        public_ipv6,
         private_ip,
         instance_charge_type: string_of("InstanceChargeType"),
         spot_strategy,
@@ -1210,6 +1243,57 @@ mod tests {
         assert!(instance.spot);
         assert_eq!(instance.spot_strategy.as_deref(), Some("SpotAsPriceGo"));
         assert!(!instance.keep_alive);
+    }
+
+    /// 公网 IPv6：三种存法都要能取到。
+    #[test]
+    fn instance_parsing_ipv6_variants() {
+        // 1) Ipv6Address 数组（开了 Ipv6AddressCount）
+        let direct = serde_json::json!({
+            "InstanceId": "i-v6a",
+            "Status": "Running",
+            "Ipv6Address": { "IpAddress": ["2408:8207::1"] }
+        });
+        assert_eq!(
+            parse_instance(&direct, "cn-hongkong")
+                .public_ipv6
+                .as_deref(),
+            Some("2408:8207::1")
+        );
+
+        // 2) Ipv6Addresses 旧字段
+        let legacy = serde_json::json!({
+            "InstanceId": "i-v6b",
+            "Status": "Running",
+            "Ipv6Addresses": { "IpAddress": ["2408:8207::2"] }
+        });
+        assert_eq!(
+            parse_instance(&legacy, "cn-hongkong")
+                .public_ipv6
+                .as_deref(),
+            Some("2408:8207::2")
+        );
+
+        // 3) 网卡 Ipv6Sets（分配了 IPv6 但没有公网带宽实例）
+        let via_nic = serde_json::json!({
+            "InstanceId": "i-v6c",
+            "Status": "Running",
+            "NetworkInterfaces": {
+                "NetworkInterface": [{
+                    "Ipv6Sets": { "Ipv6Set": [{ "Ipv6Address": "2408:8207::3" }] }
+                }]
+            }
+        });
+        assert_eq!(
+            parse_instance(&via_nic, "cn-hongkong")
+                .public_ipv6
+                .as_deref(),
+            Some("2408:8207::3")
+        );
+
+        // 没分配时为 None，不能给空串
+        let none = serde_json::json!({ "InstanceId": "i-v6d", "Status": "Stopped" });
+        assert!(parse_instance(&none, "cn-hongkong").public_ipv6.is_none());
     }
 
     #[test]

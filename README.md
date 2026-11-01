@@ -30,7 +30,7 @@
 
 - **流量采样与熔断**：每 5 分钟采集 CDT 公网流量与账户余额，按小时 / 天查看 ECharts 趋势，达到阈值自动告警或停机止损。
 - **实例自动化控制**：面板手动启停、每日定时开关机（或五字段 Cron）、抢占式实例自动保活拉起。
-- **公网地址**：卡片直接显示实例的公网 IP，一键复制。
+- **公网地址**：卡片显示实例的公网 IPv4 / IPv6，点地址即复制。
 - **多渠道推送**：支持 Telegram 与 Bark，覆盖超限熔断、保活拉起与每日流量日报。
 - **纵深安全**：AK Secret 与推送凭据经 XChaCha20-Poly1305 加密落盘，配合 Turnstile、常量时间比对、设备会话管理与跨站请求拦截。
 
@@ -232,6 +232,7 @@ cdt-monitor/
         │   ├── dom.ts           # el() / iconSvg() 等 DOM 工具
         │   ├── icons.ts         # 按需引入的 lucide 图标
         │   ├── theme.ts         # 浅色 / 深色 / 跟随系统
+        │   ├── logs.ts          # 日志标签与行渲染（设置页共用）
         │   ├── echarts.ts       # 按需注册的 ECharts 模块（动态 import）
         │   ├── store.ts         # 状态容器 + toast
         │   └── actions.ts       # API 调用与状态写入
@@ -239,9 +240,8 @@ cdt-monitor/
             ├── LoginModal.ts    # 登录卡片 + Turnstile
             ├── AccountCard.ts   # 账号卡片 + 实例控制 + 公网 IP
             ├── HistoryModal.ts  # ECharts 历史流量弹窗
-            ├── SettingsModal.ts # 设置弹窗（6 个标签页）
-            ├── CronEditor.ts    # 五字段 Cron 编辑器 + 预览
-            ├── LogDrawer.ts     # 操作与审计日志抽屉
+            ├── SettingsModal.ts # 设置弹窗（7 个标签页）
+            ├── CronEditor.ts    # 五字段 Cron 输入 + 预览
             └── ToastStack.ts    # 提示条容器
 ```
 

@@ -24,6 +24,7 @@ import {
   formatTime,
   relativeTime,
   type AccountDto,
+  type ActionLog,
   type AccountInput,
   type BarkUpdate,
   type NotifyChannel,
@@ -52,13 +53,14 @@ import {
   textInput,
   toggleRow,
 } from '@/lib/dom'
-import { cronEditor } from '@/components/CronEditor'
+import { cronInput } from '@/components/CronEditor'
 import { icons, type IconNode } from '@/lib/icons'
+import { LOG_FILTERS, logRow, type LogFilterKey } from '@/lib/logs'
 import { currentMode, setThemeMode, type ThemeMode } from '@/lib/theme'
 import { afterSettingsChanged, pushDailyReport, testNotification } from '@/lib/actions'
 import { toast } from '@/lib/store'
 
-type Tab = 'accounts' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'system'
+type Tab = 'accounts' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'logs' | 'system'
 
 /**
  * 可选地域。
@@ -200,6 +202,7 @@ const TABS: { key: Tab; label: string; icon: IconNode }[] = [
   { key: 'telegram', label: 'Telegram', icon: icons.send },
   { key: 'bark', label: 'Bark', icon: icons.phone },
   { key: 'report', label: '日报', icon: icons.bell },
+  { key: 'logs', label: '日志', icon: icons.activity },
   { key: 'system', label: '系统', icon: icons.settings },
 ]
 
@@ -518,7 +521,8 @@ export class SettingsModal {
    * 其余标签页用「保存更改」；日报页自带「立即推送」，不显示浮动栏。
    */
   private paintFooter(): void {
-    if (this.activeTab === 'report') {
+    // 日报与日志页只有即时操作，没有需要提交的表单
+    if (this.activeTab === 'report' || this.activeTab === 'logs') {
       this.footer.hidden = true
       return
     }
@@ -560,6 +564,9 @@ export class SettingsModal {
       case 'report':
         this.renderReport()
         break
+      case 'logs':
+        this.renderLogs()
+        break
       case 'system':
         this.renderSystem()
         break
@@ -586,6 +593,7 @@ export class SettingsModal {
         void this.saveSystem()
         break
       case 'accounts':
+      case 'logs':
         break
     }
   }
@@ -724,22 +732,22 @@ export class SettingsModal {
       this.form.scheduleStop = value
     }, { placeholder: '23:00' })
 
-    // 进阶模式下的两个 Cron 编辑器
+    // 进阶模式下的两个 Cron 输入框
     const scheduleTimezone = this.settings?.timezone ?? 'UTC+8'
-    const startCronEditor = cronEditor({
+    const startCronEditor = cronInput({
       label: '定时开机',
       value: form.scheduleStartCron,
       timezone: scheduleTimezone,
-      defaultTime: { hour: 8, minute: 0 },
+      placeholder: '0 8 * * 1',
       onChange: (value) => {
         this.form.scheduleStartCron = value
       },
     })
-    const stopCronEditor = cronEditor({
+    const stopCronEditor = cronInput({
       label: '定时关机',
       value: form.scheduleStopCron,
       timezone: scheduleTimezone,
-      defaultTime: { hour: 23, minute: 0 },
+      placeholder: '0 23 * * *',
       onChange: (value) => {
         this.form.scheduleStopCron = value
       },
@@ -1312,6 +1320,186 @@ export class SettingsModal {
   }
 
   // -------------------------------------------------------------------------
+  // 日志
+  // -------------------------------------------------------------------------
+
+  /** 操作日志：筛选 + 搜索 + 清空，内容与独立的日志抽屉同源。 */
+  private renderLogs(): void {
+    const listHost = el('div', { class: 'log-list' })
+    const errorBox = el('div', { class: 'inline-error' })
+    errorBox.hidden = true
+
+    const searchInput = el('input', {
+      type: 'search',
+      class: 'search-input',
+      placeholder: '按账号、实例或内容筛选…',
+    }) as HTMLInputElement
+
+    let logs: ActionLog[] = []
+    let filter: LogFilterKey = ''
+    let keyword = ''
+    let loading = false
+    let confirming = false
+
+    const confirmHost = el('div', { class: 'log-confirm-host' })
+
+    const paintList = (): void => {
+      const needle = keyword.trim().toLowerCase()
+      const filtered = needle
+        ? logs.filter((log) =>
+            `${log.action_type} ${log.account_name ?? ''} ${log.instance_id ?? ''} ${log.detail}`
+              .toLowerCase()
+              .includes(needle),
+          )
+        : logs
+
+      if (filtered.length === 0) {
+        replaceChildren(
+          listHost,
+          subtleEmpty(logs.length === 0 ? '暂无日志' : '没有匹配的日志', icons.activity),
+        )
+        return
+      }
+      replaceChildren(listHost, ...filtered.map((log) => logRow(log)))
+    }
+
+    const paintConfirm = (): void => {
+      if (!confirming) {
+        replaceChildren(confirmHost)
+        return
+      }
+      const scope = filter ? '当前筛选范围内的日志' : '全部日志'
+      replaceChildren(
+        confirmHost,
+        el(
+          'div',
+          { class: 'confirm-strip' },
+          el('span', { text: `${scope}将被永久删除，无法恢复。` }),
+          el(
+            'div',
+            { class: 'control-group' },
+            el('button', {
+              class: 'button button--secondary button--small',
+              type: 'button',
+              text: '取消',
+              on: {
+                click: () => {
+                  confirming = false
+                  paintConfirm()
+                },
+              },
+            }),
+            el('button', {
+              class: 'button button--primary button--small',
+              type: 'button',
+              text: '确认清空',
+              on: {
+                click: () => {
+                  void clearLogs()
+                },
+              },
+            }),
+          ),
+        ),
+      )
+    }
+
+    const load = async (): Promise<void> => {
+      if (loading) return
+      loading = true
+      errorBox.hidden = true
+      if (logs.length === 0) replaceChildren(listHost, subtleEmpty('正在加载…', icons.spinner))
+      try {
+        logs = await api.logs(200, { action: filter || undefined })
+        paintList()
+      } catch (error) {
+        errorBox.hidden = false
+        errorBox.textContent = error instanceof ApiError ? error.message : '加载日志失败'
+      } finally {
+        loading = false
+      }
+    }
+
+    const clearLogs = async (): Promise<void> => {
+      if (loading) return
+      loading = true
+      confirming = false
+      paintConfirm()
+      errorBox.hidden = true
+      try {
+        const { removed } = await api.clearLogs({ action: filter || undefined })
+        toast(removed > 0 ? `已清空 ${removed} 条日志` : '没有可清空的日志', 'ok')
+        logs = []
+        paintList()
+        loading = false
+        await load()
+      } catch (error) {
+        errorBox.hidden = false
+        errorBox.textContent = error instanceof ApiError ? error.message : '清空日志失败'
+        loading = false
+      }
+    }
+
+    const filterHost = el('div', {})
+    const paintFilter = (): void => {
+      replaceChildren(
+        filterHost,
+        segmented<LogFilterKey>({
+          value: filter,
+          items: LOG_FILTERS,
+          onChange: (value) => {
+            filter = value
+            paintFilter()
+            void load()
+          },
+        }),
+      )
+    }
+
+    searchInput.addEventListener('input', () => {
+      keyword = searchInput.value
+      paintList()
+    })
+
+    paintFilter()
+    paintConfirm()
+
+    replaceChildren(
+      this.content,
+      el(
+        'div',
+        { class: 'settings-section' },
+        sectionTitle({ icon: icons.activity, title: '操作日志', subtitle: 'ACTION LOG' }),
+        el(
+          'div',
+          { class: 'log-toolbar' },
+          filterHost,
+          searchInput,
+          iconButton({
+            label: '清空日志',
+            icon: icons.trash,
+            tone: 'danger',
+            onClick: () => {
+              confirming = true
+              paintConfirm()
+            },
+          }),
+          iconButton({
+            label: '刷新日志',
+            icon: icons.refresh,
+            onClick: () => void load(),
+          }),
+        ),
+        confirmHost,
+        errorBox,
+        listHost,
+      ),
+    )
+
+    void load()
+  }
+
+  // -------------------------------------------------------------------------
   // 系统
   // -------------------------------------------------------------------------
 
@@ -1399,12 +1587,22 @@ export class SettingsModal {
             'div',
             { class: 'section-title-row' },
             sectionTitle({ icon: icons.phone, title: '登录设备', subtitle: 'ACTIVE SESSIONS' }),
-            el('button', {
-              class: 'button button--secondary button--small',
-              type: 'button',
-              text: '刷新',
-              on: { click: () => void this.loadDevices(true) },
-            }),
+            el(
+              'div',
+              { class: 'control-group' },
+              el('button', {
+                class: 'button button--secondary button--small',
+                type: 'button',
+                text: '退出其它设备',
+                on: { click: () => void this.kickOthers() },
+              }),
+              el('button', {
+                class: 'button button--secondary button--small',
+                type: 'button',
+                text: '刷新',
+                on: { click: () => void this.loadDevices(true) },
+              }),
+            ),
           ),
           this.buildDeviceList(),
         ),
@@ -1457,21 +1655,6 @@ export class SettingsModal {
     }
 
     const nodes: HTMLElement[] = []
-    const others = this.devices.filter((device) => !device.current)
-    if (others.length > 0) {
-      nodes.push(
-        el(
-          'div',
-          { class: 'device-actions' },
-          el('button', {
-            class: 'button button--secondary button--small',
-            type: 'button',
-            text: '退出其它设备',
-            on: { click: () => void this.kickOthers() },
-          }),
-        ),
-      )
-    }
     for (const device of this.devices) {
       nodes.push(this.buildDeviceRow(device))
     }

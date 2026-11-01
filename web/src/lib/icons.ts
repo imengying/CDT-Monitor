@@ -23,6 +23,7 @@ import {
   Loader2,
   LogOut,
   Menu,
+  Moon,
   Pencil,
   Play,
   Plus,
@@ -33,6 +34,7 @@ import {
   Settings,
   ShieldCheck,
   Smartphone,
+  Sun,
   Trash2,
   X,
   Zap,
@@ -69,6 +71,8 @@ export const icons = {
   close: X as IconNode,
   copy: Copy as IconNode,
   copied: ClipboardCheck as IconNode,
+  sun: Sun as IconNode,
+  moon: Moon as IconNode,
   zap: Zap as IconNode,
 } as const
 

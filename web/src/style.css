@@ -1254,26 +1254,34 @@ h3 {
   margin-top: 3px;
   display: flex;
   align-items: center;
-  gap: 4px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   color: var(--muted);
   font-size: 11px;
+  min-width: 0;
 }
 
-.account-address code {
+/* 地址本身即复制入口：等宽字体 + 手型光标，悬停时轻微提亮 */
+.account-address__value {
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 11px;
   letter-spacing: 0.01em;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--duration-fast) var(--ease-out);
+}
+
+.account-address__value:hover {
+  color: var(--ink);
+}
+
+.account-address__value:active {
+  opacity: 0.6;
 }
 
 .account-address--empty {
   color: var(--muted-soft);
-}
-
-/* 复制按钮：常显，不靠悬停（触屏设备没有 hover） */
-.account-address__copy {
-  width: 20px;
-  height: 20px;
-  padding: 0;
 }
 
 .account-card__side {
@@ -1415,8 +1423,6 @@ h3 {
 
 .account-card__footer {
   margin-top: 16px;
-  padding-top: 14px;
-  border-top: 1px solid var(--hairline);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1858,36 +1864,11 @@ h3 {
   padding: 12px 22px 0 10px;
 }
 
-/* 日志抽屉 */
-.log-drawer {
-  position: relative;
-  width: min(760px, 96vw);
-  height: min(760px, 92vh);
-  border-radius: 26px;
-  overflow: hidden;
-  display: grid;
-  grid-template-rows: auto auto 1fr;
-  background: var(--panel-soft);
-  animation: modal-in 0.46s var(--ease-emphasis) both;
-}
-
-.log-drawer > header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 25px 28px 18px;
-}
-
-.log-drawer > header h2 {
-  margin: 0;
-}
-
 .log-toolbar {
-  margin: 0 28px 4px;
   display: flex;
   align-items: center;
   gap: 14px;
+  margin-bottom: 4px;
 }
 
 /* 筛选条按内容撑开：中文按钮挤在固定宽度里会逐字换行 */
@@ -1902,9 +1883,9 @@ h3 {
   padding: 6px 12px;
 }
 
-/* 清空确认条：跟随日志内容区的左右边距，空时不占高度 */
+/* 清空确认条：空时不占高度 */
 .log-confirm-host {
-  margin: 0 28px;
+  margin-top: 8px;
 }
 
 .log-confirm-host:empty {
@@ -1912,7 +1893,7 @@ h3 {
 }
 
 .log-body {
-  padding: 18px 28px 26px;
+  padding: 12px 0;
   overflow-y: auto;
   min-height: 0;
   overscroll-behavior: contain;
@@ -2301,16 +2282,6 @@ h3 {
     padding: 8px 8px 4px 4px;
   }
 
-  .log-drawer {
-    width: 100%;
-    height: calc(100dvh - 24px);
-    border-radius: 20px;
-  }
-
-  .log-drawer > header {
-    padding: 20px 18px 14px;
-  }
-
   .log-toolbar {
     margin: 0 18px;
     flex-direction: column;
@@ -2399,14 +2370,6 @@ h3 {
   flex-wrap: wrap;
 }
 
-.cron-field__freq {
-  flex: 0 0 108px;
-}
-
-.cron-field__unit {
-  flex: 0 0 92px;
-}
-
 .cron-field__input {
   flex: 1 1 120px;
   min-width: 0;
@@ -2435,14 +2398,12 @@ h3 {
   flex: 0 0 auto;
 }
 
-.cron-field__expr {
-  align-self: flex-start;
-  padding: 3px 8px;
-  border-radius: 7px;
-  color: var(--muted);
-  background: var(--surface-track);
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  font-size: 11px;
+.cron-field__hint {
+  min-height: 18px;
+}
+
+.cron-field__hint:empty {
+  display: none;
 }
 
 .cron-field__error {
@@ -2465,4 +2426,16 @@ h3 {
   border-radius: 6px;
   background: var(--surface-sunken);
   font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 设置里的日志页签                                                           */
+/* ------------------------------------------------------------------------- */
+
+/* 日志列表在设置页里跟随内容区滚动，不再有独立的高度约束 */
+.settings-section > .log-list {
+  max-height: 460px;
+  overflow-y: auto;
+  padding: 4px 0;
+  overscroll-behavior: contain;
 }

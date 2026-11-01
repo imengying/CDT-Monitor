@@ -772,6 +772,9 @@ pub struct InstanceInfo {
     pub status: String,
     #[serde(default)]
     pub public_ip: Option<String>,
+    /// 公网 IPv6（未分配则为 `None`）。
+    #[serde(default)]
+    pub public_ipv6: Option<String>,
     #[serde(default)]
     pub private_ip: Option<String>,
     /// `PrePaid` / `PostPaid`

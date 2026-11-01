@@ -19,10 +19,10 @@ import { clearToasts, store } from '@/lib/store'
 import { brandLockup, el, iconButton, iconSvg, replaceChildren } from '@/lib/dom'
 import { icons, type IconNode } from '@/lib/icons'
 import { bootstrap, loadOverview, logout, refreshAll, reportError } from '@/lib/actions'
+import { currentTheme, toggleTheme } from '@/lib/theme'
 import { AccountList } from '@/components/AccountCard'
 import { HistoryModal } from '@/components/HistoryModal'
 import { LoginModal } from '@/components/LoginModal'
-import { LogDrawer } from '@/components/LogDrawer'
 import { SettingsModal } from '@/components/SettingsModal'
 import { renderToasts } from '@/components/ToastStack'
 
@@ -53,6 +53,29 @@ function hasTransitionalInstance(state: Readonly<AppState>): boolean {
   )
 }
 
+/**
+ * 顶栏主题切换按钮。
+ *
+ * 图标按当前生效主题画：浅色时显示月亮（点了变深），深色时显示太阳。
+ * 「跟随系统」仍只能在设置页里选，这里只做浅/深来回切。
+ */
+function themeButton(): HTMLButtonElement {
+  const button = iconButton({
+    label: '切换主题',
+    icon: currentTheme() === 'dark' ? icons.sun : icons.moon,
+    onClick: () => {
+      const next = toggleTheme()
+      const icon = button.querySelector('svg')
+      if (icon) icon.replaceWith(iconSvg(next === 'dark' ? icons.sun : icons.moon, 18))
+      button.dataset.tip = next === 'dark' ? '切换到浅色' : '切换到深色'
+      button.setAttribute('aria-label', button.dataset.tip)
+    },
+  })
+  button.dataset.tip = currentTheme() === 'dark' ? '切换到浅色' : '切换到深色'
+  button.setAttribute('aria-label', button.dataset.tip)
+  return button
+}
+
 /** 控制台外壳。 */
 export class App {
   private readonly root: HTMLElement
@@ -61,7 +84,6 @@ export class App {
   private loginModal: LoginModal | null = null
   private historyModal: HistoryModal | null = null
   private settingsModal: SettingsModal | null = null
-  private logDrawer: LogDrawer | null = null
 
   private readonly accountList = new AccountList(
     (accountId) => this.settingsModal?.open(store.get().settings, false, accountId),
@@ -203,7 +225,6 @@ export class App {
 
   private renderShell(state: Readonly<AppState>): void {
     this.settingsModal = new SettingsModal()
-    this.logDrawer = new LogDrawer()
     this.historyModal = new HistoryModal()
 
     this.errorBanner = el('div', { class: 'error-banner', role: 'alert' })
@@ -244,7 +265,6 @@ export class App {
       this.root,
       this.shell,
       this.settingsModal.element,
-      this.logDrawer.element,
       this.historyModal.element,
     )
     this.updateShell(state)
@@ -262,15 +282,11 @@ export class App {
       'div',
       { class: 'topbar-actions', id: 'dashboard-actions' },
       this.refreshButton,
+      themeButton(),
       iconButton({
         label: '设置',
         icon: icons.settings,
         onClick: () => this.openSettings(),
-      }),
-      iconButton({
-        label: '操作日志',
-        icon: icons.activity,
-        onClick: () => this.openLogs(),
       }),
       iconButton({
         label: '退出登录',
@@ -314,11 +330,6 @@ export class App {
   private openSettings(startWithAdd = false): void {
     this.closeMenu()
     this.settingsModal?.open(store.get().settings, startWithAdd)
-  }
-
-  private openLogs(): void {
-    this.closeMenu()
-    this.logDrawer?.open()
   }
 
   private updateShell(state: Readonly<AppState>): void {
@@ -452,7 +463,6 @@ export class App {
     this.historyModal?.dispose()
     this.historyModal = null
     this.settingsModal = null
-    this.logDrawer = null
     this.shell = null
     this.errorBanner = null
     this.metricStrip = null

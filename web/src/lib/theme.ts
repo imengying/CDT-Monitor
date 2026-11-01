@@ -105,3 +105,17 @@ export function initTheme(): void {
     window.dispatchEvent(new CustomEvent(THEME_EVENT, { detail: { mode, theme: currentTheme() } }))
   })
 }
+
+
+/**
+ * 在「浅色 / 深色」之间快速切换。
+ *
+ * 只在这两者之间来回，不经过「跟随系统」——跟随系统需要显式选择，
+ * 放在设置页里。当前若是跟随系统，则切到与当前生效主题相反的那个。
+ */
+export function toggleTheme(): Theme {
+  const current = currentTheme()
+  const next: Theme = current === 'dark' ? 'light' : 'dark'
+  setThemeMode(next)
+  return next
+}
