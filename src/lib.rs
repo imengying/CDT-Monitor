@@ -38,6 +38,7 @@ pub mod device;
 pub mod http;
 
 pub mod aliyun;
+pub mod cron;
 pub mod crypto;
 pub mod db;
 pub mod models;
@@ -59,9 +60,9 @@ use crate::device::{client_ip, client_ua, same_origin_ok, short_device, short_ip
 use crate::http::{query_i64, query_map, query_str, query_u32, read_json};
 use crate::models::{
     AcceptedJob, AccountInput, AdvancedConfig, AdvancedSettingsDto, ApiErrorBody, BarkConfig,
-    BarkSettingsDto, BarkSettingsUpdate, DailyReportConfig, DailyReportDto, JobDto, JobStatus,
-    JobType, LoginRequest, NotifyChannel, NotifyTestRequest, SessionResponse, SessionsResponse,
-    SettingsDto, TelegramConfig, TelegramSettingsDto, TelegramSettingsUpdate,
+    BarkSettingsDto, BarkSettingsUpdate, CronPreviewRequest, DailyReportConfig, DailyReportDto,
+    JobDto, JobStatus, JobType, LoginRequest, NotifyChannel, NotifyTestRequest, SessionResponse,
+    SessionsResponse, SettingsDto, TelegramConfig, TelegramSettingsDto, TelegramSettingsUpdate,
     TrafficHistoryResponse, TurnstileConfig, TurnstileSettingsDto, TurnstileSettingsUpdate,
     build_overview, is_supported_timezone, now_ms, setting_key,
 };
@@ -684,7 +685,7 @@ async fn handle_overview(app: &AppCtx, req: &Request) -> worker::Result<Response
         .collect();
 
     // `?refresh=transitional`：仅当存在处于过渡态的实例时，才对这些账号补一次采集。
-    // 过渡态只持续几十秒，光靠 Cron（15 分钟）读不到终态，前端 1 分钟轮询也只会
+    // 过渡态只持续几十秒，光靠 Cron（5 分钟）读不到终态，前端 1 分钟轮询也只会
     // 反复读到旧快照。这里按需触发，不会让常规轮询打阿里云。
     if query_str(&params, "refresh") == Some("transitional") {
         let stale: Vec<_> = accounts
@@ -741,6 +742,29 @@ async fn handle_overview(app: &AppCtx, req: &Request) -> worker::Result<Response
 /// `GET /api/v1/history?account_id=`
 ///
 /// 一次返回小时点（最近 25 个）与天点（最近 31 个），由前端切换展示。
+/// `POST /api/v1/cron/preview`
+///
+/// 校验表达式并返回未来若干次触发时刻，供界面「预览」按钮使用。
+fn cron_preview(app: &AppCtx, payload: &CronPreviewRequest) -> Result<serde_json::Value, String> {
+    crate::cron::validate(&payload.expression)?;
+    let tz = payload
+        .timezone
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(&app.timezone);
+    if !crate::cron::validate_timezone(tz) {
+        return Err(format!("不支持的时区：{tz}"));
+    }
+    let count = payload.count.unwrap_or(5).clamp(1, 10);
+    let occurrences = crate::cron::next_occurrences(&payload.expression, tz, now_ms(), count);
+    Ok(serde_json::json!({
+        "occurrences": occurrences,
+        "timezone": tz,
+        "description": crate::cron::describe(&payload.expression),
+    }))
+}
+
 async fn handle_history(app: &AppCtx, req: &Request) -> worker::Result<Response> {
     let params = query_map(req);
 
@@ -873,6 +897,9 @@ async fn handle_create_account(app: &AppCtx, mut req: Request) -> worker::Result
             payload.stop_mode.as_str(),
             payload.normalized_schedule_start().as_deref(),
             payload.normalized_schedule_stop().as_deref(),
+            payload.normalized_schedule_mode(),
+            payload.normalized_start_cron().as_deref(),
+            payload.normalized_stop_cron().as_deref(),
             payload.spot_keep_alive,
             payload.enabled,
             now_ms(),
@@ -948,6 +975,9 @@ async fn handle_update_account(
             payload.stop_mode.as_str(),
             payload.normalized_schedule_start().as_deref(),
             payload.normalized_schedule_stop().as_deref(),
+            payload.normalized_schedule_mode(),
+            payload.normalized_start_cron().as_deref(),
+            payload.normalized_stop_cron().as_deref(),
             payload.spot_keep_alive,
             payload.enabled,
             now_ms(),
@@ -1764,6 +1794,18 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
         // ------------------------------------------------------------ 日报
         (Method::Post, ["reports", "daily"]) => spawn_job(&ctx, &app, JobTask::DailyReport).await,
 
+        // ------------------------------------------------------- Cron 预览
+        (Method::Post, ["cron", "preview"]) => {
+            let payload: CronPreviewRequest = match read_json(&mut req).await {
+                Ok(payload) => payload,
+                Err(err) => return error_response(400, err),
+            };
+            match cron_preview(&app, &payload) {
+                Ok(body) => ok(&body),
+                Err(msg) => error_response(400, msg),
+            }
+        }
+
         // ------------------------------------------------------------ 兜底
         (_, path) if !path.is_empty() => error_response(404, "接口不存在"),
         _ => error_response(404, "接口不存在"),
@@ -1811,7 +1853,7 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
     }
 }
 
-/// Cron 入口：`*/15 * * * *`。
+/// Cron 入口：`*/5 * * * *`。
 #[event(scheduled)]
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let log_level = Db::new(&env)
@@ -1833,7 +1875,7 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     log_info!("Cron 汇总：{}", report.summary());
 
     if report.accounts_failed > 0 || report.thresholds_fired > 0 {
-        // 每 6 小时最多一条汇总：持续故障不应该每 15 分钟提醒一次。
+        // 每 6 小时最多一条汇总：持续故障不应该每 5 分钟提醒一次。
         let bucket = crate::models::now_ms() / (6 * 60 * 60 * 1000);
         let _ = scheduler
             .notify_once(

@@ -260,6 +260,9 @@ impl Db {
         stop_mode: &str,
         schedule_start_time: Option<&str>,
         schedule_stop_time: Option<&str>,
+        schedule_mode: &str,
+        schedule_start_cron: Option<&str>,
+        schedule_stop_cron: Option<&str>,
         spot_keep_alive: bool,
         enabled: bool,
         now_ms: i64,
@@ -270,9 +273,11 @@ impl Db {
                 region_id, instance_id, traffic_threshold_gb,
                 over_limit_action, stop_mode,
                 schedule_start_time, schedule_stop_time, spot_keep_alive, enabled,
-                last_schedule_start_date, last_schedule_stop_date, last_schedule_stop_at,
+                schedule_mode, schedule_start_cron, schedule_stop_cron,
+                last_schedule_start_date, last_schedule_stop_date,
+                last_schedule_start_at, last_schedule_stop_at,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
             &[
                 j_text(name),
                 j_text(site_type),
@@ -287,6 +292,9 @@ impl Db {
                 j_opt_text(schedule_stop_time),
                 j_bool(spot_keep_alive),
                 j_bool(enabled),
+                j_text(schedule_mode),
+                j_opt_text(schedule_start_cron),
+                j_opt_text(schedule_stop_cron),
                 j_i64(now_ms),
                 j_i64(now_ms),
             ],
@@ -310,6 +318,9 @@ impl Db {
         stop_mode: &str,
         schedule_start_time: Option<&str>,
         schedule_stop_time: Option<&str>,
+        schedule_mode: &str,
+        schedule_start_cron: Option<&str>,
+        schedule_stop_cron: Option<&str>,
         spot_keep_alive: bool,
         enabled: bool,
         now_ms: i64,
@@ -321,6 +332,7 @@ impl Db {
                     region_id = ?, instance_id = ?, traffic_threshold_gb = ?,
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
+                    schedule_mode = ?, schedule_start_cron = ?, schedule_stop_cron = ?,
                     enabled = ?, updated_at = ?
                  WHERE id = ?"
             }
@@ -330,6 +342,7 @@ impl Db {
                     region_id = ?, instance_id = ?, traffic_threshold_gb = ?,
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
+                    schedule_mode = ?, schedule_start_cron = ?, schedule_stop_cron = ?,
                     enabled = ?, updated_at = ?
                  WHERE id = ?"
             }
@@ -348,6 +361,9 @@ impl Db {
             j_opt_text(schedule_start_time),
             j_opt_text(schedule_stop_time),
             j_bool(spot_keep_alive),
+            j_text(schedule_mode),
+            j_opt_text(schedule_start_cron),
+            j_opt_text(schedule_stop_cron),
             j_bool(enabled),
             j_i64(now_ms),
             j_i64(id),
@@ -395,22 +411,20 @@ impl Db {
         now_ms: i64,
     ) -> Result<()> {
         let sql = if is_start {
-            "UPDATE accounts SET last_schedule_start_date = ?, updated_at = ? WHERE id = ?"
+            // 同时记录精确时刻：Cron 模式按「上次执行的触发」去重，
+            // 不能只看日期，否则 `*/5` 这类高频表达式一天只能跑一次。
+            "UPDATE accounts SET last_schedule_start_date = ?, last_schedule_start_at = ?, updated_at = ? WHERE id = ?"
         } else {
             // 同时记录精确时刻：保活只需避让「刚关机的那一轮」，
             // 不能用日期判断，否则当天此后被抢占回收也不会再拉起。
             "UPDATE accounts SET last_schedule_stop_date = ?, last_schedule_stop_at = ?, updated_at = ? WHERE id = ?"
         };
-        let params = if is_start {
-            vec![j_text(date), j_i64(now_ms), j_i64(account_id)]
-        } else {
-            vec![
-                j_text(date),
-                j_i64(now_ms),
-                j_i64(now_ms),
-                j_i64(account_id),
-            ]
-        };
+        let params = vec![
+            j_text(date),
+            j_i64(now_ms),
+            j_i64(now_ms),
+            j_i64(account_id),
+        ];
         self.exec(sql, &params).await?;
         Ok(())
     }

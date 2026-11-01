@@ -36,7 +36,8 @@ function statusLabel(status: string): string {
     stopping: '停止中',
     pending: '等待中',
   }
-  return map[status] ?? (status ? '未知' : '无实例')
+  // 空状态表示「还没采集过」，不是「没有实例」——占位实例总会带 ID
+  return map[status] ?? '未知'
 }
 
 /**
@@ -66,6 +67,7 @@ function signatureOf(account: AccountOverview): string {
       id: instance.instance_id,
       status: instance.status,
       keep: instance.keep_alive,
+      ip: instance.public_ip,
     })),
   })
 }
@@ -183,6 +185,7 @@ export class AccountCard {
         { class: 'account-title' },
         el('h3', { text: account.name }),
         el('span', { text: account.region_name }),
+        this.buildAddress(),
       ),
       el(
         'div',
@@ -191,6 +194,42 @@ export class AccountCard {
         billing,
       ),
     )
+  }
+
+  /**
+   * 公网 IP 行。
+   *
+   * 实例停机后阿里云收回公网地址，此时显示「未分配」；
+   * 快照还没采过（`snapshot_updated_at` 为空）时是「等待同步」。
+   */
+  private buildAddress(): HTMLElement {
+    const ip = this.account.instances[0]?.public_ip ?? ''
+    if (!ip) {
+      const text = this.account.snapshot_updated_at ? '未分配公网地址' : '等待同步'
+      return el('span', { class: 'account-address account-address--empty', text })
+    }
+    return el(
+      'span',
+      { class: 'account-address' },
+      el('code', { text: ip }),
+      iconButton({
+        label: '复制公网 IP',
+        icon: icons.copy,
+        size: 13,
+        className: 'account-address__copy',
+        onClick: () => void this.copyAddress(ip),
+      }),
+    )
+  }
+
+  /** 复制公网 IP，成功后就地给出提示。 */
+  private async copyAddress(ip: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(ip)
+      toast('已复制公网 IP', 'ok')
+    } catch {
+      toast('复制失败，请手动选中', 'warn')
+    }
   }
 
   /** 余额分项的悬浮文案。 */
@@ -282,6 +321,10 @@ export class AccountCard {
     const stopping = status === 'stopping'
     const running = status === 'running' || stopping
     const stopped = status === 'stopped' || starting
+    // 状态未知（首采未完成 / 采集失败）：两个按钮都给出来，让用户能直接
+    // 发起动作；阿里云会拒绝不符合当前状态的操作，错误会以 toast 提示。
+    // 不这样做的话，采集失败一次卡片就彻底失去控制入口。
+    const unknown = !status
 
     const group = el('div', { class: 'control-group' })
 
@@ -303,7 +346,7 @@ export class AccountCard {
         }),
       )
 
-      if (stopped) {
+      if (stopped || unknown) {
         group.append(
           this.actionButton({
             key: 'start',
@@ -316,7 +359,7 @@ export class AccountCard {
         )
       }
 
-      if (running) {
+      if (running || unknown) {
         const keepAlive = account.spot_keep_alive
         group.append(
           this.actionButton({
@@ -324,7 +367,7 @@ export class AccountCard {
             label: stopping ? '正在停止…' : keepAlive ? '保活启用，不能关机' : '关机',
             icon: icons.power,
             tone: 'danger',
-            disabled: keepAlive || stopping,
+            disabled: !unknown && (keepAlive || stopping),
             onClick: () => void this.toggleInstance(primary, false),
           }),
         )

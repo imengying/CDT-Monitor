@@ -63,6 +63,8 @@ export class ApiError extends Error {
 export type SiteType = 'china' | 'intl'
 export type OverLimitAction = 'stop_and_notify' | 'notify_only'
 export type StopMode = 'StopCharging' | 'KeepCharging'
+/** 定时开关机模式：每日 HH:MM 或五字段 Cron 表达式 */
+export type ScheduleMode = 'simple' | 'advanced'
 export type JobStatus = 'pending' | 'running' | 'success' | 'failed' | 'unknown'
 export type JobType =
   | 'refresh_all'
@@ -118,6 +120,10 @@ export interface AccountOverview {
   stop_mode: StopMode
   schedule_start_time: string | null
   schedule_stop_time: string | null
+  /** 定时模式：每日 HH:MM 或五字段 Cron */
+  schedule_mode: ScheduleMode
+  schedule_start_cron: string | null
+  schedule_stop_cron: string | null
   spot_keep_alive: boolean
   enabled: boolean
   balance_amount: number | null
@@ -134,6 +140,15 @@ export interface OverviewResponse {
   accounts: AccountOverview[]
   timezone: string
   billing_month: string
+}
+
+/** Cron 表达式预览结果。 */
+export interface CronPreviewResponse {
+  /** 未来若干次触发时刻（Unix 毫秒） */
+  occurrences: number[]
+  timezone: string
+  /** 表达式的人话描述，解析失败时是原串 */
+  description: string
 }
 
 export interface TrafficSample {
@@ -199,6 +214,10 @@ export interface AccountDto {
   stop_mode_label: string
   schedule_start_time: string | null
   schedule_stop_time: string | null
+  /** 定时模式：每日 HH:MM 或五字段 Cron */
+  schedule_mode: ScheduleMode
+  schedule_start_cron: string | null
+  schedule_stop_cron: string | null
   spot_keep_alive: boolean
   enabled: boolean
   created_at: number
@@ -219,6 +238,10 @@ export interface AccountInput {
   stop_mode: StopMode
   schedule_start_time: string | null
   schedule_stop_time: string | null
+  /** 定时模式：每日 HH:MM 或五字段 Cron */
+  schedule_mode: ScheduleMode
+  schedule_start_cron: string | null
+  schedule_stop_cron: string | null
   spot_keep_alive: boolean
   enabled: boolean
 }
@@ -621,6 +644,14 @@ export const api = {
   /** 立即推送日报（异步）。 */
   pushDailyReport(options: PollOptions = {}): Promise<JobDto> {
     return runJob('/api/v1/reports/daily', undefined, options)
+  },
+
+  /** 校验 Cron 表达式并预览未来几次触发。 */
+  previewCron(expression: string, timezone: string, count = 5): Promise<CronPreviewResponse> {
+    return request<CronPreviewResponse>('/api/v1/cron/preview', {
+      method: 'POST',
+      body: { expression, timezone, count },
+    })
   },
 }
 

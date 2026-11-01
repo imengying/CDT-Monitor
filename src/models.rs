@@ -196,9 +196,11 @@ pub fn minutes_to_hhmm(minutes: u32) -> String {
 }
 
 /// 判断当前本地时间是否落在 `target` 分钟之后 `window` 分钟的短窗口内。
-/// Cron 每 15 分钟触发一次，窗口用于兜住边缘抖动（不至于整天错过）。
+/// Cron 每 5 分钟触发一次，窗口用于兜住边缘抖动（不至于整天错过）。
+///
+/// 区间为闭区间 `[target, target + window]`，与上游 `dueWithin` 一致。
 pub fn within_window(now_minutes: u32, target_minutes: u32, window: u32) -> bool {
-    now_minutes >= target_minutes && now_minutes < target_minutes.saturating_add(window)
+    now_minutes >= target_minutes && now_minutes <= target_minutes.saturating_add(window)
 }
 
 // ===========================================================================
@@ -599,10 +601,21 @@ pub struct AccountRow {
     pub stop_mode: String,
     pub schedule_start_time: Option<String>,
     pub schedule_stop_time: Option<String>,
+    /// `simple` = 每日 HH:MM；`advanced` = 五字段 Cron。
+    #[serde(default)]
+    pub schedule_mode: Option<String>,
+    /// 五字段 Cron（分 时 日 月 周），仅 `advanced` 使用。
+    #[serde(default)]
+    pub schedule_start_cron: Option<String>,
+    #[serde(default)]
+    pub schedule_stop_cron: Option<String>,
     pub spot_keep_alive: i64,
     pub enabled: i64,
     pub last_schedule_start_date: Option<String>,
     pub last_schedule_stop_date: Option<String>,
+    /// 最近一次定时开机的毫秒时间戳，Cron 模式据此去重。
+    #[serde(default)]
+    pub last_schedule_start_at: Option<i64>,
     /// 最近一次定时关机的毫秒时间戳，供保活避让同一轮刚关机的实例。
     #[serde(default)]
     pub last_schedule_stop_at: Option<i64>,
@@ -652,6 +665,27 @@ impl AccountRow {
         self.schedule_stop_time.as_deref().and_then(parse_hhmm)
     }
 
+    /// 定时模式：`advanced` 必须显式声明；其余一律按 `simple` 处理。
+    pub fn schedule_is_advanced(&self) -> bool {
+        self.schedule_mode.as_deref() == Some("advanced")
+    }
+
+    /// 进阶模式下的开机表达式（已去空白，空串视为未配）。
+    pub fn start_cron(&self) -> Option<&str> {
+        self.schedule_start_cron
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 进阶模式下的关机表达式。
+    pub fn stop_cron(&self) -> Option<&str> {
+        self.schedule_stop_cron
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     /// 界面展示用的账号 DTO（不含任何密文）。
     pub fn to_dto(&self) -> AccountDto {
         AccountDto {
@@ -672,6 +706,13 @@ impl AccountRow {
             stop_mode_label: self.stop_mode().label().to_string(),
             schedule_start_time: self.schedule_start_time.clone(),
             schedule_stop_time: self.schedule_stop_time.clone(),
+            schedule_mode: if self.schedule_is_advanced() {
+                "advanced".to_string()
+            } else {
+                "simple".to_string()
+            },
+            schedule_start_cron: self.schedule_start_cron.clone(),
+            schedule_stop_cron: self.schedule_stop_cron.clone(),
             spot_keep_alive: self.is_spot_keep_alive(),
             enabled: self.is_enabled(),
             created_at: self.created_at,
@@ -1165,6 +1206,10 @@ pub struct AccountDto {
     pub stop_mode_label: String,
     pub schedule_start_time: Option<String>,
     pub schedule_stop_time: Option<String>,
+    /// 定时模式：`simple` / `advanced`。
+    pub schedule_mode: String,
+    pub schedule_start_cron: Option<String>,
+    pub schedule_stop_cron: Option<String>,
     pub spot_keep_alive: bool,
     pub enabled: bool,
     pub created_at: i64,
@@ -1195,6 +1240,14 @@ pub struct AccountInput {
     pub schedule_start_time: Option<String>,
     #[serde(default)]
     pub schedule_stop_time: Option<String>,
+    /// `simple`（默认）或 `advanced`。
+    #[serde(default)]
+    pub schedule_mode: Option<String>,
+    /// 五字段 Cron，仅 `advanced` 模式使用。
+    #[serde(default)]
+    pub schedule_start_cron: Option<String>,
+    #[serde(default)]
+    pub schedule_stop_cron: Option<String>,
     #[serde(default)]
     pub spot_keep_alive: bool,
     #[serde(default = "default_true")]
@@ -1245,6 +1298,37 @@ impl AccountInput {
         self.schedule_stop_minutes().map(minutes_to_hhmm)
     }
 
+    /// 归一化后的定时模式：只认字面值 `advanced`，其余一律 `simple`。
+    pub fn normalized_schedule_mode(&self) -> &'static str {
+        if self.schedule_mode.as_deref().map(str::trim) == Some("advanced") {
+            "advanced"
+        } else {
+            "simple"
+        }
+    }
+
+    pub fn is_advanced_schedule(&self) -> bool {
+        self.normalized_schedule_mode() == "advanced"
+    }
+
+    /// 归一化后的开机 Cron（去空白，空串归一为 `None`）。
+    pub fn normalized_start_cron(&self) -> Option<String> {
+        self.schedule_start_cron
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// 归一化后的关机 Cron。
+    pub fn normalized_stop_cron(&self) -> Option<String> {
+        self.schedule_stop_cron
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     /// 字段校验；返回 `Err(中文提示)` 由路由层转成 400。
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
@@ -1277,6 +1361,20 @@ impl AccountInput {
             && parse_hhmm(time).is_none()
         {
             return Err("定时关机时间格式应为 HH:MM".to_string());
+        }
+        // 进阶模式下至少得配一个表达式，否则等于开了定时却什么都不做
+        if self.is_advanced_schedule() {
+            let start = self.normalized_start_cron();
+            let stop = self.normalized_stop_cron();
+            if start.is_none() && stop.is_none() {
+                return Err("进阶模式至少要配置一个 Cron 表达式".to_string());
+            }
+            if let Some(expr) = start {
+                crate::cron::validate(&expr).map_err(|e| format!("定时开机：{e}"))?;
+            }
+            if let Some(expr) = stop {
+                crate::cron::validate(&expr).map_err(|e| format!("定时关机：{e}"))?;
+            }
         }
         Ok(())
     }
@@ -1496,6 +1594,19 @@ pub struct NotifyTestRequest {
     pub channel: NotifyChannel,
 }
 
+/// Cron 表达式预览请求（未来若干次触发）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct CronPreviewRequest {
+    /// 五字段表达式。
+    pub expression: String,
+    /// 时区（`UTC+8` 形式）；缺省用全局设置。
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// 预览次数，缺省 5，范围 1..=10。
+    #[serde(default)]
+    pub count: Option<usize>,
+}
+
 /// 实例动作请求（可选指定地域；缺省时从快照推断）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct InstanceActionRequest {
@@ -1548,6 +1659,27 @@ pub fn build_overview(
             snap.instances(),
         ),
         None => (0, None, None, None, None, None, false, Vec::new()),
+    };
+
+    // 快照为空时合成一个占位实例。
+    //
+    // 卡片的开机 / 关机按钮完全由 `instances[0].status` 决定，若直接返回空
+    // 数组，新建账号（首采未完成或采集失败）卡片上就只剩「设置」，用户
+    // 以为功能坏了。上游把 `instance_status` 存在账号行上（新建为
+    // `Unknown`），这里用同样的语义把实例 ID 补上，状态留空由前端显示
+    // 「未知」。
+    let instances = if instances.is_empty() {
+        match account.instance_id_opt() {
+            Some(id) => vec![InstanceInfo {
+                instance_id: id.to_string(),
+                region_id: account.region_id.clone(),
+                keep_alive: account.is_spot_keep_alive(),
+                ..InstanceInfo::default()
+            }],
+            None => Vec::new(),
+        }
+    } else {
+        instances
     };
 
     // 卡片与图表都按 GB 展示，统一在这里换算一次。
@@ -1627,6 +1759,9 @@ mod tests {
             stop_mode: StopMode::StopCharging,
             schedule_start_time: None,
             schedule_stop_time: None,
+            schedule_mode: None,
+            schedule_start_cron: None,
+            schedule_stop_cron: None,
             spot_keep_alive: false,
             enabled: true,
         };
@@ -1757,11 +1892,12 @@ mod tests {
 
     #[test]
     fn within_window_semantics() {
-        // 目标 10:00，窗口 20 分钟 -> [10:00, 10:20)
+        // 目标 10:00，窗口 20 分钟 -> 闭区间 [10:00, 10:20]
         assert!(!within_window(9 * 60 + 59, 10 * 60, 20));
         assert!(within_window(10 * 60, 10 * 60, 20));
         assert!(within_window(10 * 60 + 19, 10 * 60, 20));
-        assert!(!within_window(10 * 60 + 20, 10 * 60, 20));
+        assert!(within_window(10 * 60 + 20, 10 * 60, 20));
+        assert!(!within_window(10 * 60 + 21, 10 * 60, 20));
     }
 
     #[test]
@@ -1851,5 +1987,98 @@ mod tests {
     #[test]
     fn negative_threshold_is_treated_as_unlimited() {
         assert!(!threshold_reached(500.0, -1.0));
+    }
+
+    /// 无快照时也要合成实例，否则卡片上的开机 / 关机按钮会全部消失。
+    #[test]
+    fn overview_synthesizes_instance_without_snapshot() {
+        let account = AccountRow {
+            id: 1,
+            name: "测试".to_string(),
+            site_type: "china".to_string(),
+            access_key_id: "LTAI5tTest".to_string(),
+            encrypted_access_key_secret: "cipher".to_string(),
+            region_id: "cn-hongkong".to_string(),
+            instance_id: Some("i-bp1test".to_string()),
+            traffic_threshold_gb: 100.0,
+            over_limit_action: "notify_only".to_string(),
+            stop_mode: "StopCharging".to_string(),
+            schedule_start_time: None,
+            schedule_stop_time: None,
+            schedule_mode: None,
+            schedule_start_cron: None,
+            schedule_stop_cron: None,
+            spot_keep_alive: 1,
+            enabled: 1,
+            last_schedule_start_date: None,
+            last_schedule_stop_date: None,
+            last_schedule_start_at: None,
+            last_schedule_stop_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let overview = build_overview(&account, None, "UTC+8", 1_700_000_000_000);
+        assert_eq!(overview.instances.len(), 1, "应合成一个占位实例");
+        let inst = &overview.instances[0];
+        assert_eq!(inst.instance_id, "i-bp1test");
+        // 状态留空：前端显示「未知」并保留全部操作按钮
+        assert_eq!(inst.status, "");
+        // 逐实例保活跟随账号级开关，否则按钮会被误禁用
+        assert!(inst.keep_alive);
+        assert!(inst.public_ip.is_none());
+        // 快照时间戳仍为空，卡片显示「等待首次同步」
+        assert!(overview.snapshot_updated_at.is_none());
+    }
+
+    /// 有快照时不得覆盖真实数据。
+    #[test]
+    fn overview_keeps_snapshot_instances() {
+        let account = AccountRow {
+            id: 2,
+            name: "测试".to_string(),
+            site_type: "china".to_string(),
+            access_key_id: "LTAI5tTest".to_string(),
+            encrypted_access_key_secret: "cipher".to_string(),
+            region_id: "cn-hongkong".to_string(),
+            instance_id: Some("i-bp1test".to_string()),
+            traffic_threshold_gb: 100.0,
+            over_limit_action: "notify_only".to_string(),
+            stop_mode: "StopCharging".to_string(),
+            schedule_start_time: None,
+            schedule_stop_time: None,
+            schedule_mode: None,
+            schedule_start_cron: None,
+            schedule_stop_cron: None,
+            spot_keep_alive: 0,
+            enabled: 1,
+            last_schedule_start_date: None,
+            last_schedule_stop_date: None,
+            last_schedule_start_at: None,
+            last_schedule_stop_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let snapshot = SnapshotRow {
+            account_id: 2,
+            balance_amount: Some(10.0),
+            balance_currency: Some("CNY".to_string()),
+            balance_cash: None,
+            balance_credit: None,
+            cdt_domestic_bytes: 0,
+            cdt_overseas_bytes: 0,
+            billing_month: "2026-11".to_string(),
+            instances_json:
+                r#"[{"instance_id":"i-bp1real","status":"Running","public_ip":"1.2.3.4"}]"#
+                    .to_string(),
+            threshold_triggered_month: None,
+            updated_at: 1_700_000_000_000,
+        };
+
+        let overview = build_overview(&account, Some(&snapshot), "UTC+8", 1_700_000_000_000);
+        assert_eq!(overview.instances.len(), 1);
+        assert_eq!(overview.instances[0].instance_id, "i-bp1real");
+        assert_eq!(overview.instances[0].status, "Running");
+        assert_eq!(overview.instances[0].public_ip.as_deref(), Some("1.2.3.4"));
     }
 }

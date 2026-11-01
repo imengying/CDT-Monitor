@@ -1,13 +1,13 @@
 //! # 调度器：采样、熔断、定时开关机、抢占式保活、日报
 //!
-//! 每次 Cron（`*/15 * * * *`）走一遍 [`Scheduler::run_cron`]：
+//! 每次 Cron（`*/5 * * * *`）走一遍 [`Scheduler::run_cron`]：
 //!
 //! ```text
 //! 1. 清理过期锁 / 旧任务 / 旧日志（每天一次）
 //! 2. 逐个启用账号：CDT 流量 + 余额 + 各地域 ECS 实例 → 写快照 → 采样历史
 //! 3. 阈值判定：合计流量 ≥ traffic_limit_gb
 //!      └─ 首次超限 → 标记账期 + 通知 [+ 停机（stop_and_notify）]
-//! 4. 定时关机（含 20 分钟短窗口补偿）
+//! 4. 定时关机（含 10 分钟短窗口补偿）
 //! 5. 定时开机（同上，**受熔断闸门约束**）
 //! 6. 抢占式保活（受熔断闸门与「夜间停机窗口」约束）
 //! 7. 每日日报（命中 HH:MM 窗口且当天未推送）
@@ -44,11 +44,12 @@ use crate::notify::{
     BarkChannel, Channels, Message, NotifyLevel, NotifyOutcome, TelegramChannel, dispatch,
 };
 
-/// 定时开关机的补偿窗口（分钟）。Cron 每 15 分钟一次，60 分钟窗口意味着
-/// 最多 4 次重试机会，足以吞掉一次网络抖动。
-pub const SCHEDULE_WINDOW_MINUTES: u32 = 60;
-/// 日报的补偿窗口（分钟）。与开关机窗口同宽。
-pub const REPORT_WINDOW_MINUTES: u32 = 60;
+/// 定时开关机的补偿窗口（分钟）。与上游一致：10 分钟。
+///
+/// Cron 每 5 分钟一次，所以每个触发点有 2 次尝试机会（准点与 +5 分钟）。
+pub const SCHEDULE_WINDOW_MINUTES: u32 = 10;
+/// 日报的补偿窗口（分钟）。与开关机窗口同宽，与上游一致。
+pub const REPORT_WINDOW_MINUTES: u32 = 10;
 /// 流量采样去重心跳：数值连续不变时，至少每 30 分钟落一个点，
 /// 保证小时粒度图表不断线。
 pub const HISTORY_HEARTBEAT_MS: i64 = 30 * 60 * 1000;
@@ -73,10 +74,10 @@ pub const INSTANCE_LOCK_TTL_MINUTES: i64 = 30;
 pub const TRANSITION_REFRESH_TTL_MS: i64 = 45_000;
 /// 定时关机后保活的避让期（分钟）。
 ///
-/// 只需覆盖「刚关机的那一轮 Cron」：Cron 15 分钟一次，留 20 分钟让快照
+/// 只需覆盖「刚关机的那一轮 Cron」：Cron 5 分钟一次，留 10 分钟让快照
 /// 追上最新状态即可。不能用「当天已关机」判断——那样当天之后实例若被
 /// 抢占回收，保活会一直不再拉起，与「自动开关机 + 保活并存」的预期冲突。
-pub const KEEP_ALIVE_STOP_GRACE_MINUTES: i64 = 20;
+pub const KEEP_ALIVE_STOP_GRACE_MINUTES: i64 = 10;
 
 // ===========================================================================
 // 辅助函数
@@ -296,7 +297,7 @@ impl Scheduler {
 
     /// 同一「去重键」在窗口内只发送一次的通知。
     ///
-    /// 用于周期性巡检产生的告警：Cron 每 15 分钟一轮，若不加抑制，
+    /// 用于周期性巡检产生的告警：Cron 每 5 分钟一轮，若不加抑制，
     /// 一次持续异常会连续轰炸。去重键应包含「异常主体 + 时间片」，
     /// 例如 `threshold:3:2026-10`。
     pub async fn notify_once(
@@ -488,7 +489,7 @@ impl Scheduler {
         });
 
         // 采样历史：按小时、按天各落一个点，存的是**当月累计用量**。
-        // 同一小时内多次采样覆盖同一个点，所以 15 分钟巡检不会把表撑大。
+        // 同一小时内多次采样覆盖同一个点，所以 5 分钟巡检不会把表撑大。
         if sync.traffic.is_some() {
             let day_start = local_day_start_ms(self.now, &self.timezone);
             self.db
@@ -697,25 +698,82 @@ impl Scheduler {
     // 定时开关机
     // -----------------------------------------------------------------------
 
-    /// 定时关机：命中窗口且当天未执行过。
+    /// 判断「定时关机」这次该不该执行。
+    ///
+    /// 返回 `(去重键, 时间描述)`；`None` 表示本轮不执行。
+    fn stop_due(&self, account: &AccountRow) -> Option<(String, String)> {
+        if account.schedule_is_advanced() {
+            let expr = account.stop_cron()?;
+            let window_ms = SCHEDULE_WINDOW_MINUTES as i64 * 60 * 1000;
+            let occurred =
+                crate::cron::last_occurrence_within(expr, &self.timezone, self.now, window_ms)?;
+            // 这次触发已经执行过（或执行时间更晚）就跳过
+            if account
+                .last_schedule_stop_at
+                .is_some_and(|prev| prev >= occurred)
+            {
+                return None;
+            }
+            Some((format!("cron:{occurred}"), crate::cron::describe(expr)))
+        } else {
+            let target = account.schedule_stop_minutes()?;
+            let now_minutes = local_minutes_of_day(self.now, &self.timezone);
+            if !within_window(now_minutes, target, SCHEDULE_WINDOW_MINUTES) {
+                return None;
+            }
+            let today = local_date(self.now, &self.timezone);
+            if account.last_schedule_stop_date.as_deref() == Some(today.as_str()) {
+                return None;
+            }
+            Some((format!("daily:{today}"), today))
+        }
+    }
+
+    /// 判断「定时开机」这次该不该执行，语义同 [`Self::stop_due`]。
+    fn start_due(&self, account: &AccountRow) -> Option<(String, String)> {
+        if account.schedule_is_advanced() {
+            let expr = account.start_cron()?;
+            let window_ms = SCHEDULE_WINDOW_MINUTES as i64 * 60 * 1000;
+            let occurred =
+                crate::cron::last_occurrence_within(expr, &self.timezone, self.now, window_ms)?;
+            if account
+                .last_schedule_start_at
+                .is_some_and(|prev| prev >= occurred)
+            {
+                return None;
+            }
+            Some((format!("cron:{occurred}"), crate::cron::describe(expr)))
+        } else {
+            let target = account.schedule_start_minutes()?;
+            let now_minutes = local_minutes_of_day(self.now, &self.timezone);
+            if !within_window(now_minutes, target, SCHEDULE_WINDOW_MINUTES) {
+                return None;
+            }
+            let today = local_date(self.now, &self.timezone);
+            if account.last_schedule_start_date.as_deref() == Some(today.as_str()) {
+                return None;
+            }
+            Some((format!("daily:{today}"), today))
+        }
+    }
+
+    /// 定时关机：命中窗口且这次触发尚未执行过。
+    ///
+    /// 两种模式共用「命中 → 加锁 → 执行 → 记录」流程，只是判定不同：
+    /// * `simple`：每日 HH:MM，按本地日期去重；
+    /// * `advanced`：五字段 Cron，按「上次执行的触发时刻」去重，
+    ///   所以 `*/5` 这类高频表达式也能逐次生效。
     async fn maybe_scheduled_stop(
         &self,
         account: &AccountRow,
         report: &mut CronReport,
     ) -> worker::Result<()> {
-        let Some(target) = account.schedule_stop_minutes() else {
+        let Some((dedupe_key, label)) = self.stop_due(account) else {
             return Ok(());
         };
-        let now_minutes = local_minutes_of_day(self.now, &self.timezone);
-        if !within_window(now_minutes, target, SCHEDULE_WINDOW_MINUTES) {
-            return Ok(());
-        }
         let today = local_date(self.now, &self.timezone);
-        if account.last_schedule_stop_date.as_deref() == Some(today.as_str()) {
-            return Ok(());
-        }
 
-        let lock_name = format!("schedule-stop:{}:{}", account.id, today);
+        let lock_name = format!("schedule-stop:{}:{dedupe_key}", account.id);
         let owner = random_hex(8).map_err(|e| worker::Error::RustError(e.to_string()))?;
         if !self
             .db
@@ -752,10 +810,7 @@ impl Scheduler {
                                 Some(account.id),
                                 "schedule_stop",
                                 Some(&instance.instance_id),
-                                &format!(
-                                    "定时关机 {}",
-                                    account.schedule_stop_time.as_deref().unwrap_or("-")
-                                ),
+                                &format!("定时关机 {label}"),
                                 now_ms(),
                             )
                             .await?;
@@ -806,17 +861,10 @@ impl Scheduler {
         account: &AccountRow,
         report: &mut CronReport,
     ) -> worker::Result<()> {
-        let Some(target) = account.schedule_start_minutes() else {
+        let Some((_dedupe_key, label)) = self.start_due(account) else {
             return Ok(());
         };
-        let now_minutes = local_minutes_of_day(self.now, &self.timezone);
-        if !within_window(now_minutes, target, SCHEDULE_WINDOW_MINUTES) {
-            return Ok(());
-        }
         let today = local_date(self.now, &self.timezone);
-        if account.last_schedule_start_date.as_deref() == Some(today.as_str()) {
-            return Ok(());
-        }
 
         // 优先级：熔断闸门高于定时开机
         if self.threshold_blocked(account).await? {
@@ -873,10 +921,7 @@ impl Scheduler {
                                 Some(account.id),
                                 "schedule_start",
                                 Some(&instance.instance_id),
-                                &format!(
-                                    "定时开机 {}",
-                                    account.schedule_start_time.as_deref().unwrap_or("-")
-                                ),
+                                &format!("定时开机 {label}"),
                                 now_ms(),
                             )
                             .await?;
@@ -1355,13 +1400,58 @@ impl Scheduler {
             }
         };
 
-        // 动作后立即刷新，保证前端轮询结束时看到的是真实状态
+        // 动作后立即刷新，保证前端轮询结束时看到的是真实状态；
+        // 若阿里云尚未落到终态（刚发出指令常如此），把快照置为过渡态，
+        // 让前端显示「正在启动…」并切到 1 分钟轮询。
         let refresh = self.refresh_account(&account).await;
         if !refresh.success {
             log_warn!("动作后刷新失败：{}", refresh.warnings.join("；"));
         }
+        self.set_transitional_status(account_id, instance_id, start)
+            .await?;
 
         Ok(detail)
+    }
+
+    /// 把快照里某个实例的状态置为 `Starting` / `Stopping`。
+    ///
+    /// 只在刷新后仍停留在「与意图相反」的旧状态时才写：若阿里云已经
+    /// 报回 `Starting` / `Stopping` / 终态，就以采集结果为准，不要回退。
+    async fn set_transitional_status(
+        &self,
+        account_id: i64,
+        instance_id: &str,
+        start: bool,
+    ) -> worker::Result<()> {
+        let mut instances = self.db.snapshot_instances(account_id).await?;
+        let mut changed = false;
+        for instance in instances.iter_mut() {
+            if instance.instance_id != instance_id {
+                continue;
+            }
+            let current = instance.status.to_ascii_lowercase();
+            // 已经开始动了（或已是目标终态）就别再改成过渡态
+            let already_moving = current == "starting"
+                || current == "stopping"
+                || current == "pending"
+                || (start && current == "running")
+                || (!start && current == "stopped");
+            if already_moving {
+                continue;
+            }
+            instance.status = if start {
+                "Starting".to_string()
+            } else {
+                "Stopping".to_string()
+            };
+            changed = true;
+        }
+        if changed {
+            self.db
+                .update_snapshot_instances(account_id, &instances, now_ms())
+                .await?;
+        }
+        Ok(())
     }
 
     /// 切换逐实例抢占式保活开关。
@@ -1642,10 +1732,14 @@ mod tests {
             stop_mode: "StopCharging".to_string(),
             schedule_start_time: start.map(|s| s.to_string()),
             schedule_stop_time: stop.map(|s| s.to_string()),
+            schedule_mode: None,
+            schedule_start_cron: None,
+            schedule_stop_cron: None,
             spot_keep_alive: 1,
             enabled: 1,
             last_schedule_start_date: None,
             last_schedule_stop_date: None,
+            last_schedule_start_at: None,
             last_schedule_stop_at: None,
             created_at: 0,
             updated_at: 0,
@@ -1718,7 +1812,7 @@ mod tests {
         assert!(in_allowed_window(&account, 8 * 60));
     }
 
-    /// 保活避让只看「刚刚关过机」：关机后 20 分钟内让路，
+    /// 保活避让只看「刚刚关过机」：关机后在避让期内让路，
     /// 之后必须恢复保活，否则当天被抢占回收就再也不会拉起。
     #[test]
     fn keep_alive_stop_grace_window() {
@@ -1737,10 +1831,12 @@ mod tests {
         // 同一轮：刚关机，必须让路
         assert!(in_grace(now));
         assert!(in_grace(now - 5 * 60 * 1000));
-        assert!(in_grace(now - 19 * 60 * 1000));
+        assert!(in_grace(
+            now - (KEEP_ALIVE_STOP_GRACE_MINUTES - 1) * 60 * 1000
+        ));
 
-        // 20 分钟之后：恢复正常保活（这正是旧实现的缺陷所在）
-        assert!(!in_grace(now - 20 * 60 * 1000));
+        // 避让期结束后：恢复正常保活（这正是旧实现的缺陷所在）
+        assert!(!in_grace(now - grace_ms));
         assert!(!in_grace(now - 6 * 60 * 60 * 1000));
 
         // 时钟回拨：未来时间戳不得被误判为「刚关机」
@@ -1817,5 +1913,41 @@ mod tests {
         assert_eq!(SiteType::from_db("intl").label(), "国际站");
         assert_eq!(StopMode::from_db("KeepCharging").label(), "普通停机");
         assert_eq!(StopMode::from_db("StopCharging").label(), "节省停机");
+    }
+
+    // -----------------------------------------------------------------------
+    // 进阶（Cron）定时
+    // -----------------------------------------------------------------------
+
+    /// 带 cron 配置的账号。
+    fn account_with_cron(
+        mode: Option<&str>,
+        start: Option<&str>,
+        stop: Option<&str>,
+    ) -> AccountRow {
+        AccountRow {
+            schedule_mode: mode.map(|s| s.to_string()),
+            schedule_start_cron: start.map(|s| s.to_string()),
+            schedule_stop_cron: stop.map(|s| s.to_string()),
+            ..account_with_schedule(None, None)
+        }
+    }
+
+    #[test]
+    fn advanced_mode_detection() {
+        // 显式 advanced
+        assert!(
+            account_with_cron(Some("advanced"), Some("0 8 * * *"), None).schedule_is_advanced()
+        );
+        // simple / 空都算简单模式
+        assert!(!account_with_cron(Some("simple"), Some("0 8 * * *"), None).schedule_is_advanced());
+        assert!(!account_with_cron(None, Some("0 8 * * *"), None).schedule_is_advanced());
+    }
+
+    #[test]
+    fn cron_accessors_trim_and_ignore_blank() {
+        let acc = account_with_cron(Some("advanced"), Some("  0 8 * * *  "), Some("   "));
+        assert_eq!(acc.start_cron(), Some("0 8 * * *"));
+        assert_eq!(acc.stop_cron(), None);
     }
 }

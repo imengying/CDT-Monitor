@@ -18,9 +18,10 @@
   font-family:
     ui-sans-serif, -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', 'Noto Sans SC',
     sans-serif;
-  color: #181a1d;
-  background: #f1f3f5;
-  color-scheme: light;
+  /* 这三个用变量：深色主题会覆盖它们 */
+  color: var(--ink);
+  background: var(--bg);
+  color-scheme: light dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 
@@ -37,6 +38,33 @@
   --line-strong: rgba(118, 125, 135, 0.42);
   --inner-line: rgba(255, 255, 255, 0.9);
 
+  /* ---- 表面层 ----------------------------------------------------------
+   * 控件底色按「静态 / 悬停 / 聚焦」三档递进，深色下对应地「变亮」而非「变白」。
+   * 分开定义而不是复用同一变量，是因为深色需要不同的递进方向。 */
+  --surface-sunken: rgba(233, 236, 239, 0.72);
+  --surface-hover: rgba(239, 241, 243, 0.88);
+  --surface-raised: rgba(255, 255, 255, 0.92);
+  --surface-track: rgba(225, 229, 233, 0.72);
+  --surface-muted: rgba(255, 255, 255, 0.76);
+  /* 卡片 / 弹窗铺底：接近不透明，替代上游的毛玻璃 */
+  --surface-panel: rgba(252, 253, 253, 0.97);
+  /* 高光内阴影与描边 */
+  --highlight: rgba(255, 255, 255, 0.92);
+  --highlight-soft: rgba(255, 255, 255, 0.76);
+  --highlight-strong: rgba(255, 255, 255, 0.2);
+  --hairline: rgba(209, 209, 214, 0.45);
+  /* 控件内阴影：浅色下是淡淡的黑 */
+  --inset-shadow: rgba(28, 28, 30, 0.045);
+  /* 滑块 / 进度条槽的填充色 */
+  --track-thumb: #aeb4bc;
+  /* 实心深色块（主按钮、品牌标、选中文字）的底色与前景 */
+  --solid-ink: #2c2f33;
+  --on-solid: #ffffff;
+  --solid-bg: var(--ink);
+  /* 遮罩 */
+  --scrim: rgba(35, 38, 42, 0.28);
+  --scrim-strong: rgba(20, 27, 38, 0.55);
+
   --green: #147a55;
   --green-soft: #dcefe6;
   --blue: #2563b8;
@@ -47,6 +75,13 @@
   --red-soft: #fbe0e3;
   --amber: #a86608;
   --amber-soft: #f8eccb;
+  /* 语义色的浅底与描边（提醒条、错误态输入框） */
+  --red-soft-translucent: rgba(255, 235, 237, 0.82);
+  --red-line: rgba(201, 60, 71, 0.18);
+  --red-ink: #9f2933;
+  --amber-soft-translucent: rgba(250, 235, 203, 0.7);
+  --blue-soft-translucent: rgba(50, 103, 178, 0.1);
+  --neutral-ink: #959ba3;
 
   --radius-lg: 24px;
   --shadow-lg:
@@ -62,6 +97,76 @@
 * {
   box-sizing: border-box;
 }
+
+/* ------------------------------------------------------------------------- */
+/* 深色主题                                                                   */
+/* ------------------------------------------------------------------------- */
+/*
+ * 只覆盖颜色令牌，不改任何布局、圆角、阴影结构、动效。
+ * 深色下「高光」要反过来做：浅色靠白色内阴影提亮，深色靠降低不透明度避免刺眼；
+ * 控件底色则从「比背景白」变成「比背景亮一阶」。
+ *
+ * 切换由 `<html data-theme>` 驱动，见 web/src/lib/theme.ts。
+ */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #14171b;
+  --panel: #1b1f25;
+  --panel-soft: #20252c;
+  --ink: #e6e9ed;
+  --muted: #a4adb9;
+  --muted-soft: #8b939f;
+  --ink-strong: #f0f2f5;
+  --muted-icon: #9aa1ab;
+  --line: rgba(164, 173, 185, 0.22);
+  --line-strong: rgba(164, 173, 185, 0.38);
+  --inner-line: rgba(255, 255, 255, 0.07);
+
+  /* 表面层：静态 -> 悬停 -> 聚焦，逐级变亮 */
+  --surface-sunken: #22272e;
+  --surface-hover: #262c34;
+  --surface-raised: #2b323a;
+  --surface-track: #232830;
+  --surface-muted: #242a32;
+  --surface-panel: #1b1f25;
+  --highlight: rgba(255, 255, 255, 0.07);
+  --highlight-soft: rgba(255, 255, 255, 0.05);
+  --highlight-strong: rgba(255, 255, 255, 0.06);
+  --hairline: rgba(164, 173, 185, 0.2);
+  --inset-shadow: rgba(0, 0, 0, 0.28);
+  --track-thumb: #4a525c;
+  --solid-ink: #dce4ef;
+  /* 深色下反相：实心块是浅色，字用深色 */
+  --on-solid: #14171b;
+  --solid-bg: #dce4ef;
+
+  --scrim: rgba(5, 8, 12, 0.62);
+  --scrim-strong: rgba(5, 8, 12, 0.72);
+
+  /* 语义色：深色下提亮前景、压暗浅底 */
+  --green: #6ecfa4;
+  --green-soft: #1b3a2d;
+  --blue: #7fa9f0;
+  --blue-soft: #1e3452;
+  --cyan: #6cc4d4;
+  --cyan-soft: #1a3840;
+  --red: #f08a94;
+  --red-soft: #40242a;
+  --amber: #eec07a;
+  --amber-soft: #3d301c;
+  --red-soft-translucent: rgba(240, 138, 148, 0.14);
+  --red-line: rgba(240, 138, 148, 0.32);
+  --red-ink: #f4a1a9;
+  --amber-soft-translucent: rgba(238, 192, 122, 0.14);
+  --blue-soft-translucent: rgba(127, 169, 240, 0.14);
+  --neutral-ink: #8b939f;
+
+  /* 阴影加深：深色背景上浅色阴影没有意义 */
+  --shadow-lg: 0 26px 60px -34px rgba(0, 0, 0, 0.72), 0 1px 0 rgba(255, 255, 255, 0.06) inset;
+  --shadow-sm: 0 14px 30px -24px rgba(0, 0, 0, 0.7), 0 1px 0 rgba(255, 255, 255, 0.06) inset;
+}
+
 
 /* `hidden` 属性必须胜过组件自己的 display（例如 .empty-state 的 grid） */
 [hidden] {
@@ -84,8 +189,8 @@ body {
 }
 
 ::selection {
-  color: white;
-  background: var(--ink);
+  color: var(--on-solid);
+  background: var(--solid-bg);
 }
 
 button,
@@ -229,7 +334,7 @@ h3 {
   border: 0;
   border-radius: 12px;
   appearance: none;
-  background-color: rgba(233, 236, 239, 0.72);
+  background-color: var(--surface-sunken);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%235f6670' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 12px center;
@@ -238,24 +343,24 @@ h3 {
   font-size: 15px;
   cursor: pointer;
   box-shadow:
-    inset 0 1px 3px rgba(28, 28, 30, 0.045),
+    inset 0 1px 3px var(--inset-shadow),
     inset 0 0 0 1px var(--line),
-    0 1px 0 rgba(255, 255, 255, 0.76);
+    0 1px 0 var(--surface-muted);
   transition:
     background-color var(--duration-fast) ease,
     box-shadow var(--duration-fast) ease;
 }
 
 .native-select:hover {
-  background-color: rgba(239, 241, 243, 0.88);
+  background-color: var(--surface-hover);
 }
 
 .native-select:focus {
   outline: none;
-  background-color: rgba(255, 255, 255, 0.92);
+  background-color: var(--surface-raised);
   box-shadow:
     inset 0 0 0 1px var(--line-strong),
-    0 0 0 3px rgba(50, 103, 178, 0.1);
+    0 0 0 3px var(--blue-soft-translucent);
 }
 
 /* 设置页内的分区与列表 */
@@ -286,10 +391,10 @@ h3 {
   margin-top: 16px;
   padding: 11px 14px;
   border-radius: 11px;
-  background: rgba(255, 235, 237, 0.82);
-  color: #9f2933;
+  background: var(--red-soft-translucent);
+  color: var(--red-ink);
   font-size: 12px;
-  box-shadow: inset 0 0 0 1px rgba(201, 60, 71, 0.18);
+  box-shadow: inset 0 0 0 1px var(--red-line);
 }
 
 .device-list {
@@ -310,8 +415,8 @@ h3 {
   align-items: center;
   gap: 6px 14px;
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.52);
-  border: 1px solid rgba(255, 255, 255, 0.78);
+  background: var(--surface-muted);
+  border: 1px solid var(--surface-muted);
   box-shadow: 0 0 0 1px var(--line);
 }
 
@@ -396,11 +501,11 @@ h3 {
   display: grid;
   place-items: center;
   border-radius: 12px;
-  color: white;
-  background: var(--ink);
+  color: var(--on-solid);
+  background: var(--solid-bg);
   box-shadow:
     0 14px 24px -16px rgba(0, 0, 0, 0.72),
-    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    inset 0 1px 0 var(--highlight-strong);
   transition:
     transform var(--duration-base) var(--ease-emphasis),
     box-shadow var(--duration-base) ease;
@@ -410,7 +515,7 @@ h3 {
   transform: translateY(-2px) rotate(-2deg);
   box-shadow:
     0 18px 28px -17px rgba(0, 0, 0, 0.76),
-    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    inset 0 1px 0 var(--highlight-strong);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -493,11 +598,11 @@ h3 {
   align-items: center;
   gap: 10px;
   border-radius: 12px;
-  background: rgba(233, 236, 239, 0.72);
+  background: var(--surface-sunken);
   box-shadow:
-    inset 0 1px 3px rgba(28, 28, 30, 0.045),
+    inset 0 1px 3px var(--inset-shadow),
     inset 0 0 0 1px var(--line),
-    0 1px 0 rgba(255, 255, 255, 0.76);
+    0 1px 0 var(--surface-muted);
   transition:
     background var(--duration-fast) ease,
     box-shadow var(--duration-fast) ease,
@@ -505,14 +610,14 @@ h3 {
 }
 
 .input-shell:hover {
-  background: rgba(239, 241, 243, 0.88);
+  background: var(--surface-hover);
 }
 
 .input-shell:focus-within {
-  background: rgba(255, 255, 255, 0.92);
+  background: var(--surface-raised);
   box-shadow:
     inset 0 0 0 1px var(--line-strong),
-    0 0 0 3px rgba(50, 103, 178, 0.1);
+    0 0 0 3px var(--blue-soft-translucent);
 }
 
 .input-shell > svg {
@@ -532,7 +637,7 @@ h3 {
 
 .input-shell input::placeholder,
 .input-shell textarea::placeholder {
-  color: #959ba3;
+  color: var(--neutral-ink);
 }
 
 .input-shell input {
@@ -556,7 +661,7 @@ h3 {
 .input-shell textarea::-webkit-scrollbar-thumb {
   border: 2px solid transparent;
   border-radius: 99px;
-  background: #aeb4bc;
+  background: var(--track-thumb);
   background-clip: padding-box;
 }
 
@@ -592,12 +697,12 @@ h3 {
   align-items: center;
   gap: 9px;
   margin-top: 18px;
-  color: #9f2933;
-  background: rgba(255, 235, 237, 0.82);
+  color: var(--red-ink);
+  background: var(--red-soft-translucent);
   padding: 12px 15px;
   border-radius: 10px;
   font-size: 13px;
-  box-shadow: inset 0 0 0 1px rgba(201, 60, 71, 0.18);
+  box-shadow: inset 0 0 0 1px var(--red-line);
 }
 
 /* 分段控件 */
@@ -607,8 +712,8 @@ h3 {
   display: flex;
   align-items: stretch;
   border-radius: 12px;
-  background: rgba(225, 229, 233, 0.72);
-  box-shadow: inset 0 1px 4px rgba(28, 28, 30, 0.055);
+  background: var(--surface-track);
+  box-shadow: inset 0 1px 4px var(--inset-shadow);
 }
 
 .segmented button {
@@ -621,7 +726,7 @@ h3 {
   cursor: pointer;
   font-size: 12px;
   font-weight: 700;
-  color: #727279;
+  color: var(--neutral-ink);
   line-height: 1.25;
   text-align: center;
   word-break: break-word;
@@ -637,11 +742,11 @@ h3 {
 }
 
 .segmented button.active {
-  background: rgba(255, 255, 255, 0.88);
+  background: var(--surface-muted);
   color: var(--ink-strong);
   box-shadow:
     0 4px 12px -8px rgba(0, 0, 0, 0.4),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.9);
+    inset 0 0 0 1px var(--surface-raised);
 }
 
 /* 开关行 */
@@ -653,8 +758,8 @@ h3 {
   gap: 10px;
   align-items: center;
   border-radius: 13px;
-  background: rgba(255, 255, 255, 0.54);
-  border: 1px solid rgba(255, 255, 255, 0.78);
+  background: var(--surface-muted);
+  border: 1px solid var(--surface-muted);
   box-shadow: 0 0 0 1px var(--line);
   cursor: pointer;
   transition:
@@ -664,7 +769,7 @@ h3 {
 }
 
 .toggle-row:hover {
-  background: rgba(255, 255, 255, 0.78);
+  background: var(--surface-muted);
   transform: translateY(-1px);
 }
 
@@ -679,7 +784,7 @@ h3 {
   display: grid;
   place-items: center;
   border-radius: 9px;
-  background: rgba(225, 229, 233, 0.72);
+  background: var(--surface-track);
 }
 
 .toggle-row svg {
@@ -703,7 +808,7 @@ h3 {
   height: 27px;
   padding: 3px;
   border-radius: 99px;
-  background: #bec3ca;
+  background: var(--track-thumb);
   box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.12);
   transition: background var(--duration-base) ease;
 }
@@ -713,13 +818,13 @@ h3 {
   width: 21px;
   height: 21px;
   border-radius: 50%;
-  background: white;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  background: var(--surface-raised);
+  box-shadow: 0 2px 6px var(--inset-shadow);
   transition: transform var(--duration-base) var(--ease-emphasis);
 }
 
 .toggle-row input:checked + .toggle {
-  background: var(--ink);
+  background: var(--solid-bg);
 }
 
 .toggle-row input:checked + .toggle em {
@@ -754,31 +859,31 @@ h3 {
 }
 
 .button--primary {
-  color: white;
-  background: var(--ink);
+  color: var(--on-solid);
+  background: var(--solid-bg);
   box-shadow:
     0 14px 26px -16px rgba(0, 0, 0, 0.72),
-    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    inset 0 1px 0 var(--highlight-strong);
 }
 
 .button--primary:hover:not(:disabled) {
-  background: #2c2f33;
+  background: var(--solid-ink);
   transform: translateY(-1px);
   box-shadow:
     0 18px 30px -17px rgba(0, 0, 0, 0.76),
-    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    inset 0 1px 0 var(--highlight-strong);
 }
 
 .button--secondary {
-  background: rgba(255, 255, 255, 0.68);
+  background: var(--surface-muted);
   box-shadow:
     0 8px 18px -15px rgba(0, 0, 0, 0.4),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.92),
-    0 0 0 1px rgba(209, 209, 214, 0.45);
+    inset 0 0 0 1px var(--surface-raised),
+    0 0 0 1px var(--hairline);
 }
 
 .button--secondary:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.96);
+  background: var(--surface-raised);
   transform: translateY(-1px);
 }
 
@@ -809,9 +914,9 @@ h3 {
   display: grid;
   place-items: center;
   cursor: pointer;
-  background: rgba(255, 255, 255, 0.7);
+  background: var(--surface-muted);
   box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.92),
+    inset 0 0 0 1px var(--surface-raised),
     0 0 0 1px var(--line),
     0 10px 20px -18px rgba(0, 0, 0, 0.72);
   transition:
@@ -828,7 +933,7 @@ h3 {
 
 .icon-button:hover:not(:disabled),
 .mini-icon:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.98);
+  background: var(--surface-raised);
   transform: translateY(-1px);
   box-shadow:
     inset 0 0 0 1px white,
@@ -865,7 +970,7 @@ h3 {
   background: var(--panel);
   color: var(--ink);
   border: 1px solid var(--line-strong);
-  box-shadow: 0 10px 22px -14px rgba(20, 27, 38, 0.55);
+  box-shadow: 0 10px 22px -14px var(--scrim-strong);
   font-size: 11px;
   font-weight: 650;
   line-height: 1.35;
@@ -941,8 +1046,8 @@ h3 {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   border-radius: var(--radius-lg);
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid rgba(255, 255, 255, 0.9);
+  background: var(--surface-muted);
+  border: 1px solid var(--surface-raised);
   box-shadow:
     0 0 0 1px var(--line),
     var(--shadow-lg);
@@ -961,7 +1066,7 @@ h3 {
 }
 
 .metric:hover {
-  background: rgba(255, 255, 255, 0.56);
+  background: var(--surface-muted);
 }
 
 .metric:not(:last-child)::after {
@@ -971,7 +1076,7 @@ h3 {
   right: 0;
   bottom: 20px;
   width: 1px;
-  background: rgba(209, 209, 214, 0.55);
+  background: var(--hairline);
 }
 
 .metric-icon {
@@ -982,10 +1087,10 @@ h3 {
   display: grid;
   place-items: center;
   color: var(--muted);
-  background: rgba(225, 229, 233, 0.78);
+  background: var(--surface-track);
   box-shadow:
     inset 0 1px 3px rgba(0, 0, 0, 0.035),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.78);
+    inset 0 0 0 1px var(--surface-muted);
 }
 
 .metric--blue .metric-icon {
@@ -1010,7 +1115,7 @@ h3 {
 
 .metric--red .metric-icon {
   color: var(--red);
-  background: rgba(251, 224, 227, 0.75);
+  background: var(--red-soft-translucent);
 }
 
 .metric label {
@@ -1076,16 +1181,16 @@ h3 {
 
 .account-card:hover {
   transform: translateY(-2px);
-  background: rgba(255, 255, 255, 0.94);
+  background: var(--surface-raised);
   box-shadow:
     0 0 0 1px var(--line-strong),
-    0 32px 62px -40px rgba(20, 27, 38, 0.58),
-    inset 0 1px 0 rgba(255, 255, 255, 0.92);
+    0 32px 62px -40px var(--scrim-strong),
+    inset 0 1px 0 var(--surface-raised);
 }
 
 .account-card--alert {
   box-shadow:
-    0 0 0 1px rgba(201, 60, 71, 0.18),
+    0 0 0 1px var(--red-line),
     var(--shadow-lg);
 }
 
@@ -1102,8 +1207,8 @@ h3 {
   display: grid;
   place-items: center;
   border-radius: 12px;
-  background: rgba(225, 229, 233, 0.72);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.86);
+  background: var(--surface-track);
+  box-shadow: inset 0 1px 0 var(--highlight);
 }
 
 .status-icon svg {
@@ -1118,12 +1223,12 @@ h3 {
 }
 
 .status-icon.negative {
-  color: #7d7d85;
+  color: var(--muted);
 }
 
 .status-icon.warning {
   color: var(--amber);
-  background: rgba(250, 235, 203, 0.7);
+  background: var(--amber-soft-translucent);
 }
 
 .account-title {
@@ -1139,9 +1244,36 @@ h3 {
   text-overflow: ellipsis;
 }
 
-.account-title span {
+.account-title > span {
   color: var(--muted-soft);
   font-size: 11px;
+}
+
+/* 公网 IP：紧贴地域下方，等宽字体避免数字跳动 */
+.account-address {
+  margin-top: 3px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.account-address code {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+}
+
+.account-address--empty {
+  color: var(--muted-soft);
+}
+
+/* 复制按钮：常显，不靠悬停（触屏设备没有 hover） */
+.account-address__copy {
+  width: 20px;
+  height: 20px;
+  padding: 0;
 }
 
 .account-card__side {
@@ -1164,8 +1296,8 @@ h3 {
   border-radius: 99px;
   font-size: 10px;
   font-weight: 800;
-  background: rgba(225, 229, 233, 0.72);
-  color: #696970;
+  background: var(--surface-track);
+  color: var(--muted);
 }
 
 .status-pill i {
@@ -1181,12 +1313,12 @@ h3 {
 }
 
 .status-pill.negative {
-  color: #717179;
+  color: var(--muted);
 }
 
 .status-pill.warning {
   color: var(--amber);
-  background: rgba(250, 235, 203, 0.7);
+  background: var(--amber-soft-translucent);
 }
 
 .account-billing {
@@ -1248,8 +1380,8 @@ h3 {
   height: 7px;
   margin-top: 13px;
   border-radius: 99px;
-  background: rgba(195, 200, 207, 0.68);
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.08);
+  background: var(--surface-track);
+  box-shadow: inset 0 1px 3px var(--inset-shadow);
   overflow: hidden;
 }
 
@@ -1257,7 +1389,8 @@ h3 {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: var(--ink);
+  /* 用 --solid-bg：深色主题下自动反相，否则会跟轨道糊成一片 */
+  background: var(--solid-bg);
   transform-origin: left center;
   animation: progress-in 0.8s 0.35s var(--ease-emphasis) both;
 }
@@ -1283,7 +1416,7 @@ h3 {
 .account-card__footer {
   margin-top: 16px;
   padding-top: 14px;
-  border-top: 1px solid rgba(209, 209, 214, 0.48);
+  border-top: 1px solid var(--hairline);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1328,15 +1461,15 @@ h3 {
 .empty-state {
   width: 100%;
   min-height: 220px;
-  border: 1px dashed rgba(118, 125, 135, 0.52);
+  border: 1px dashed var(--line-strong);
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.4);
+  background: var(--highlight-soft);
   display: grid;
   place-items: center;
   align-content: center;
   gap: 9px;
   cursor: pointer;
-  color: #6e6e73;
+  color: var(--muted);
   transition:
     transform var(--duration-base) var(--ease-out),
     background var(--duration-base) ease,
@@ -1345,7 +1478,7 @@ h3 {
 }
 
 .empty-state:hover {
-  background: rgba(255, 255, 255, 0.68);
+  background: var(--surface-muted);
   border-color: var(--line-strong);
   transform: translateY(-2px);
 }
@@ -1388,7 +1521,7 @@ h3 {
   background: var(--red-soft);
   color: var(--red);
   font-size: 13px;
-  box-shadow: inset 0 0 0 1px rgba(201, 60, 71, 0.18);
+  box-shadow: inset 0 0 0 1px var(--red-line);
 }
 
 .error-banner > span {
@@ -1416,7 +1549,7 @@ h3 {
 .modal-scrim {
   position: absolute;
   inset: 0;
-  background: rgba(35, 38, 42, 0.28);
+  background: var(--scrim);
   animation: scrim-in 0.24s ease both;
 }
 
@@ -1460,8 +1593,8 @@ h3 {
   display: flex;
   gap: 4px;
   border-radius: 13px;
-  background: rgba(225, 229, 233, 0.68);
-  box-shadow: inset 0 1px 4px rgba(0, 0, 0, 0.055);
+  background: var(--surface-track);
+  box-shadow: inset 0 1px 4px var(--inset-shadow);
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
@@ -1487,7 +1620,7 @@ h3 {
   gap: 8px;
   font-size: 12px;
   font-weight: 750;
-  color: #6f747d;
+  color: var(--muted);
   cursor: pointer;
   white-space: nowrap;
   transition:
@@ -1503,10 +1636,10 @@ h3 {
 
 .settings-tabs button.active {
   color: var(--ink);
-  background: rgba(255, 255, 255, 0.94);
+  background: var(--surface-raised);
   box-shadow:
     0 10px 20px -17px rgba(0, 0, 0, 0.5),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.95);
+    inset 0 0 0 1px var(--highlight);
 }
 
 .settings-tabs svg {
@@ -1529,7 +1662,7 @@ h3 {
 .settings-content::-webkit-scrollbar-thumb {
   border: 3px solid transparent;
   border-radius: 99px;
-  background: #aeb4bc;
+  background: var(--track-thumb);
   background-clip: padding-box;
 }
 
@@ -1563,9 +1696,9 @@ h3 {
   display: grid;
   place-items: center;
   color: var(--blue);
-  background: rgba(255, 255, 255, 0.76);
+  background: var(--surface-muted);
   box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.9),
+    inset 0 0 0 1px var(--surface-raised),
     0 0 0 1px var(--line);
 }
 
@@ -1618,8 +1751,8 @@ h3 {
 /* 悬浮在内容之上，给按钮一点浮起的层次，避免和正文糊在一起 */
 .settings-footer .button--primary {
   box-shadow:
-    0 18px 34px -18px rgba(20, 27, 38, 0.55),
-    0 1px 0 rgba(255, 255, 255, 0.16) inset;
+    0 18px 34px -18px var(--scrim-strong),
+    0 1px 0 var(--highlight-strong) inset;
 }
 
 .account-settings-list {
@@ -1630,8 +1763,8 @@ h3 {
 .account-editor {
   padding: 20px;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.58);
-  border: 1px solid rgba(255, 255, 255, 0.8);
+  background: var(--surface-muted);
+  border: 1px solid var(--highlight-soft);
   box-shadow: 0 0 0 1px var(--line);
 }
 
@@ -1792,12 +1925,12 @@ h3 {
   padding: 0 14px;
   border: 0;
   border-radius: 12px;
-  background: rgba(233, 236, 239, 0.72);
+  background: var(--surface-sunken);
   color: var(--ink);
   box-shadow:
-    inset 0 1px 3px rgba(28, 28, 30, 0.045),
+    inset 0 1px 3px var(--inset-shadow),
     inset 0 0 0 1px var(--line),
-    0 1px 0 rgba(255, 255, 255, 0.76);
+    0 1px 0 var(--surface-muted);
   transition:
     background var(--duration-fast) ease,
     box-shadow var(--duration-fast) ease;
@@ -1805,14 +1938,14 @@ h3 {
 
 .search-input:focus {
   outline: none;
-  background: rgba(255, 255, 255, 0.92);
+  background: var(--surface-raised);
   box-shadow:
     inset 0 0 0 1px var(--line-strong),
-    0 0 0 3px rgba(50, 103, 178, 0.1);
+    0 0 0 3px var(--blue-soft-translucent);
 }
 
 .search-input::placeholder {
-  color: #959ba3;
+  color: var(--neutral-ink);
 }
 
 .log-list {
@@ -1828,13 +1961,13 @@ h3 {
   align-items: center;
   padding: 12px 16px;
   border-radius: 11px;
-  background: rgba(255, 255, 255, 0.5);
+  background: var(--surface-muted);
   box-shadow: 0 0 0 1px var(--line);
   transition: background var(--duration-fast) ease;
 }
 
 .log-row:hover {
-  background: rgba(255, 255, 255, 0.76);
+  background: var(--surface-muted);
 }
 
 .log-row > div {
@@ -1892,7 +2025,7 @@ h3 {
   align-items: center;
   gap: 11px;
   border-radius: 11px;
-  background: #ffffff;
+  background: var(--surface-raised);
   box-shadow:
     0 0 0 1px var(--line),
     0 20px 38px -22px rgba(0, 0, 0, 0.42);
@@ -1940,7 +2073,7 @@ h3 {
 
 .toast-close:hover {
   opacity: 1;
-  background: rgba(225, 229, 233, 0.72);
+  background: var(--surface-track);
 }
 
 .toast-close svg {
@@ -1973,7 +2106,7 @@ h3 {
   }
 
   .metric:nth-child(-n + 2) {
-    border-bottom: 1px solid rgba(209, 209, 214, 0.45);
+    border-bottom: 1px solid var(--hairline);
   }
 
   .account-grid {
@@ -2039,7 +2172,7 @@ h3 {
     right: 0;
     padding: 10px;
     border-radius: 14px;
-    background: #ffffff;
+    background: var(--surface-raised);
     box-shadow:
       var(--shadow-lg),
       0 0 0 1px var(--line);
@@ -2090,7 +2223,7 @@ h3 {
     gap: 12px;
     margin-top: 14px;
     padding-top: 12px;
-    border-top: 1px solid rgba(209, 209, 214, 0.45);
+    border-top: 1px solid var(--hairline);
   }
 
   .account-billing {
@@ -2217,4 +2350,119 @@ h3 {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Cron 编辑器                                                                */
+/* ------------------------------------------------------------------------- */
+
+.cron-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.cron-mode-row__label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.cron-mode-row .segmented {
+  flex: 1;
+  max-width: 280px;
+}
+
+.cron-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cron-stack__label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.cron-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.cron-field__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cron-field__freq {
+  flex: 0 0 108px;
+}
+
+.cron-field__unit {
+  flex: 0 0 92px;
+}
+
+.cron-field__input {
+  flex: 1 1 120px;
+  min-width: 0;
+  height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0 12px;
+  color: var(--ink);
+  background: var(--surface-sunken);
+  font: inherit;
+  font-size: 13px;
+}
+
+.cron-field__input:focus-visible {
+  outline: none;
+  border-color: var(--line-strong);
+  background: var(--surface-raised);
+}
+
+.cron-field__input--raw {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  letter-spacing: 0.02em;
+}
+
+.cron-field__preview {
+  flex: 0 0 auto;
+}
+
+.cron-field__expr {
+  align-self: flex-start;
+  padding: 3px 8px;
+  border-radius: 7px;
+  color: var(--muted);
+  background: var(--surface-track);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+}
+
+.cron-field__error {
+  margin: 0;
+  color: var(--red);
+  font-size: 11px;
+}
+
+.cron-field__preview-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  color: var(--muted-soft);
+  font-size: 11px;
+}
+
+.cron-field__preview-list time {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--surface-sunken);
+  font-variant-numeric: tabular-nums;
 }

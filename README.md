@@ -17,7 +17,7 @@
 │         ▼                                                         │
 │  Worker (Rust → Wasm)                                             │
 │    ├─ fetch:      路由 + 登录 + Cookie 鉴权                       │
-│    ├─ scheduled:  */15 * * * * 巡检                               │
+│    ├─ scheduled:  */5 * * * * 巡检                                │
 │    └─ wait_until: 异步 Job（刷新 / 开关机 / 通知测试 / 日报）     │
 │         │                                                         │
 │         ├─ D1：accounts / snapshots / history / jobs / logs       │
@@ -28,8 +28,9 @@
 
 ## 核心特性
 
-- **流量采样与熔断**：每 15 分钟采集 CDT 公网流量与账户余额，按小时 / 天查看 ECharts 趋势，达到阈值自动告警或停机止损。
-- **实例自动化控制**：面板手动启停、每日定时开关机、抢占式实例自动保活拉起。
+- **流量采样与熔断**：每 5 分钟采集 CDT 公网流量与账户余额，按小时 / 天查看 ECharts 趋势，达到阈值自动告警或停机止损。
+- **实例自动化控制**：面板手动启停、每日定时开关机（或五字段 Cron）、抢占式实例自动保活拉起。
+- **公网地址**：卡片直接显示实例的公网 IP，一键复制。
 - **多渠道推送**：支持 Telegram 与 Bark，覆盖超限熔断、保活拉起与每日流量日报。
 - **纵深安全**：AK Secret 与推送凭据经 XChaCha20-Poly1305 加密落盘，配合 Turnstile、常量时间比对、设备会话管理与跨站请求拦截。
 
@@ -201,13 +202,15 @@ cdt-monitor/
 │   ├── check-config.ts          # wrangler.toml 结构校验
 │   └── deploy.ts                # 部署入口：建库 → 迁移 → 发布
 ├── migrations/
-│   └── init_001.sql             # 9 张表 + 12 个索引
+│   ├── init_001.sql             # 9 张表 + 12 个索引
+│   └── init_002_schedule_cron.sql  # 增量：定时模式与 Cron 字段
 ├── src/
 │   ├── lib.rs                   # fetch / scheduled 入口、路由、鉴权、Job 执行器
 │   ├── models.rs                # D1 实体行 + 前后端 DTO + 时区/单位换算
 │   ├── db.rs                    # D1 SQL 封装（含幂等锁）
 │   ├── crypto.rs                # XChaCha20-Poly1305、无状态 Token
 │   ├── logging.rs               # 分级日志（默认只输出 error）
+│   ├── cron.rs                  # Cron 表达式解析与触发窗口判定
 │   ├── aliyun.rs                # RPC V1 签名器 + CDT/ECS/BSS 客户端
 │   ├── notify.rs                # Telegram + Bark
 │   └── scheduler.rs             # 采样 / 熔断 / 定时开关机 / 保活 / 日报
@@ -216,24 +219,28 @@ cdt-monitor/
     ├── tsconfig.json
     ├── vite.config.ts
     ├── index.html               # 以 render=explicit 引入 Turnstile
-    ├── public/favicon.svg
+    ├── public/
+    │   ├── favicon.svg
+    │   └── theme-init.js        # 首屏落地主题，避免深色下一帧白底
     └── src/
         ├── main.ts              # 入口
         ├── App.ts               # 主控制台
-        ├── style.css            # 主题令牌与组件语义类
+        ├── style.css            # 主题令牌与组件语义类（含深色主题）
         ├── env.d.ts             # Turnstile 类型声明
         ├── api/client.ts        # API 客户端 + 202 Job 轮询
         ├── lib/
         │   ├── dom.ts           # el() / iconSvg() 等 DOM 工具
         │   ├── icons.ts         # 按需引入的 lucide 图标
+        │   ├── theme.ts         # 浅色 / 深色 / 跟随系统
         │   ├── echarts.ts       # 按需注册的 ECharts 模块（动态 import）
         │   ├── store.ts         # 状态容器 + toast
         │   └── actions.ts       # API 调用与状态写入
         └── components/
             ├── LoginModal.ts    # 登录卡片 + Turnstile
-            ├── AccountCard.ts   # 账号卡片 + 实例控制
+            ├── AccountCard.ts   # 账号卡片 + 实例控制 + 公网 IP
             ├── HistoryModal.ts  # ECharts 历史流量弹窗
             ├── SettingsModal.ts # 设置弹窗（6 个标签页）
+            ├── CronEditor.ts    # 五字段 Cron 编辑器 + 预览
             ├── LogDrawer.ts     # 操作与审计日志抽屉
             └── ToastStack.ts    # 提示条容器
 ```
@@ -304,7 +311,7 @@ debug  同 info
 
 ### 业务逻辑
 
-#### Cron（`*/15 * * * *`）
+#### Cron（`*/5 * * * *`）
 
 ```text
 1. housekeeping（每日一次，锁保护）
@@ -312,13 +319,22 @@ debug  同 info
 2. 逐账号：CDT 流量 + 余额 + 该地域 ECS 实例 → 写快照 → 采样历史
 3. 额度判定：任一池（内地 / 非内地）超出各自额度
      首次超限 → 标记账期 + 通知 [+ 停机（stop_and_notify）]
-4. 定时关机（60 分钟窗口，失败下轮重试）
+4. 定时关机（10 分钟窗口，失败下轮重试）
 5. 定时开机（同窗口，受熔断闸门约束）
 6. 抢占式保活（见下方闸门）
-7. 每日日报（60 分钟窗口，当天仅一次）
+7. 每日日报（10 分钟窗口，当天仅一次）
 ```
 
-窗口取 60 分钟：巡检间隔 15 分钟，一次网络抖动后下一轮还能补上。
+窗口取 10 分钟（与上游一致）：巡检间隔 5 分钟，每个触发点有准点与 +5 分钟两次尝试机会。
+
+#### 定时开关机的两种模式
+
+| 模式 | 配置 | 去重方式 |
+|---|---|---|
+| 简单 | 每日 `HH:MM` | 按本地日期，当天只执行一次 |
+| 进阶 | 五字段 Cron（分 时 日 月 周） | 按「上次执行的触发时刻」，同一触发只执行一次 |
+
+进阶模式用「触发时刻」而非日期去重，`*/30 * * * *` 这类高频表达式也能逐次生效。
 
 #### 抢占式保活
 
@@ -390,6 +406,7 @@ debug  同 info
 | `DELETE` | `/api/v1/sessions[/{sid}]` | 踢下线（指定 / 其它全部） |
 | `POST` | `/api/v1/settings/notify-test` | 测试通知 → 202 |
 | `POST` | `/api/v1/reports/daily` | 立即推送日报 → 202 |
+| `POST` | `/api/v1/cron/preview` | 校验 Cron 表达式并预览未来几次触发 |
 
 错误体格式 `{ "error": "...", "code": "..." }`，`code` 取值：
 
@@ -402,7 +419,7 @@ debug  同 info
 | 表 | 用途 |
 |---|---|
 | `settings` | KV 配置（时区、日报、TG/Bark 密文、Turnstile 密文） |
-| `accounts` | 阿里云账号（AK、加密 Secret、地域、实例 ID、告警阈值、策略、定时、保活） |
+| `accounts` | 阿里云账号（AK、加密 Secret、地域、实例 ID、告警阈值、策略、定时/ Cron、保活） |
 | `account_snapshots` | 每账号一行最新状态，首页只读此表 |
 | `traffic_hourly` / `traffic_daily` | 流量采样（账期累计值），索引 `(account_id, recorded_at)` |
 | `jobs` | 异步任务状态 |

@@ -31,6 +31,7 @@ import {
   type PushLevel,
   type SessionDevice,
   type SettingsResponse,
+  type ScheduleMode,
   type SiteType,
   type StopMode,
   type TelegramUpdate,
@@ -46,11 +47,14 @@ import {
   onEscape,
   replaceChildren,
   sectionTitle,
+  segmented,
   subtleEmpty,
   textInput,
   toggleRow,
 } from '@/lib/dom'
+import { cronEditor } from '@/components/CronEditor'
 import { icons, type IconNode } from '@/lib/icons'
+import { currentMode, setThemeMode, type ThemeMode } from '@/lib/theme'
 import { afterSettingsChanged, pushDailyReport, testNotification } from '@/lib/actions'
 import { toast } from '@/lib/store'
 
@@ -103,6 +107,10 @@ interface AccountForm {
   stopMode: StopMode
   scheduleStart: string
   scheduleStop: string
+  /** 定时模式：简单（每日 HH:MM）/ 进阶（五字段 Cron） */
+  scheduleMode: ScheduleMode
+  scheduleStartCron: string
+  scheduleStopCron: string
   spotKeepAlive: boolean
   enabled: boolean
 }
@@ -122,6 +130,9 @@ function blankAccountForm(): AccountForm {
     stopMode: 'StopCharging',
     scheduleStart: '',
     scheduleStop: '',
+    scheduleMode: 'simple',
+    scheduleStartCron: '',
+    scheduleStopCron: '',
     spotKeepAlive: false,
     enabled: true,
   }
@@ -142,6 +153,9 @@ function formFromAccount(account: AccountDto): AccountForm {
     stopMode: account.stop_mode,
     scheduleStart: account.schedule_start_time ?? '',
     scheduleStop: account.schedule_stop_time ?? '',
+    scheduleMode: account.schedule_mode === 'advanced' ? 'advanced' : 'simple',
+    scheduleStartCron: account.schedule_start_cron ?? '',
+    scheduleStopCron: account.schedule_stop_cron ?? '',
     spotKeepAlive: account.spot_keep_alive,
     enabled: account.enabled,
   }
@@ -220,6 +234,7 @@ export class SettingsModal {
   }
   private reportDraft = { enabled: false, time: '09:00' }
   private timezoneDraft = 'UTC+8'
+  private themeDraft: ThemeMode = currentMode()
   private advancedDraft = { logLevel: 'error', jobLockMinutes: 10, sessionDays: 14 }
 
   private devices: SessionDevice[] = []
@@ -709,6 +724,27 @@ export class SettingsModal {
       this.form.scheduleStop = value
     }, { placeholder: '23:00' })
 
+    // 进阶模式下的两个 Cron 编辑器
+    const scheduleTimezone = this.settings?.timezone ?? 'UTC+8'
+    const startCronEditor = cronEditor({
+      label: '定时开机',
+      value: form.scheduleStartCron,
+      timezone: scheduleTimezone,
+      defaultTime: { hour: 8, minute: 0 },
+      onChange: (value) => {
+        this.form.scheduleStartCron = value
+      },
+    })
+    const stopCronEditor = cronEditor({
+      label: '定时关机',
+      value: form.scheduleStopCron,
+      timezone: scheduleTimezone,
+      defaultTime: { hour: 23, minute: 0 },
+      onChange: (value) => {
+        this.form.scheduleStopCron = value
+      },
+    })
+
     const fields = el(
       'div',
       { class: 'form-grid account-fields' },
@@ -797,8 +833,38 @@ export class SettingsModal {
           },
         ),
       ),
-      field('每日定时开机', scheduleStart),
-      field('每日定时关机', scheduleStop),
+      el(
+        'div',
+        { class: 'account-fields__full cron-mode-row' },
+        el('span', { class: 'cron-mode-row__label', text: '定时方式' }),
+        segmented<ScheduleMode>({
+          value: form.scheduleMode,
+          items: [
+            ['simple', '每日时间'],
+            ['advanced', 'Cron 表达式'],
+          ],
+          onChange: (value) => {
+            this.form.scheduleMode = value
+            this.renderContent()
+          },
+        }),
+      ),
+      ...(form.scheduleMode === 'advanced'
+        ? [
+            el(
+              'div',
+              { class: 'account-fields__full cron-stack' },
+              el('span', { class: 'cron-stack__label', text: '定时开机' }),
+              startCronEditor,
+            ),
+            el(
+              'div',
+              { class: 'account-fields__full cron-stack' },
+              el('span', { class: 'cron-stack__label', text: '定时关机' }),
+              stopCronEditor,
+            ),
+          ]
+        : [field('每日定时开机', scheduleStart), field('每日定时关机', scheduleStop)]),
       el(
         'div',
         { class: 'account-fields__full toggle-list' },
@@ -823,7 +889,10 @@ export class SettingsModal {
         'p',
         { class: 'field-hint account-fields__full' },
         el('span', {
-          text: '时间格式 HH:MM，留空表示不启用。保活与定时开关可同时开启：定时关机后不再拉起，定时开机后若被抢占回收则由保活补上。',
+          text:
+            form.scheduleMode === 'advanced'
+              ? '五字段 Cron（分 时 日 月 周），留空表示不启用。保活与定时开关可同时开启：定时关机后不再拉起，定时开机后若被抢占回收则由保活补上。'
+              : '时间格式 HH:MM，留空表示不启用。保活与定时开关可同时开启：定时关机后不再拉起，定时开机后若被抢占回收则由保活补上。',
         }),
       ),
     )
@@ -881,6 +950,9 @@ export class SettingsModal {
       stop_mode: form.stopMode,
       schedule_start_time: form.scheduleStart.trim() || null,
       schedule_stop_time: form.scheduleStop.trim() || null,
+      schedule_mode: form.scheduleMode,
+      schedule_start_cron: form.scheduleStartCron.trim() || null,
+      schedule_stop_cron: form.scheduleStopCron.trim() || null,
       spot_keep_alive: form.spotKeepAlive,
       enabled: form.enabled,
     }
@@ -894,7 +966,7 @@ export class SettingsModal {
       if (form.id === null) {
         const created = await api.createAccount(payload)
         // 新建账号还没有快照，不立即采集的话卡片会一直是空的，
-        // 要等到下一轮 Cron（最长 15 分钟）才有数据。
+        // 要等到下一轮 Cron（最长 5 分钟）才有数据。
         // 采集失败不阻断创建：账号已经建好了，卡片会显示「等待首次同步」。
         let collected = true
         try {
@@ -1272,6 +1344,24 @@ export class SettingsModal {
         el(
           'div',
           { class: 'form-grid settings-form' },
+          // 外观是浏览器本地偏好，不进 D1，所以单独一颗、不参与底栏保存
+          field(
+            '外观主题',
+            segmented<ThemeMode>({
+              value: this.themeDraft,
+              items: [
+                ['light', '浅色'],
+                ['dark', '深色'],
+                ['system', '跟随系统'],
+              ],
+              onChange: (value) => {
+                this.themeDraft = value
+                setThemeMode(value)
+                // 重建当前页，让分段选中态跟着变
+                this.renderSystem()
+              },
+            }),
+          ),
           field('系统时区', tzSelect),
           field(
             '日志级别',
