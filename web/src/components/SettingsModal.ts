@@ -55,7 +55,7 @@ import {
 } from '@/lib/dom'
 import { cronInput } from '@/components/CronEditor'
 import { icons, type IconNode } from '@/lib/icons'
-import { LOG_FILTERS, logRow, type LogFilterKey } from '@/lib/logs'
+import { LOG_FILTERS, logRow, maskInstanceId, type LogFilterKey } from '@/lib/logs'
 import { currentMode, setThemeMode, type ThemeMode } from '@/lib/theme'
 import { afterSettingsChanged, pushDailyReport, testNotification } from '@/lib/actions'
 import { toast } from '@/lib/store'
@@ -407,6 +407,8 @@ export class SettingsModal {
       min?: string
       step?: string
       required?: boolean
+      /** 有值时默认掩码显示，聚焦后才展示明文，避免截图/录屏泄露。 */
+      masked?: boolean
     } = {},
   ): HTMLElement {
     const input = textInput({
@@ -418,7 +420,33 @@ export class SettingsModal {
       step: options.step,
     })
     if (options.required) input.required = true
-    input.addEventListener('input', () => onInput(input.value))
+
+    // 掩码只影响「没在编辑时」的显示：
+    //   未聚焦 → i-bp1…klmn
+    //   聚焦   → 真实值，方便查看与修改
+    //   失焦   → 再掩回去（用当前值，用户改过也照样掩）
+    // 空值时没有可掩的内容，退化成普通输入框。
+    let current = initial
+    let revealed = false
+    const paint = (): void => {
+      input.value = revealed || !current ? current : maskInstanceId(current)
+    }
+    if (options.masked && initial) {
+      input.addEventListener('focus', () => {
+        revealed = true
+        paint()
+      })
+      input.addEventListener('blur', () => {
+        revealed = false
+        paint()
+      })
+      paint()
+    }
+    input.addEventListener('input', () => {
+      current = input.value
+      onInput(current)
+    })
+
     return inputShell({ icon: options.icon, input, suffix: options.suffix })
   }
 
@@ -803,7 +831,7 @@ export class SettingsModal {
         '实例 ID *',
         this.line(form.instanceId, (value) => {
           this.form.instanceId = value
-        }, { placeholder: 'i-bp…', required: true }),
+        }, { placeholder: 'i-bp…', required: true, masked: true }),
       ),
       field(
         '告警阈值（GB）',
