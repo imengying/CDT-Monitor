@@ -27,25 +27,6 @@ fn race<T>(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::pin::pin;
-    use std::task::{Context, Waker};
-
-    #[test]
-    fn stalled_operation_is_cancelled_and_ready_operation_completes() {
-        let mut cx = Context::from_waker(Waker::noop());
-        let mut stalled = pin!(race(std::future::pending::<()>(), std::future::ready(())));
-        assert!(matches!(
-            stalled.as_mut().poll(&mut cx),
-            Poll::Ready(Err(_))
-        ));
-        let mut ready = pin!(race(std::future::ready(42), std::future::pending()));
-        assert_eq!(ready.as_mut().poll(&mut cx), Poll::Ready(Ok(42)));
-    }
-}
-
 /// 极简 `join`：两个 future 都完成后返回各自结果。
 pub fn join2<A, B, FA, FB>(fa: FA, fb: FB) -> impl Future<Output = (A, B)>
 where
@@ -108,4 +89,23 @@ pub async fn fetch_text(request: worker::Request, ms: u64) -> Result<(u16, Strin
     })
     .await
     .map_err(str::to_string)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::pin;
+    use std::task::{Context, Waker};
+
+    #[test]
+    fn stalled_operation_is_cancelled_and_ready_operation_completes() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut stalled = pin!(race(std::future::pending::<()>(), std::future::ready(())));
+        assert!(matches!(
+            stalled.as_mut().poll(&mut cx),
+            Poll::Ready(Err(_))
+        ));
+        let mut ready = pin!(race(std::future::ready(42), std::future::pending()));
+        assert_eq!(ready.as_mut().poll(&mut cx), Poll::Ready(Ok(42)));
+    }
 }
