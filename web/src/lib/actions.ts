@@ -132,8 +132,8 @@ export async function refreshAll(): Promise<void> {
   try {
     // 后端在部分失败时返回 success + 说明文案，全部失败时才 failed。
     // 两种情况都刷新界面：失败也需要看到最新的 warning 日志。
-    await api.refreshAll()
-    toast('账号已刷新', 'ok')
+    const job = await api.refreshAll()
+    toast(job.result_msg ?? '账号已刷新', job.result_msg?.includes('注意：') ? 'warn' : 'ok')
   } catch (error) {
     reportError(error, '刷新失败')
   } finally {

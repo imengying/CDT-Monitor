@@ -734,6 +734,13 @@ pub struct SnapshotRow {
     pub billing_month: String,
     pub instances_json: String,
     pub threshold_triggered_month: Option<String>,
+    pub threshold_limit_gb: Option<f64>,
+    pub threshold_notified_month: Option<String>,
+    pub threshold_stop_status: Option<String>,
+    pub traffic_updated_at: Option<i64>,
+    pub balance_updated_at: Option<i64>,
+    pub instances_updated_at: Option<i64>,
+    pub sync_errors_json: String,
     pub updated_at: i64,
 }
 
@@ -838,6 +845,10 @@ pub struct SnapshotUpdate {
     pub cdt_overseas_bytes: i64,
     pub billing_month: String,
     pub instances: Vec<InstanceInfo>,
+    pub traffic_updated_at: Option<i64>,
+    pub balance_updated_at: Option<i64>,
+    pub instances_updated_at: Option<i64>,
+    pub sync_errors: Vec<String>,
     pub updated_at: i64,
 }
 
@@ -867,6 +878,9 @@ pub struct JobRow {
     pub error_msg: Option<String>,
     pub created_at: i64,
     pub finished_at: Option<i64>,
+    pub result_msg: Option<String>,
+    pub payload_json: Option<String>,
+    pub started_at: Option<i64>,
 }
 
 impl JobRow {
@@ -877,6 +891,7 @@ impl JobRow {
             job_type: JobType::from_db(&self.job_type),
             status: JobStatus::from_db(&self.status),
             error_msg: self.error_msg.clone(),
+            result_msg: self.result_msg.clone(),
             created_at: self.created_at,
             finished_at: self.finished_at,
         }
@@ -1419,6 +1434,12 @@ pub struct AccountOverview {
     /// 本月是否已触发流量熔断（熔断后禁止任何自动/手动开机）。
     pub threshold_triggered: bool,
     pub snapshot_updated_at: Option<i64>,
+    pub traffic_updated_at: Option<i64>,
+    pub balance_updated_at: Option<i64>,
+    pub instances_updated_at: Option<i64>,
+    pub sync_errors: Vec<String>,
+    pub traffic_current: bool,
+    pub threshold_stop_status: Option<String>,
     pub instances: Vec<InstanceInfo>,
 }
 
@@ -1440,6 +1461,7 @@ pub struct JobDto {
     pub error_msg: Option<String>,
     pub created_at: i64,
     pub finished_at: Option<i64>,
+    pub result_msg: Option<String>,
 }
 
 /// 流量历史响应。
@@ -1711,9 +1733,18 @@ pub fn build_overview(
         balance_credit,
         traffic_used_gb: used_gb,
         percentage: percent_of(used_gb, quota_gb),
-        billing_month: month,
+        billing_month: month.clone(),
         threshold_triggered: triggered,
         snapshot_updated_at: updated_at,
+        traffic_updated_at: snapshot.and_then(|s| s.traffic_updated_at),
+        balance_updated_at: snapshot.and_then(|s| s.balance_updated_at),
+        instances_updated_at: snapshot.and_then(|s| s.instances_updated_at),
+        sync_errors: snapshot
+            .map(|s| serde_json::from_str(&s.sync_errors_json).unwrap_or_default())
+            .unwrap_or_default(),
+        threshold_stop_status: snapshot.and_then(|s| s.threshold_stop_status.clone()),
+        traffic_current: snapshot
+            .is_some_and(|s| s.billing_month == month && s.traffic_updated_at.is_some()),
         instances,
     }
 }
@@ -2075,6 +2106,13 @@ mod tests {
                 r#"[{"instance_id":"i-bp1real","status":"Running","public_ip":"1.2.3.4"}]"#
                     .to_string(),
             threshold_triggered_month: None,
+            threshold_limit_gb: None,
+            threshold_notified_month: None,
+            threshold_stop_status: None,
+            traffic_updated_at: None,
+            balance_updated_at: None,
+            instances_updated_at: None,
+            sync_errors_json: "[]".to_string(),
             updated_at: 1_700_000_000_000,
         };
 

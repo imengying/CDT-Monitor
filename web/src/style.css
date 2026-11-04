@@ -2439,3 +2439,6 @@ h3 {
   padding: 4px 0;
   overscroll-behavior: contain;
 }
+
+.sync-status { font-size: 12px; line-height: 1.6; margin: 12px 0; overflow-wrap: anywhere; }
+.sync-status summary { cursor: pointer; }

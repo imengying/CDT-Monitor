@@ -378,7 +378,7 @@ export class App {
     let running = 0
     let triggered = 0
     for (const account of accounts) {
-      totalUsedGb += account.traffic_used_gb
+      totalUsedGb += account.traffic_current ? account.traffic_used_gb : 0
       if (account.threshold_triggered) triggered += 1
       for (const instance of account.instances) {
         if (instance.status.toLowerCase() === 'running') running += 1

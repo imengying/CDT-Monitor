@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "bash scripts/build-ci.sh",
-    "build:worker": "worker-build --release",
+    "build:worker": "worker-build --release --locked",
     "build:web": "bun run --cwd web build",
     "install:web": "bun install --cwd web",
     "dev": "bun run build:web && bunx wrangler dev",
@@ -22,9 +22,12 @@
     "typecheck:web": "bun run --cwd web typecheck",
     "lint": "cargo clippy --target wasm32-unknown-unknown -- -D warnings",
     "check": "cargo check --target wasm32-unknown-unknown",
-    "check:config": "bun run scripts/check-config.ts"
+    "check:config": "bun run scripts/check-config.ts",
+    "test:worker": "worker-build --release --locked && node tests/worker.mjs",
+    "test": "cargo test --locked && bun run typecheck:web && bun run check:config"
   },
   "devDependencies": {
-    "wrangler": "^4.40.0"
+    "wrangler": "^4.40.0",
+    "miniflare": "5.20261019.2-beta"
   }
 }

@@ -42,7 +42,7 @@ use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha1::Sha1;
-use worker::{Delay, Fetch, Headers, Method, Request, RequestInit};
+use worker::{Delay, Headers, Method, Request, RequestInit};
 
 use crate::crypto::{CryptoError, random_hex};
 use crate::models::{AccountRow, InstanceInfo, QuotaPool, SiteType, StopMode};
@@ -370,16 +370,9 @@ impl AliyunClient {
         let request = Request::new_with_init(&url, &init)
             .map_err(|e| AliyunError::Local(format!("构造请求失败：{e}")))?;
 
-        let mut response = Fetch::Request(request)
-            .send()
+        let (status, body) = crate::runtime::fetch_text(request, 4_000)
             .await
-            .map_err(|e| AliyunError::Network(format!("{e}")))?;
-
-        let status = response.status_code();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| AliyunError::Network(format!("读取响应失败：{e}")))?;
+            .map_err(AliyunError::Network)?;
 
         parse_rpc_response(status, &body, action)
     }
@@ -967,7 +960,16 @@ pub async fn sync_account(
 ) -> AccountSync {
     let mut out = AccountSync::default();
 
-    match client.query_cdt_traffic().await {
+    let instance_id = instance_filter.unwrap_or_default().trim();
+    let (traffic, (balance, instance)) = crate::runtime::join2(
+        client.query_cdt_traffic(),
+        crate::runtime::join2(
+            client.query_balance(),
+            client.describe_instance(region_id, instance_id),
+        ),
+    )
+    .await;
+    match traffic {
         Ok(traffic) => {
             if traffic.items == 0 {
                 out.warnings
@@ -988,7 +990,7 @@ pub async fn sync_account(
             .push(format!("CDT 流量查询失败：{}", err.short())),
     }
 
-    match client.query_balance().await {
+    match balance {
         Ok(balance) => out.balance = Some(balance),
         Err(err) => out.warnings.push(format!("余额查询失败：{}", err.short())),
     }
@@ -1000,7 +1002,7 @@ pub async fn sync_account(
                 .push("未配置实例 ID，跳过实例状态查询".to_string());
             return out;
         };
-        match client.describe_instance(region_id, instance_id).await {
+        match instance {
             // 查不到通常意味着实例已被释放，保留上次快照并提示，不要把卡片清空
             Ok(None) => out.warnings.push(format!(
                 "{region_id} 未找到实例 {instance_id}（可能已释放）"

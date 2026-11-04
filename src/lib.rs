@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! fetch(req, env, ctx)
-//!   ├─ 非 /api/*  → 转发给 ASSETS 绑定（Vue 静态资源，SPA 回退）
+//!   ├─ 非 /api/*  → 转发给 ASSETS 绑定（前端静态资源，SPA 回退）
 //!   └─ /api/*     → 路由分发
 //!        ├─ 公开路由：/auth/session、/auth/login、/auth/logout
 //!        └─ 受保护路由：校验 Cookie 里的 HMAC Token
@@ -17,7 +17,7 @@
 //! * 登录：Turnstile token 送 `challenges.cloudflare.com/turnstile/v0/siteverify`，
 //!   同时带上 `CF-Connecting-IP`。校验通过后再比对管理员密码。
 //! * 会话：`HMAC-SHA256(MASTER_KEY)` 签名的无状态 Token，写入
-//!   `HttpOnly; Secure; SameSite=Strict` Cookie；D1 里没有 Session 表。
+//!   `HttpOnly; Secure; SameSite=Strict` Cookie；D1 sessions 表支持撤销。
 //! * 所有写接口额外校验 `Origin`/`Referer` 与 `Sec-Fetch-Site`，作为
 //!   SameSite=Strict 之外的纵深防御。
 //!
@@ -41,13 +41,16 @@ pub mod aliyun;
 pub mod cron;
 pub mod crypto;
 pub mod db;
+mod jobs;
 pub mod models;
 pub mod notify;
+pub mod runtime;
 pub mod scheduler;
+use jobs::{JobTask, spawn_job};
 
 use serde::Serialize;
 use worker::{
-    Context, Env, Fetch, Headers, Method, Request, Response, ResponseBuilder, ScheduleContext,
+    Context, Env, Headers, Method, Request, Response, ResponseBuilder, ScheduleContext,
     ScheduledEvent, event,
 };
 
@@ -190,16 +193,15 @@ impl AppCtx {
 
     /// 读取 Turnstile 配置（来自 D1 的 `settings` 表）。
     ///
-    /// **未配置即关闭**：`enabled` 为 false 或密钥不全时一律不校验，
-    /// 登录只比对用户名 + 密码。这样自部署可以先跑起来，
-    /// 需要人机校验时再去后台填两个 key。
+    /// 用于公开登录页的展示；只有配置完整才渲染组件。
+    /// 登录请求另由 turnstile_gate 检查，已启用但损坏的配置会拒绝登录。
     async fn turnstile_config(&self) -> TurnstileConfig {
         let mut config: TurnstileConfig = self
             .db
             .get_json_setting(setting_key::TURNSTILE)
             .await
             .unwrap_or_default();
-        // 密钥不全时强制视为关闭，避免出现「前端不渲染组件、后端仍要求 token」
+        // 缺少完整配置时不向浏览器下发不可用组件。
         config.enabled = config.enabled && config.is_complete();
         config
     }
@@ -220,14 +222,15 @@ impl AppCtx {
     /// 两者若都返回 `None`，私钥解密失败（如 `MASTER_KEY` 已轮换）时
     /// 校验会被静默跳过，人机校验失效且无任何提示。
     async fn turnstile_gate(&self) -> TurnstileGate {
-        let config: TurnstileConfig = self
-            .db
-            .get_json_setting(setting_key::TURNSTILE)
-            .await
-            .unwrap_or_default();
-
-        if !config.enabled || !config.is_complete() {
+        let config: TurnstileConfig = match self.db.get_json_setting(setting_key::TURNSTILE).await {
+            Ok(config) => config,
+            Err(_) => return TurnstileGate::Broken,
+        };
+        if !config.enabled {
             return TurnstileGate::Disabled;
+        }
+        if !config.is_complete() {
+            return TurnstileGate::Broken;
         }
 
         let enc = config.secret_enc.as_deref().unwrap_or_default();
@@ -328,16 +331,7 @@ async fn verify_turnstile(
     )
     .map_err(|e| format!("构造 Turnstile 请求失败：{e}"))?;
 
-    let mut response = Fetch::Request(request)
-        .send()
-        .await
-        .map_err(|e| format!("Turnstile 请求失败：{e}"))?;
-
-    let status = response.status_code();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("读取 Turnstile 响应失败：{e}"))?;
+    let (status, body) = runtime::fetch_text(request, 8_000).await?;
 
     if !(200..300).contains(&status) {
         return Err(format!("Turnstile 返回 HTTP {status}：{body}"));
@@ -440,6 +434,22 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
         return error_response_with_code(403, "跨站请求被拒绝", "cross_origin");
     }
 
+    let ip = client_ip(&req).unwrap_or_else(|| "unknown".into());
+    let bucket = format!("ip:{}", blake3::hash(ip.as_bytes()).to_hex());
+    if !app
+        .db
+        .allow_login(&bucket, now_ms(), 10, 5 * 60_000)
+        .await?
+    {
+        let mut response = error_response_with_code(
+            429,
+            "登录尝试过于频繁，请 5 分钟后重试",
+            "login_rate_limited",
+        )?;
+        response.headers_mut().set("Retry-After", "300")?;
+        return Ok(response);
+    }
+
     let payload: LoginRequest = match read_json(&mut req).await {
         Ok(payload) => payload,
         Err(err) => return error_response(400, err),
@@ -453,7 +463,7 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
     match app.turnstile_gate().await {
         TurnstileGate::Disabled => {}
         TurnstileGate::Broken => {
-            log_error!("Turnstile 已启用但私钥无法解密，拒绝登录（请检查 MASTER_KEY）");
+            log_error!("Turnstile 配置读取、完整性或解密检查失败，拒绝登录");
             return error_response_with_code(
                 500,
                 "人机校验配置异常，请联系管理员检查私钥与 MASTER_KEY",
@@ -462,7 +472,13 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
         }
         TurnstileGate::Required(secret) => {
             let ip = client_ip(&req);
-            match verify_turnstile(&secret, &payload.turnstile_token, ip.as_deref()).await {
+            match runtime::timeout(
+                8_000,
+                verify_turnstile(&secret, &payload.turnstile_token, ip.as_deref()),
+            )
+            .await
+            .unwrap_or_else(|e| Err(e.into()))
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     sleep_ms(LOGIN_FAILURE_DELAY_MS).await;
@@ -834,9 +850,17 @@ async fn handle_clear_logs(app: &AppCtx, req: &Request) -> worker::Result<Respon
 }
 
 /// `GET /api/v1/jobs/{id}` 与 `GET /api/v1/jobs`
-async fn handle_job(app: &AppCtx, job_id: &str) -> worker::Result<Response> {
+async fn handle_job(ctx: &Context, app: &AppCtx, job_id: &str) -> worker::Result<Response> {
+    app.db.recover_jobs(now_ms()).await?;
     match app.db.get_job(job_id).await? {
-        Some(job) => ok(&job.to_dto()),
+        Some(job) => {
+            if job.status == "pending" {
+                let env = app.env.clone();
+                let id = job.id.clone();
+                ctx.wait_until(Box::pin(jobs::execute_job(env, id)));
+            }
+            ok(&job.to_dto())
+        }
         None => error_response(404, "任务不存在"),
     }
 }
@@ -1361,258 +1385,6 @@ async fn handle_update_timezone(app: &AppCtx, mut req: Request) -> worker::Resul
 // 异步 Job
 // ===========================================================================
 
-/// 异步任务的具体内容。Job 行只记录状态，参数随闭包一起进入 `wait_until`。
-#[derive(Debug, Clone)]
-enum JobTask {
-    RefreshAll,
-    RefreshAccount {
-        account_id: i64,
-    },
-    StartInstance {
-        account_id: i64,
-        instance_id: String,
-    },
-    StopInstance {
-        account_id: i64,
-        instance_id: String,
-    },
-    NotifyTest {
-        channel: Option<NotifyChannel>,
-    },
-    DailyReport,
-}
-
-impl JobTask {
-    fn job_type(&self) -> JobType {
-        match self {
-            JobTask::RefreshAll => JobType::RefreshAll,
-            JobTask::RefreshAccount { .. } => JobType::RefreshAccount,
-            JobTask::StartInstance { .. } => JobType::StartInstance,
-            JobTask::StopInstance { .. } => JobType::StopInstance,
-            JobTask::NotifyTest { .. } => JobType::NotifyTest,
-            JobTask::DailyReport => JobType::DailyReport,
-        }
-    }
-
-    fn account_id(&self) -> Option<i64> {
-        match self {
-            JobTask::RefreshAll | JobTask::NotifyTest { .. } | JobTask::DailyReport => None,
-            JobTask::RefreshAccount { account_id }
-            | JobTask::StartInstance { account_id, .. }
-            | JobTask::StopInstance { account_id, .. } => Some(*account_id),
-        }
-    }
-
-    /// 需要 D1 级互斥锁的任务名（跨实例防止并发重复执行）。
-    ///
-    /// 只给「会打阿里云且开销较大」的刷新类任务上锁：全局刷新与单账号刷新。
-    /// 开关机由阿里云自身的幂等语义 + 调度器的实例级锁兜底，无需额外锁；
-    /// 通知测试与日报是纯副作用，重复执行无害。
-    fn lock_name(&self) -> Option<String> {
-        match self {
-            JobTask::RefreshAll => Some("job:refresh_all".to_string()),
-            JobTask::RefreshAccount { account_id } => Some(format!("job:refresh:{account_id}")),
-            _ => None,
-        }
-    }
-}
-
-/// 执行一个 Job：置 running → 跑任务 → 置 success/failed → 释放互斥锁。
-async fn execute_job(env: Env, job_id: String, task: JobTask) {
-    let db = Db::new(&env);
-    let lock_name = task.lock_name();
-    if let Err(err) = db.start_job(&job_id).await {
-        log_error!("任务 {job_id} 置为 running 失败：{err}");
-        release_job_lock(&db, lock_name.as_deref(), &job_id).await;
-        return;
-    }
-
-    let scheduler = match Scheduler::new(&env).await {
-        Ok(scheduler) => scheduler,
-        Err(err) => {
-            let text = err.to_string();
-            log_error!("任务 {job_id} 初始化失败：{text}");
-            let _ = db.finish_job_failed(&job_id, &text, now_ms()).await;
-            release_job_lock(&db, lock_name.as_deref(), &job_id).await;
-            return;
-        }
-    };
-
-    let result: worker::Result<String> = match task {
-        JobTask::RefreshAll => {
-            let outcomes = scheduler.refresh_all().await;
-            if outcomes.is_empty() {
-                Err(worker::Error::RustError(
-                    "没有任何启用的账号可刷新".to_string(),
-                ))
-            } else {
-                // 如实汇报：部分失败时不能谎报「全部已刷新」，
-                // 否则用户会以为数据是新的。
-                let failed: Vec<String> = outcomes
-                    .iter()
-                    .filter(|outcome| !outcome.success)
-                    .map(|outcome| {
-                        let reason = outcome.warnings.first().cloned().unwrap_or_default();
-                        if reason.is_empty() {
-                            outcome.account_name.clone()
-                        } else {
-                            format!("{}（{reason}）", outcome.account_name)
-                        }
-                    })
-                    .collect();
-
-                if failed.is_empty() {
-                    Ok(format!("{} 个账号已刷新", outcomes.len()))
-                } else if failed.len() == outcomes.len() {
-                    Err(worker::Error::RustError(format!(
-                        "全部 {} 个账号刷新失败：{}",
-                        failed.len(),
-                        failed.join("；")
-                    )))
-                } else {
-                    Ok(format!(
-                        "{}/{} 个账号刷新成功；失败：{}",
-                        outcomes.len() - failed.len(),
-                        outcomes.len(),
-                        failed.join("；")
-                    ))
-                }
-            }
-        }
-        JobTask::RefreshAccount { account_id } => match db.get_account(account_id).await {
-            Ok(Some(account)) => {
-                let outcome = scheduler.refresh_account(&account).await;
-                if outcome.success {
-                    Ok(format!(
-                        "{} 已刷新：国内 {} / 海外 {}",
-                        outcome.account_name,
-                        crate::models::human_bytes(outcome.domestic_bytes),
-                        crate::models::human_bytes(outcome.overseas_bytes)
-                    ))
-                } else {
-                    Err(worker::Error::RustError(if outcome.warnings.is_empty() {
-                        "刷新失败".to_string()
-                    } else {
-                        outcome.warnings.join("；")
-                    }))
-                }
-            }
-            Ok(None) => Err(worker::Error::RustError("账号不存在".to_string())),
-            Err(err) => Err(err),
-        },
-        JobTask::StartInstance {
-            account_id,
-            instance_id,
-        } => scheduler
-            .instance_action(account_id, &instance_id, true)
-            .await
-            .map(|result| result.detail),
-        JobTask::StopInstance {
-            account_id,
-            instance_id,
-        } => scheduler
-            .instance_action(account_id, &instance_id, false)
-            .await
-            .map(|result| result.detail),
-        JobTask::NotifyTest { channel } => {
-            let outcome = scheduler.test_notification(channel).await;
-            if outcome.results.is_empty() {
-                Err(worker::Error::RustError(
-                    "未启用任何通知渠道，请先在设置中配置".to_string(),
-                ))
-            } else if outcome.any_success() {
-                Ok(outcome.summary())
-            } else {
-                Err(worker::Error::RustError(outcome.summary()))
-            }
-        }
-        JobTask::DailyReport => scheduler.push_daily_report().await,
-    };
-
-    match result {
-        Ok(detail) => {
-            log_info!("任务 {job_id} 完成：{detail}");
-            if let Err(err) = db.finish_job_success(&job_id, now_ms()).await {
-                log_error!("任务 {job_id} 收尾失败：{err}");
-            }
-        }
-        Err(err) => {
-            let text = err.to_string();
-            log_error!("任务 {job_id} 失败：{text}");
-            if let Err(inner) = db.finish_job_failed(&job_id, &text, now_ms()).await {
-                log_error!("任务 {job_id} 收尾失败：{inner}");
-            }
-        }
-    }
-
-    release_job_lock(&db, lock_name.as_deref(), &job_id).await;
-}
-
-/// 释放 Job 互斥锁（owner 不匹配时不会误删）。
-async fn release_job_lock(db: &Db, lock_name: Option<&str>, owner: &str) {
-    if let Some(name) = lock_name
-        && let Err(err) = db.release_lock(name, owner).await
-    {
-        log_error!("释放任务锁 {name} 失败：{err}");
-    }
-}
-
-/// 建 Job 行 → `ctx.wait_until` 派生执行 → 立刻返回 202。
-async fn spawn_job(ctx: &Context, app: &AppCtx, task: JobTask) -> worker::Result<Response> {
-    let job_type = task.job_type();
-    let account_id = task.account_id();
-
-    // 先确认账号存在：jobs 表对 account_id 有外键，直接插入会得到
-    // 「FOREIGN KEY constraint failed」并被翻译成 500，掩盖了真实原因
-    // （账号已被删除或 ID 手误）。在这里提前给出 404。
-    if let Some(id) = account_id
-        && app.db.get_account(id).await?.is_none()
-    {
-        return error_response(404, "账号不存在");
-    }
-
-    let job_id =
-        crate::crypto::random_id().map_err(|err| worker::Error::RustError(err.to_string()))?;
-
-    // 跨实例互斥：同一刷新任务在 TTL 内只允许一个执行者。
-    // 用 job_id 作为锁 owner，收尾时按 owner 释放，避免误删他人的锁。
-    let lock_name = task.lock_name();
-    if let Some(name) = lock_name.as_deref() {
-        let acquired = app
-            .db
-            .acquire_lock(name, &job_id, now_ms(), app.job_lock_ttl_ms())
-            .await?;
-        if !acquired {
-            return error_response_with_code(409, "同类任务正在执行中，请稍后再试", "job_locked");
-        }
-    }
-
-    if let Err(err) = app
-        .db
-        .create_job(&job_id, account_id, job_type, now_ms())
-        .await
-    {
-        release_job_lock(&app.db, lock_name.as_deref(), &job_id).await;
-        return Err(err);
-    }
-
-    let env = app.env.clone();
-    let job_id_for_task = job_id.clone();
-    ctx.wait_until(async move {
-        execute_job(env, job_id_for_task, task).await;
-    });
-
-    json_response(
-        &AcceptedJob {
-            job_id,
-            status: JobStatus::Pending,
-            job_type,
-        },
-        202,
-        None,
-    )
-}
-
 // ===========================================================================
 // 路由
 // ===========================================================================
@@ -1685,7 +1457,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
 
         // ------------------------------------------------------------ 任务
         (Method::Get, ["jobs"]) => handle_job_list(&app, &req).await,
-        (Method::Get, ["jobs", id]) => handle_job(&app, id).await,
+        (Method::Get, ["jobs", id]) => handle_job(&ctx, &app, id).await,
         (Method::Post, ["refresh"]) => spawn_job(&ctx, &app, JobTask::RefreshAll).await,
 
         // ------------------------------------------------------------ 账号
@@ -1826,6 +1598,9 @@ async fn serve_asset(env: &Env, req: Request) -> worker::Result<Response> {
 /// HTTP 入口。
 #[event(fetch, respond_with_errors)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
+    std::panic::set_hook(Box::new(|info| {
+        worker::console_error!("Worker panic: {info}")
+    }));
     // 日志级别来自 D1（后台「设置 → 系统」），因此要先读配置再决定级别。
     // 读失败时保持默认的 error，不影响请求处理。
     let log_level = Db::new(&env)
@@ -1871,7 +1646,14 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
         }
     };
 
+    let db = Db::new(&env);
+    let _ = db.recover_jobs(now_ms()).await;
     let report = scheduler.run_cron().await;
+    if let Ok(pending) = db.pending_jobs().await {
+        for job in pending {
+            jobs::execute_job(env.clone(), job.id).await;
+        }
+    }
     log_info!("Cron 汇总：{}", report.summary());
 
     if report.accounts_failed > 0 || report.thresholds_fired > 0 {

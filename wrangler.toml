@@ -35,7 +35,8 @@ compatibility_date = "2026-10-01"
 
 # 强制全局 fetch 只走公网：本 Worker 要访问阿里云、Telegram、Bark 等
 # 第三方服务，走公网才是预期行为，避免误命中同账号内的私有来源。
-compatibility_flags = ["global_fetch_strictly_public"]
+# worker::Delay 使用 Web 标准的数字 timer ID，禁用 Node.js Timeout 对象。
+compatibility_flags = ["global_fetch_strictly_public", "no_nodejs_global_timers"]
 
 workers_dev = true
 

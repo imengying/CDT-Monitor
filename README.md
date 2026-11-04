@@ -143,7 +143,7 @@
 | `BUN_VERSION` | `1.4.4` |
 
 > [!IMPORTANT]
-> 这一项**必须配**。Cloudflare 构建镜像预装的是 Bun 1.2.5，不指定版本就会用旧版编译，可能直接失败。`build-ci.sh` 检测到版本不符会自行装指定版本；完全没设时脚本直接报错退出。
+> 这一项**必须配**。Cloudflare 构建镜像预装的是 Bun 1.2.5，不指定版本就会用旧版编译，可能直接失败。`build-ci.sh` 检测到版本不符会自行装指定版本；本地未设置时使用已安装的 Bun；云端请显式设置版本。
 
 点 **部署**（Deploy）。
 
@@ -203,9 +203,12 @@ cdt-monitor/
 │   └── deploy.ts                # 部署入口：建库 → 迁移 → 发布
 ├── migrations/
 │   ├── init_001.sql             # 9 张表 + 12 个索引
-│   └── init_002_schedule_cron.sql  # 增量：定时模式与 Cron 字段
+│   ├── init_002_schedule_cron.sql  # 增量：定时模式与 Cron 字段
+│   └── init_003_reliability.sql  # 增量：分项采集状态、任务恢复、登录限流
 ├── src/
-│   ├── lib.rs                   # fetch / scheduled 入口、路由、鉴权、Job 执行器
+│   ├── lib.rs                   # fetch / scheduled 入口、路由、鉴权
+│   ├── jobs.rs                  # D1 任务执行器与批量进度
+│   ├── runtime.rs               # 并发请求、超时与取消
 │   ├── models.rs                # D1 实体行 + 前后端 DTO + 时区/单位换算
 │   ├── db.rs                    # D1 SQL 封装（含幂等锁）
 │   ├── crypto.rs                # XChaCha20-Poly1305、无状态 Token
@@ -213,7 +216,9 @@ cdt-monitor/
 │   ├── cron.rs                  # Cron 表达式解析与触发窗口判定
 │   ├── aliyun.rs                # RPC V1 签名器 + CDT/ECS/BSS 客户端
 │   ├── notify.rs                # Telegram + Bark
-│   └── scheduler.rs             # 采样 / 熔断 / 定时开关机 / 保活 / 日报
+│   ├── scheduler.rs             # 采样 / 巡检 / 日报
+│   └── scheduler/              # 熔断、定时开关机与保活
+├── tests/worker.mjs             # 本地 Worker + D1 业务回归
 └── web/
     ├── package.json
     ├── tsconfig.json
@@ -296,10 +301,11 @@ debug  同 info
 | 环节 | 实现 |
 |---|---|
 | 人机校验 | Turnstile `siteverify`，携带 `CF-Connecting-IP` 作为 `remoteip`；前端 `appearance: 'interaction-only'`，无交互需求时不渲染可见元素 |
-| 开关 | 未配置 Site Key 与 Secret Key 时不校验；启用后私钥解密失败返回 `turnstile_broken` 并拒绝登录 |
+| 开关 | 默认关闭；配置损坏，或启用后密钥不完整、无法解密，均返回 `turnstile_broken` 并拒绝登录 |
 | 凭证来源 | `ADMIN_USERNAME` / `ADMIN_PASSWORD`，唯一来源 |
 | 比较方式 | 用户名与密码均常量时间比较且不短路 |
 | 防枚举 | 用户名错与密码错返回同一提示，延迟一致 |
+| 登录限流 | 每个来源 IP 每 5 分钟最多 10 次尝试，D1 原子计数 |
 | 会话 | `v1.<payload>.<sig>`，`HMAC-SHA256(MASTER_KEY)` 签名，payload 含 `iat` / `exp` / `jti` |
 | 传输 | `HttpOnly; Secure; SameSite=Strict` Cookie |
 
@@ -320,7 +326,7 @@ debug  同 info
      清理过期锁 / 32 天前历史 / 32 天前日志 / 7 天前 Job
 2. 逐账号：CDT 流量 + 余额 + 该地域 ECS 实例 → 写快照 → 采样历史
 3. 额度判定：任一池（内地 / 非内地）超出各自额度
-     首次超限 → 标记账期 + 通知 [+ 停机（stop_and_notify）]
+     首次超限 → 标记账期；每轮核实停机，失败重试；通知送达后去重
 4. 定时关机（10 分钟窗口，失败下轮重试）
 5. 定时开机（同窗口，受熔断闸门约束）
 6. 抢占式保活（见下方闸门）
@@ -345,7 +351,7 @@ debug  同 info
 1. 账号级与实例级保活开关都开启
 2. 当前处于「允许运行时段」（只配关机时间时，关机后即不再保活）
 3. 未触发流量熔断
-4. 今天还没执行过定时关机
+4. 简单模式避让刚执行的定时关机；Cron 模式按最近的开/关触发判断当前应运行状态（同刻关机优先）
 
 > [!WARNING]
 > 在允许运行时段内手动停止已开启保活的实例，必须先在面板关闭该实例的保活开关，否则下一次 Cron 巡检会将它重新拉起。
@@ -360,7 +366,7 @@ debug  同 info
 
 #### 采集失败的处理
 
-- CDT 查询失败 → 沿用上次快照流量值，不写 0
+- CDT 查询失败 → 沿用上次快照流量值及原账期，不用上月数据触发本月熔断
 - 余额查询失败 → 沿用上次快照
 - 实例查询失败 → 沿用该账号旧实例，卡片不会变空
 - 逐实例保活开关 → 按 `instance_id` 从旧快照继承
@@ -375,12 +381,23 @@ debug  同 info
   "job_type": "start_instance",
   "status": "pending|running|success|failed",
   "error_msg": null,
+  "result_msg": null,
   "created_at": 1792948752627,
   "finished_at": null
 }
 ```
 
-刷新类任务以 D1 锁跨实例互斥（owner = `job_id`，收尾按 owner 释放），并发提交返回 `409 job_locked`。
+刷新任务按范围、手动启停任务按实例以 D1 锁互斥（owner = `job_id`，收尾按 owner 释放），并发提交返回 `409 job_locked`。未完成批量任务的锁保留到任务完成或超时回收，分段等待期间也不会重复提交。
+
+任务参数与批量进度存入 D1。批量刷新每段处理一个账号，任务轮询或每五分钟 Cron 继续推进；每段预算 25 秒，账号刷新预算 20 秒，阿里云单次请求预算 4 秒（含响应体）。`running` 超过 60 秒会标记失败并释放任务锁，不自动重放结果不确定的启停指令。成功结果通过 `result_msg` 返回，包含部分采集失败的说明。
+
+熔断后会持续核实实例状态，直到确认停止；通知失败也会重试。提高阈值或将其设为 0 后，需成功刷新流量且满足新阈值才解除熔断，界面会记录解除日志。各项最近成功采集时间和本次错误可在账号卡片展开查看。
+
+登录接口每个来源 IP 在五分钟窗口内最多接受 10 次尝试（含并发请求），超出返回 `429` 和 `Retry-After`。已启用的人机校验在配置损坏或读取失败时拒绝登录。
+
+本次升级新增 `init_003_reliability.sql`，通过现有部署脚本先迁移再发布。迁移会将旧版尚未完成的任务标记失败，需要重新提交；存量快照的分项成功时间在下次成功采集时补齐。
+
+`wrangler.toml` 保留 `no_nodejs_global_timers`，使 Rust SDK 的超时定时器使用数字 ID。配置自检会检查此项；删除后可能导致 Wasm 定时器运行异常。
 
 ---
 
@@ -428,6 +445,7 @@ debug  同 info
 | `action_logs` | 自动化动作 / 告警 / 登录审计 |
 | `sessions` | 登录设备，用于踢下线 |
 | `locks` | 幂等锁，TTL 到期可抢占 |
+| `login_attempts` | 登录来源固定时间窗口计数，过期自动清理 |
 
 时间戳统一 Unix 毫秒 `INTEGER`；布尔存 `0/1`（Rust 侧以 `i64` 承载后转换，`serde-wasm-bindgen` 反序列化 `bool` 只接受 JS `true/false`）。
 
@@ -516,9 +534,10 @@ curl http://localhost:8787/cdn-cgi/local/scheduled
 #### 4. 测试与构建校验
 
 ```bash
-cargo test                                                     # 92 个单元测试
+cargo test --locked                                            # 单元测试
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 bun run typecheck:web
 bun run check:config
+bun run test:worker                                            # 本地 Worker + D1 流程测试（云接口模拟）
 bun run build
 ```

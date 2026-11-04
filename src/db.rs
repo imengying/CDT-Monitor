@@ -44,6 +44,10 @@ fn j_i64(value: i64) -> JsValue {
     JsValue::from_f64(value as f64)
 }
 
+fn j_opt_i64(value: Option<i64>) -> JsValue {
+    value.map(j_i64).unwrap_or(JsValue::NULL)
+}
+
 fn j_f64(value: f64) -> JsValue {
     JsValue::from_f64(value)
 }
@@ -181,9 +185,8 @@ impl Db {
         T: DeserializeOwned + Default,
     {
         match self.get_setting(key).await? {
-            Some(raw) if !raw.trim().is_empty() => {
-                Ok(serde_json::from_str(&raw).unwrap_or_default())
-            }
+            Some(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw)
+                .map_err(|e| worker::Error::RustError(format!("配置 {key} 格式错误：{e}"))),
             _ => Ok(T::default()),
         }
     }
@@ -459,8 +462,9 @@ impl Db {
             "INSERT INTO account_snapshots (
                 account_id, balance_amount, balance_currency, balance_cash, balance_credit,
                 cdt_domestic_bytes, cdt_overseas_bytes, billing_month,
-                instances_json, threshold_triggered_month, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                instances_json, threshold_triggered_month, updated_at,
+                traffic_updated_at, balance_updated_at, instances_updated_at, sync_errors_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
              ON CONFLICT(account_id) DO UPDATE SET
                 balance_amount = excluded.balance_amount,
                 balance_currency = excluded.balance_currency,
@@ -471,6 +475,10 @@ impl Db {
                 billing_month = excluded.billing_month,
                 instances_json = excluded.instances_json,
                 updated_at = excluded.updated_at,
+                traffic_updated_at = excluded.traffic_updated_at,
+                balance_updated_at = excluded.balance_updated_at,
+                instances_updated_at = excluded.instances_updated_at,
+                sync_errors_json = excluded.sync_errors_json,
                 threshold_triggered_month = CASE
                     WHEN account_snapshots.threshold_triggered_month = excluded.billing_month
                         THEN account_snapshots.threshold_triggered_month
@@ -487,6 +495,10 @@ impl Db {
                 j_text(&update.billing_month),
                 j_text(&instances_json),
                 j_i64(update.updated_at),
+                j_opt_i64(update.traffic_updated_at),
+                j_opt_i64(update.balance_updated_at),
+                j_opt_i64(update.instances_updated_at),
+                j_text(&serde_json::to_string(&update.sync_errors).unwrap_or_default()),
             ],
         )
         .await?;
@@ -498,16 +510,18 @@ impl Db {
         &self,
         account_id: i64,
         month: &str,
+        limit_gb: f64,
         now_ms: i64,
     ) -> Result<()> {
         self.exec(
             "INSERT INTO account_snapshots (
                 account_id, balance_amount, balance_currency,
                 cdt_domestic_bytes, cdt_overseas_bytes, billing_month,
-                instances_json, threshold_triggered_month, updated_at
-             ) VALUES (?, NULL, NULL, 0, 0, ?, '[]', ?, ?)
+                instances_json, threshold_triggered_month, updated_at, threshold_limit_gb
+             ) VALUES (?, NULL, NULL, 0, 0, ?, '[]', ?, ?, ?)
              ON CONFLICT(account_id) DO UPDATE SET
                 threshold_triggered_month = excluded.threshold_triggered_month,
+                threshold_limit_gb = excluded.threshold_limit_gb,
                 billing_month = excluded.billing_month,
                 updated_at = excluded.updated_at",
             &[
@@ -515,7 +529,31 @@ impl Db {
                 j_text(month),
                 j_text(month),
                 j_i64(now_ms),
+                j_f64(limit_gb),
             ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_threshold(&self, account_id: i64) -> Result<()> {
+        self.exec("UPDATE account_snapshots SET threshold_triggered_month = NULL, threshold_limit_gb = NULL, threshold_notified_month = NULL, threshold_stop_status = NULL WHERE account_id = ?", &[j_i64(account_id)]).await?;
+        Ok(())
+    }
+
+    pub async fn set_threshold_stop_status(&self, account_id: i64, status: &str) -> Result<()> {
+        self.exec(
+            "UPDATE account_snapshots SET threshold_stop_status = ? WHERE account_id = ?",
+            &[j_text(status), j_i64(account_id)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_threshold_notified(&self, account_id: i64, month: &str) -> Result<()> {
+        self.exec(
+            "UPDATE account_snapshots SET threshold_notified_month = ? WHERE account_id = ?",
+            &[j_text(month), j_i64(account_id)],
         )
         .await?;
         Ok(())
@@ -526,14 +564,14 @@ impl Db {
         &self,
         account_id: i64,
         instances: &[InstanceInfo],
-        now_ms: i64,
+        _now_ms: i64,
     ) -> Result<()> {
         let instances_json = serde_json::to_string(instances)
             .map_err(|e| worker::Error::RustError(format!("实例列表序列化失败：{e}")))?;
         let changed = self
             .exec(
-                "UPDATE account_snapshots SET instances_json = ?, updated_at = ? WHERE account_id = ?",
-                &[j_text(&instances_json), j_i64(now_ms), j_i64(account_id)],
+                "UPDATE account_snapshots SET instances_json = ? WHERE account_id = ?",
+                &[j_text(&instances_json), j_i64(account_id)],
             )
             .await?;
         if changed == 0 {
@@ -630,11 +668,12 @@ impl Db {
         id: &str,
         account_id: Option<i64>,
         job_type: JobType,
+        payload: &str,
         now_ms: i64,
     ) -> Result<()> {
         self.exec(
-            "INSERT INTO jobs (id, account_id, job_type, status, error_msg, created_at, finished_at)
-             VALUES (?, ?, ?, 'pending', NULL, ?, NULL)",
+            "INSERT INTO jobs (id, account_id, job_type, status, error_msg, created_at, finished_at, payload_json)
+             VALUES (?, ?, ?, 'pending', NULL, ?, NULL, ?)",
             &[
                 j_text(id),
                 match account_id {
@@ -643,27 +682,44 @@ impl Db {
                 },
                 j_text(job_type.as_str()),
                 j_i64(now_ms),
+                j_text(payload),
             ],
         )
         .await?;
         Ok(())
     }
 
-    /// 置为 `running`。
-    pub async fn start_job(&self, id: &str) -> Result<()> {
-        self.exec(
-            "UPDATE jobs SET status = 'running' WHERE id = ?",
-            &[j_text(id)],
-        )
-        .await?;
+    /// 原子领取一段任务，轮询、Cron 和初始请求只能有一个执行者。
+    pub async fn claim_job(&self, id: &str, now: i64) -> Result<bool> {
+        Ok(self.exec("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ? AND status = 'pending'",
+            &[j_i64(now), j_text(id)]).await? > 0)
+    }
+
+    pub async fn continue_job(&self, id: &str, payload: &str) -> Result<()> {
+        self.exec("UPDATE jobs SET status = 'pending', payload_json = ?, started_at = NULL WHERE id = ? AND status = 'running'", &[j_text(payload), j_text(id)]).await?;
         Ok(())
     }
 
+    pub async fn recover_jobs(&self, now: i64) -> Result<()> {
+        self.exec("UPDATE jobs SET status = 'failed', error_msg = '执行中断或超时，请刷新实例状态后重新提交', finished_at = ? WHERE (status = 'running' AND COALESCE(started_at, created_at) <= ?) OR (status = 'pending' AND created_at <= ?)",
+            &[j_i64(now), j_i64(now - 60_000), j_i64(now - 24 * 60 * 60 * 1000)]).await?;
+        self.exec("DELETE FROM locks WHERE owner IN (SELECT id FROM jobs WHERE status IN ('failed', 'success'))", &[]).await?;
+        Ok(())
+    }
+
+    pub async fn pending_jobs(&self) -> Result<Vec<JobRow>> {
+        self.query(
+            "SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at LIMIT 10",
+            &[],
+        )
+        .await
+    }
+
     /// 置为 `success`。
-    pub async fn finish_job_success(&self, id: &str, now_ms: i64) -> Result<()> {
+    pub async fn finish_job_success(&self, id: &str, detail: &str, now_ms: i64) -> Result<()> {
         self.exec(
-            "UPDATE jobs SET status = 'success', error_msg = NULL, finished_at = ? WHERE id = ?",
-            &[j_i64(now_ms), j_text(id)],
+            "UPDATE jobs SET status = 'success', error_msg = NULL, finished_at = ?, result_msg = ? WHERE id = ? AND status = 'running'",
+            &[j_i64(now_ms), j_text(&truncate(detail, 900)), j_text(id)],
         )
         .await?;
         Ok(())
@@ -672,7 +728,7 @@ impl Db {
     /// 置为 `failed` 并记录错误。
     pub async fn finish_job_failed(&self, id: &str, error: &str, now_ms: i64) -> Result<()> {
         self.exec(
-            "UPDATE jobs SET status = 'failed', error_msg = ?, finished_at = ? WHERE id = ?",
+            "UPDATE jobs SET status = 'failed', error_msg = ?, finished_at = ? WHERE id = ? AND status IN ('pending', 'running')",
             &[j_text(&truncate(error, 900)), j_i64(now_ms), j_text(id)],
         )
         .await?;
@@ -825,6 +881,7 @@ impl Db {
     /// 尝试获取锁；已存在且未过期时返回 `false`。
     ///
     /// 用「插入或抢占过期锁」的单条语句实现，天然并发安全。
+    /// 未完成任务的锁保留到任务收尾或 recover_jobs 回收，避免分段期间重复提交。
     pub async fn acquire_lock(
         &self,
         name: &str,
@@ -838,7 +895,9 @@ impl Db {
                 "INSERT INTO locks (name, owner, expires_at) VALUES (?, ?, ?)
                  ON CONFLICT(name) DO UPDATE SET
                     owner = excluded.owner, expires_at = excluded.expires_at
-                 WHERE locks.expires_at <= ?",
+                 WHERE locks.expires_at <= ? AND NOT EXISTS (
+                    SELECT 1 FROM jobs WHERE jobs.id = locks.owner AND jobs.status IN ('pending', 'running')
+                 )",
                 &[
                     j_text(name),
                     j_text(owner),
@@ -863,8 +922,33 @@ impl Db {
 
     /// 清理已过期的锁。
     pub async fn purge_locks(&self, now_ms: i64) -> Result<usize> {
-        self.exec("DELETE FROM locks WHERE expires_at <= ?", &[j_i64(now_ms)])
-            .await
+        self.exec(
+            "DELETE FROM locks WHERE expires_at <= ? AND NOT EXISTS (
+                SELECT 1 FROM jobs WHERE jobs.id = locks.owner AND jobs.status IN ('pending', 'running')
+             )",
+            &[j_i64(now_ms)],
+        ).await
+    }
+
+    /// 固定窗口原子计数：并发请求不能绕过额度，超额请求不继续写库。
+    pub async fn allow_login(
+        &self,
+        bucket: &str,
+        now: i64,
+        limit: i64,
+        window_ms: i64,
+    ) -> Result<bool> {
+        Ok(self.exec("INSERT INTO login_attempts (bucket, attempts, expires_at) VALUES (?, 1, ?) ON CONFLICT(bucket) DO UPDATE SET attempts = CASE WHEN login_attempts.expires_at <= ? THEN 1 ELSE login_attempts.attempts + 1 END, expires_at = CASE WHEN login_attempts.expires_at <= ? THEN excluded.expires_at ELSE login_attempts.expires_at END WHERE login_attempts.expires_at <= ? OR login_attempts.attempts < ?",
+            &[j_text(bucket), j_i64(now + window_ms), j_i64(now), j_i64(now), j_i64(now), j_i64(limit)]).await? > 0)
+    }
+
+    pub async fn purge_login_attempts(&self, now: i64) -> Result<()> {
+        self.exec(
+            "DELETE FROM login_attempts WHERE expires_at <= ?",
+            &[j_i64(now)],
+        )
+        .await?;
+        Ok(())
     }
 
     // =======================================================================

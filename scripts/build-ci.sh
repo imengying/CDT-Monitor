@@ -3,7 +3,7 @@
 # Cloudflare Workers Builds 构建脚本
 # ============================================================================
 # Cloudflare 构建环境只有 Node，无 Rust 与 worker-build，本脚本负责
-# 安装工具链并完成构建，可重复执行（产物新于源码时直接复用）。
+# 安装工具链并完成构建，可重复执行（每次重建前端，Rust 使用 Cargo 的依赖缓存）。
 #
 # 调用来源：
 #   1. Dashboard → Settings → Build → Build command
@@ -23,28 +23,6 @@ cd "$ROOT"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*"; }
-
-# ---------------------------------------------------------------------------
-# 0a. 结构校验：拦截部署成功但运行时失败的配置缺失
-# ---------------------------------------------------------------------------
-if [ -f scripts/check-config.ts ]; then
-  log "配置自检"
-  bun run scripts/check-config.ts || {
-    echo "错误：wrangler.toml 配置自检未通过（见上方提示）" >&2
-    exit 1
-  }
-fi
-
-# ---------------------------------------------------------------------------
-# 0b. 幂等：产物比源码新就直接复用
-# ---------------------------------------------------------------------------
-if [ -f build/worker/shim.mjs ] && [ -f web/dist/index.html ]; then
-  if [ -z "$(find src Cargo.toml Cargo.lock web/src web/index.html web/package.json \
-              -newer build/worker/shim.mjs 2>/dev/null)" ]; then
-    log "已是最新构建，跳过（build/worker/shim.mjs 存在且比源码新）"
-    exit 0
-  fi
-fi
 
 # ---------------------------------------------------------------------------
 # 1. Bun
@@ -74,6 +52,8 @@ if [ "$installed" != "$BUN_VERSION" ]; then
   export PATH="$BUN_INSTALL/bin:$PATH"
 fi
 log "Bun: $(bun --version)"
+log "配置自检"
+bun run scripts/check-config.ts
 
 # ---------------------------------------------------------------------------
 # 2. Rust 工具链
@@ -110,10 +90,7 @@ if ! command -v worker-build >/dev/null 2>&1; then
   # 在临时目录里安装：避免 rust-toolchain.toml 覆盖工具链导致
   # "default toolchain implicitly overridden by rustup toolchain file"。
   #
-  # 不加 --locked：crate 自带的 Cargo.lock 会锁定依赖的精确版本，
-  # 一旦其中某个版本被 crates.io yank，安装就会失败或告警
-  # （曾出现 yoke-derive 0.8.3 被 yank）。交给 cargo 自行解析版本。
-  ( cd "$(mktemp -d)" && cargo +stable install worker-build --version 0.8.7 )
+  ( cd "$(mktemp -d)" && cargo +stable install worker-build --version 0.8.7 --locked )
 fi
 log "worker-build: $(command -v worker-build)"
 
@@ -121,14 +98,17 @@ log "worker-build: $(command -v worker-build)"
 # 4. 依赖安装
 # ---------------------------------------------------------------------------
 log "安装根依赖（wrangler）"
-bun install --frozen-lockfile || bun install
+bun install --frozen-lockfile
 
 log "安装前端依赖"
-( cd web && { bun install --frozen-lockfile || bun install; } )
+( cd web && bun install --frozen-lockfile )
 
 # ---------------------------------------------------------------------------
 # 5. 构建前端
 # ---------------------------------------------------------------------------
+log "前端类型检查"
+bun run typecheck:web
+
 log "构建前端 → web/dist"
 ( cd web && bun run build )
 
@@ -141,7 +121,7 @@ fi
 # 6. 构建 Worker（Rust → Wasm）
 # ---------------------------------------------------------------------------
 log "构建 Worker → build/worker/shim.mjs"
-worker-build --release
+worker-build --release --locked
 
 if [ ! -f build/worker/shim.mjs ]; then
   echo "错误：Worker 构建失败，build/worker/shim.mjs 不存在" >&2

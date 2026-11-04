@@ -11,7 +11,7 @@
  * 直到接口返回，避免连点触发服务端 409。
  */
 
-import { api, humanAmount, relativeTime, type AccountOverview, type InstanceInfo } from '@/api/client'
+import { formatTime, api, humanAmount, relativeTime, type AccountOverview, type InstanceInfo } from '@/api/client'
 import { el, iconSvg, iconButton, replaceChildren } from '@/lib/dom'
 import { icons, type IconNode } from '@/lib/icons'
 import { preloadHistoryChart } from '@/components/HistoryModal'
@@ -97,6 +97,9 @@ function signatureOf(account: AccountOverview): string {
     used: account.traffic_used_gb,
     percent: account.percentage,
     triggered: account.threshold_triggered,
+    stopStatus: account.threshold_stop_status,
+    freshness: [account.traffic_updated_at, account.balance_updated_at, account.instances_updated_at, account.traffic_current],
+    errors: account.sync_errors,
     instances: account.instances.map((instance) => ({
       id: instance.instance_id,
       status: instance.status,
@@ -171,7 +174,21 @@ export class AccountCard {
       },
       this.buildHeader(),
       this.buildTrafficBlock(),
+      this.buildSyncStatus(),
       this.buildFooter(),
+    )
+  }
+
+  private buildSyncStatus(): HTMLElement {
+    const account = this.account
+    const source = (label: string, at: number | null) => `${label}：${at ? formatTime(at) : '尚无成功采集'}`
+    return el('details', { class: 'sync-status' },
+      el('summary', { text: account.sync_errors.length ? '采集异常 · 查看详情' : '查看各项更新时间' }),
+      el('div', { text: source('流量', account.traffic_updated_at) }),
+      el('div', { text: source('余额', account.balance_updated_at) }),
+      el('div', { text: source('实例', account.instances_updated_at) }),
+      account.threshold_triggered && account.over_limit_action === 'stop_and_notify' ? el('div', { text: account.threshold_stop_status === 'confirmed' ? '熔断停机：已确认停止' : '熔断停机：尚未确认，将继续重试' }) : null,
+      ...account.sync_errors.map(text => el('div', { text })),
     )
   }
 
@@ -295,7 +312,7 @@ export class AccountCard {
   /** 流量区：大号数字 + 进度条 + 百分比与阈值。 */
   private buildTrafficBlock(): HTMLElement {
     const account = this.account
-    const percent = account.percentage
+    const percent = account.traffic_current ? account.percentage : 0
     const fill = account.threshold_triggered
       ? 'danger'
       : percent >= 80
@@ -328,8 +345,8 @@ export class AccountCard {
         el(
           'div',
           {},
-          el('span', { text: '本月 CDT 流量' }),
-          el('strong', { text: account.traffic_used_gb.toFixed(2) }),
+          el('span', { text: account.traffic_current ? '本月 CDT 流量' : '本月 CDT 流量 · 等待采集' }),
+          el('strong', { text: account.traffic_current ? account.traffic_used_gb.toFixed(2) : '—' }),
           el('small', { text: ` / ${account.quota_gb.toFixed(0)} GB` }),
         ),
         historyButton,
@@ -345,7 +362,7 @@ export class AccountCard {
       el(
         'div',
         { class: 'progress-meta' },
-        el('span', { text: `${percent.toFixed(2)}% 已使用` }),
+        el('span', { text: account.traffic_current ? `${percent.toFixed(2)}% 已使用` : '等待本月流量' }),
         el('span', {
           text:
             account.traffic_threshold_gb > 0
@@ -515,11 +532,12 @@ export class AccountCard {
     if (this.busy.has('refresh')) return
     this.markBusy('refresh', true)
     try {
-      await api.refreshAccount(this.account.id)
-      toast('实例状态已刷新', 'ok')
+      const job = await api.refreshAccount(this.account.id)
+      toast(job.result_msg ?? '实例状态已刷新', job.result_msg?.includes('注意：') ? 'warn' : 'ok')
       await afterAccountChanged()
     } catch (error) {
       reportError(error, '刷新失败')
+      await afterAccountChanged()
     } finally {
       this.markBusy('refresh', false)
     }

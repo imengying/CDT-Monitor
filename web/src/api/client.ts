@@ -135,6 +135,12 @@ export interface AccountOverview {
   billing_month: string
   threshold_triggered: boolean
   snapshot_updated_at: number | null
+  traffic_updated_at: number | null
+  balance_updated_at: number | null
+  instances_updated_at: number | null
+  sync_errors: string[]
+  traffic_current: boolean
+  threshold_stop_status: string | null
   instances: InstanceInfo[]
 }
 
@@ -187,6 +193,7 @@ export interface JobDto {
   job_type: JobType
   status: JobStatus
   error_msg: string | null
+  result_msg: string | null
   created_at: number
   finished_at: number | null
 }
@@ -340,6 +347,8 @@ export interface BarkUpdate {
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
   body?: unknown
+  signal?: AbortSignal
+  timeoutMs?: number
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -354,6 +363,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     },
     // 禁用缓存，确保拿到最新快照
     cache: 'no-store',
+    signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(options.timeoutMs ?? 30_000)]) : AbortSignal.timeout(options.timeoutMs ?? 30_000),
   }
 
   if (body !== undefined) {
@@ -362,14 +372,17 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
 
   let response: Response
+  let text: string
   try {
     response = await fetch(path, init)
+    text = await response.text()
   } catch {
+    if (options.signal?.aborted) throw new ApiError('操作已取消', 0, 'aborted')
+    if (init.signal?.aborted) throw new ApiError('请求超时，请刷新状态后重试', 0, 'timeout')
     throw new ApiError('网络异常，请检查连接后重试', 0)
   }
 
   const isJson = (response.headers.get('content-type') ?? '').includes('application/json')
-  const text = await response.text()
 
   if (!response.ok) {
     let message = `请求失败（HTTP ${response.status}）`
@@ -403,7 +416,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 export interface PollOptions {
   /** 轮询间隔（毫秒），默认 1200 */
   intervalMs?: number
-  /** 超时（毫秒），默认 180 秒（Worker 的 wait_until 上限远大于此） */
+  /** 超时（毫秒），默认 180 秒；批量任务分段执行，超时后由巡检继续处理 */
   timeoutMs?: number
   /** 每次拿到新状态时回调 */
   onUpdate?: (job: JobDto) => void
@@ -421,7 +434,7 @@ export async function waitForJob(jobId: string, options: PollOptions = {}): Prom
       throw new ApiError('操作已取消', 0, 'aborted')
     }
 
-    const job = await request<JobDto>(`/api/v1/jobs/${encodeURIComponent(jobId)}`)
+    const job = await request<JobDto>(`/api/v1/jobs/${encodeURIComponent(jobId)}`, { signal, timeoutMs: Math.max(1, deadline - Date.now()) })
     onUpdate?.(job)
 
     if (job.status === 'success') {
@@ -432,15 +445,14 @@ export async function waitForJob(jobId: string, options: PollOptions = {}): Prom
     }
 
     await new Promise<void>((resolve) => {
-      const timer = window.setTimeout(resolve, intervalMs)
-      signal?.addEventListener(
-        'abort',
-        () => {
-          window.clearTimeout(timer)
-          resolve()
-        },
-        { once: true },
-      )
+      const done = () => {
+        window.clearTimeout(timer)
+        signal?.removeEventListener('abort', done)
+        resolve()
+      }
+      const timer = window.setTimeout(done, Math.min(intervalMs, Math.max(0, deadline - Date.now())))
+      signal?.addEventListener('abort', done, { once: true })
+      if (signal?.aborted) done()
     })
   }
 

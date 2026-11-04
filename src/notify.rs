@@ -15,12 +15,10 @@
 //! 3. **超时**：Worker 单次 fetch 没有默认超时，这里用 `Delay` 与 fetch
 //!    竞速做 8 秒上限，避免 Cron 被慢接口拖死。
 
-use std::time::Duration;
-
 use serde::Serialize;
 #[cfg(test)]
 use serde_json::json;
-use worker::{Delay, Fetch, Headers, Method, Request, RequestInit};
+use worker::{Headers, Method, Request, RequestInit};
 
 use crate::models::PushLevel;
 
@@ -330,57 +328,7 @@ async fn post_with_timeout(
 
     let request = Request::new_with_init(url, &init).map_err(|e| format!("构造请求失败：{e}"))?;
 
-    // fetch 与定时器竞争：谁先完成用谁。
-    // `Fetch::send(&self)` 借用了 `Fetch`，所以要先把 `Fetch` 绑定到局部变量。
-    let source = Fetch::Request(request);
-    let fetch = source.send();
-    let timeout = Delay::from(Duration::from_millis(REQUEST_TIMEOUT_MS as u64));
-    let raced = futures_race(fetch, timeout).await;
-
-    match raced {
-        RaceResult::First(result) => {
-            let mut response = result.map_err(|e| format!("网络请求失败：{e}"))?;
-            let status = response.status_code();
-            let text = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<读取响应失败：{e}>"));
-            Ok((status, text))
-        }
-        RaceResult::Second(()) => Err(format!("请求超过 {REQUEST_TIMEOUT_MS}ms 未完成")),
-    }
-}
-
-enum RaceResult<T> {
-    First(T),
-    Second(()),
-}
-
-/// 极简的「两个 future 竞速」实现。
-///
-/// 不用 `futures` crate 是为了避免额外依赖；这里只需要「A 完成或超时」，
-/// 因此用 `poll_fn` 手动轮询，超时分支固定返回 `Second(())`。
-async fn futures_race<F, T>(future: F, timeout: worker::Delay) -> RaceResult<T>
-where
-    F: std::future::Future<Output = T>,
-{
-    use std::future::Future;
-    use std::pin::pin;
-    use std::task::Poll;
-
-    let mut future = pin!(future);
-    let mut timeout = pin!(timeout);
-
-    std::future::poll_fn(move |cx| {
-        if let Poll::Ready(value) = future.as_mut().poll(cx) {
-            return Poll::Ready(RaceResult::First(value));
-        }
-        if let Poll::Ready(()) = timeout.as_mut().poll(cx) {
-            return Poll::Ready(RaceResult::Second(()));
-        }
-        Poll::Pending
-    })
-    .await
+    crate::runtime::fetch_text(request, REQUEST_TIMEOUT_MS as u64).await
 }
 
 // ===========================================================================
@@ -545,7 +493,7 @@ pub async fn dispatch(channels: &Channels, message: &Message) -> NotifyOutcome {
         }
     };
 
-    let (telegram_result, bark_result) = join2(telegram_fut, bark_fut).await;
+    let (telegram_result, bark_result) = crate::runtime::join2(telegram_fut, bark_fut).await;
 
     let mut results = Vec::new();
     if let Some(result) = telegram_result {
@@ -555,41 +503,6 @@ pub async fn dispatch(channels: &Channels, message: &Message) -> NotifyOutcome {
         results.push(result);
     }
     NotifyOutcome { results }
-}
-
-/// 极简 `join`：两个 future 都完成后返回各自结果。
-async fn join2<A, B, FA, FB>(fa: FA, fb: FB) -> (A, B)
-where
-    FA: std::future::Future<Output = A>,
-    FB: std::future::Future<Output = B>,
-{
-    use std::pin::pin;
-    use std::task::Poll;
-
-    let mut fa = pin!(fa);
-    let mut fb = pin!(fb);
-    let mut out_a: Option<A> = None;
-    let mut out_b: Option<B> = None;
-
-    std::future::poll_fn(move |cx| {
-        if out_a.is_none()
-            && let Poll::Ready(value) = fa.as_mut().poll(cx)
-        {
-            out_a = Some(value);
-        }
-        if out_b.is_none()
-            && let Poll::Ready(value) = fb.as_mut().poll(cx)
-        {
-            out_b = Some(value);
-        }
-        match (out_a.is_some(), out_b.is_some()) {
-            (true, true) => {
-                Poll::Ready((out_a.take().expect("已就绪"), out_b.take().expect("已就绪")))
-            }
-            _ => Poll::Pending,
-        }
-    })
-    .await
 }
 
 /// 通知渠道测试（设置面板的「测试发送」）。
