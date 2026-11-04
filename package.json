@@ -13,7 +13,7 @@
     "build:worker": "worker-build --release --locked",
     "build:web": "bun run --cwd web build",
     "install:web": "bun install --cwd web",
-    "dev": "bun run build:web && bunx wrangler dev",
+    "dev": "bun run build && bunx wrangler dev",
     "dev:web": "bun run --cwd web dev",
     "deploy": "bun run scripts/deploy.ts",
     "db:migrate:local": "bunx wrangler d1 migrations apply DB --local",

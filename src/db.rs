@@ -455,11 +455,16 @@ impl Db {
     /// `threshold_triggered_month` 不参与普通写入：
     /// * 账期内保留原值（已触发则继续禁止开机）；
     /// * 账期切换（`excluded.billing_month` 与新账期不一致）时自动清空。
-    pub async fn upsert_snapshot(&self, update: &SnapshotUpdate) -> Result<()> {
+    pub async fn upsert_snapshot(
+        &self,
+        update: &SnapshotUpdate,
+        sample: Option<(f64, i64, i64)>,
+    ) -> Result<()> {
         let instances_json = serde_json::to_string(&update.instances)
             .map_err(|e| worker::Error::RustError(format!("实例列表序列化失败：{e}")))?;
-        self.exec(
-            "INSERT INTO account_snapshots (
+        let snapshot = self
+            .stmt(
+                "INSERT INTO account_snapshots (
                 account_id, balance_amount, balance_currency, balance_cash, balance_credit,
                 cdt_domestic_bytes, cdt_overseas_bytes, billing_month,
                 instances_json, threshold_triggered_month, updated_at,
@@ -484,7 +489,8 @@ impl Db {
                         THEN account_snapshots.threshold_triggered_month
                     ELSE NULL
                 END",
-            &[
+            )?
+            .bind(&[
                 j_i64(update.account_id),
                 j_opt_f64(update.balance_amount),
                 j_opt_text(update.balance_currency.as_deref()),
@@ -499,9 +505,12 @@ impl Db {
                 j_opt_i64(update.balance_updated_at),
                 j_opt_i64(update.instances_updated_at),
                 j_text(&serde_json::to_string(&update.sync_errors).unwrap_or_default()),
-            ],
-        )
-        .await?;
+            ])?;
+        let mut statements = vec![snapshot];
+        if let Some((traffic, at, day)) = sample {
+            statements.extend(self.traffic_statements(update.account_id, traffic, at, day)?);
+        }
+        self.conn()?.batch(statements).await?;
         Ok(())
     }
 
@@ -599,30 +608,21 @@ impl Db {
     ///
     /// 小时表与日表各写一行，读的时候分开查 —— 小时表只要最近 25 条、
     /// 日表 31 条，混在一张表里反而要靠时间窗过滤。
-    pub async fn add_traffic_stats(
+    fn traffic_statements(
         &self,
         account_id: i64,
         traffic_gb: f64,
         now_ms: i64,
         day_start_ms: i64,
-    ) -> Result<()> {
+    ) -> Result<Vec<D1PreparedStatement>> {
         let hour = now_ms / 3_600_000 * 3_600_000;
-        let day = day_start_ms;
         let value = traffic_gb.max(0.0);
-
-        self.exec(
-            "INSERT INTO traffic_hourly (account_id, recorded_at, traffic) VALUES (?, ?, ?)
-             ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic",
-            &[j_i64(account_id), j_i64(hour), j_f64(value)],
-        )
-        .await?;
-        self.exec(
-            "INSERT INTO traffic_daily (account_id, recorded_at, traffic) VALUES (?, ?, ?)
-             ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic",
-            &[j_i64(account_id), j_i64(day), j_f64(value)],
-        )
-        .await?;
-        Ok(())
+        Ok(vec![
+            self.stmt("INSERT INTO traffic_hourly (account_id, recorded_at, traffic) VALUES (?, ?, ?) ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic")?
+                .bind(&[j_i64(account_id), j_i64(hour), j_f64(value)])?,
+            self.stmt("INSERT INTO traffic_daily (account_id, recorded_at, traffic) VALUES (?, ?, ?) ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic")?
+                .bind(&[j_i64(account_id), j_i64(day_start_ms), j_f64(value)])?,
+        ])
     }
 
     /// 取最近 N 个小时点 / 天点，按时间升序返回。
@@ -812,12 +812,12 @@ impl Db {
             params.push(j_i64(id));
         }
         if let Some(prefix) = filter.action_prefix.as_deref().filter(|v| !v.is_empty()) {
-            clauses.push("l.action_type LIKE ?");
-            params.push(j_text(&format!("{prefix}%")));
+            clauses.push("instr(l.action_type, ?) = 1");
+            params.push(j_text(prefix));
         }
         if let Some(keyword) = filter.keyword.as_deref().filter(|v| !v.is_empty()) {
-            clauses.push("l.detail LIKE ?");
-            params.push(j_text(&format!("%{keyword}%")));
+            clauses.push("instr(lower(l.detail), lower(?)) > 0");
+            params.push(j_text(keyword));
         }
 
         let where_sql = if clauses.is_empty() {
@@ -858,12 +858,12 @@ impl Db {
             params.push(j_i64(account_id));
         }
         if let Some(prefix) = filter.action_prefix.as_deref().filter(|v| !v.is_empty()) {
-            clauses.push("action_type LIKE ?");
-            params.push(j_text(&format!("{prefix}%")));
+            clauses.push("instr(action_type, ?) = 1");
+            params.push(j_text(prefix));
         }
         if let Some(keyword) = filter.keyword.as_deref().filter(|v| !v.is_empty()) {
-            clauses.push("detail LIKE ?");
-            params.push(j_text(&format!("%{keyword}%")));
+            clauses.push("instr(lower(detail), lower(?)) > 0");
+            params.push(j_text(keyword));
         }
 
         let sql = if clauses.is_empty() {

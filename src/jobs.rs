@@ -75,7 +75,25 @@ impl JobTask {
 }
 
 /// 执行一个 Job：置 running → 跑任务 → 置 success/failed → 释放互斥锁。
-pub(crate) async fn execute_job(env: Env, job_id: String) {
+pub(crate) async fn execute_job(env: Env, job_id: String) -> worker::Result<()> {
+    // 包含领取、初始化、外部调用和数据库收尾的总预算。
+    crate::runtime::timeout(28_000, async {
+        execute_segment(env.clone(), job_id.clone()).await;
+        if let Some(row) = Db::new(&env).get_job(&job_id).await? {
+            match row.status.as_str() {
+                "pending" => crate::tasks::enqueue_job(&env, &job_id).await?,
+                "running" => return Err(worker::Error::RustError("任务仍在执行，稍后核实".into())),
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| worker::Error::RustError(e.into()))?
+}
+
+async fn execute_segment(env: Env, job_id: String) {
+    let began = now_ms();
     let db = Db::new(&env);
     if !matches!(db.claim_job(&job_id, now_ms()).await, Ok(true)) {
         return;
@@ -109,7 +127,7 @@ pub(crate) async fn execute_job(env: Env, job_id: String) {
         }
     };
 
-    let result = crate::runtime::timeout(25_000, async {
+    let result = crate::runtime::timeout((24_000 - (now_ms() - began)).max(1) as u64, async {
         match task {
             JobTask::RefreshAll => Err(worker::Error::RustError("批量任务尚未初始化".into())),
             JobTask::RefreshBatch {
@@ -257,9 +275,9 @@ async fn release_job_lock(db: &Db, lock_name: Option<&str>, owner: &str) {
     }
 }
 
-/// 建 Job 行 → `ctx.wait_until` 派生执行 → 立刻返回 202。
+/// 建 Job 行 → 队列派发 → 返回 202。
 pub(crate) async fn spawn_job(
-    ctx: &Context,
+    _ctx: &Context,
     app: &AppCtx,
     task: JobTask,
 ) -> worker::Result<Response> {
@@ -326,9 +344,10 @@ pub(crate) async fn spawn_job(
         return Err(err);
     }
 
-    let env = app.env.clone();
-    let job_id_for_task = job_id.clone();
-    ctx.wait_until(Box::pin(execute_job(env, job_id_for_task)));
+    // D1 是任务来源；入队失败时保留 pending，由 Cron 重新派发。
+    if let Err(err) = crate::tasks::enqueue_job(&app.env, &job_id).await {
+        log_error!("任务 {job_id} 入队失败，将由巡检补发：{err}");
+    }
 
     json_response(
         &AcceptedJob {

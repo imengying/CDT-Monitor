@@ -9,7 +9,7 @@
 //!        ├─ 公开路由：/auth/session、/auth/login、/auth/logout
 //!        └─ 受保护路由：校验 Cookie 里的 HMAC Token
 //!             ├─ 读接口：直接 await（快）
-//!             └─ 写接口：建 job 行 → ctx.wait_until(执行) → 202 Accepted + job_id
+//!             └─ 写接口：建 job 行 → Queues 派发 → 202 Accepted + job_id
 //! ```
 //!
 //! ## 鉴权
@@ -24,8 +24,8 @@
 //! ## 异步 Job
 //!
 //! 手动刷新、开关机、通知测试、日报推送都走同一个执行器：
-//! 请求线程只做「建 job 行 + 派生任务」，实际调用阿里云的活交给
-//! `ctx.wait_until`，客户端立刻拿到 `202 { job_id }` 并轮询
+//! 请求线程只做「建 job 行 + 入队」，实际调用阿里云的活交给
+//! Cloudflare Queues，客户端立刻拿到 `202 { job_id }` 并轮询
 //! `/api/v1/jobs/{job_id}`。
 
 use std::collections::HashMap;
@@ -46,6 +46,7 @@ pub mod models;
 pub mod notify;
 pub mod runtime;
 pub mod scheduler;
+mod tasks;
 use jobs::{JobTask, spawn_job};
 
 use serde::Serialize;
@@ -69,7 +70,6 @@ use crate::models::{
     TrafficHistoryResponse, TurnstileConfig, TurnstileSettingsDto, TurnstileSettingsUpdate,
     build_overview, is_supported_timezone, now_ms, setting_key,
 };
-use crate::notify::NotifyLevel;
 use crate::scheduler::Scheduler;
 
 // ===========================================================================
@@ -850,17 +850,10 @@ async fn handle_clear_logs(app: &AppCtx, req: &Request) -> worker::Result<Respon
 }
 
 /// `GET /api/v1/jobs/{id}` 与 `GET /api/v1/jobs`
-async fn handle_job(ctx: &Context, app: &AppCtx, job_id: &str) -> worker::Result<Response> {
+async fn handle_job(_ctx: &Context, app: &AppCtx, job_id: &str) -> worker::Result<Response> {
     app.db.recover_jobs(now_ms()).await?;
     match app.db.get_job(job_id).await? {
-        Some(job) => {
-            if job.status == "pending" {
-                let env = app.env.clone();
-                let id = job.id.clone();
-                ctx.wait_until(Box::pin(jobs::execute_job(env, id)));
-            }
-            ok(&job.to_dto())
-        }
+        Some(job) => ok(&job.to_dto()),
         None => error_response(404, "任务不存在"),
     }
 }
@@ -1412,6 +1405,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
         }
     };
 
+    logging::init_from_config(Some(&app.advanced.log_level));
     let method = req.method();
     let segments = path_segments(&req);
 
@@ -1601,15 +1595,6 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
     std::panic::set_hook(Box::new(|info| {
         worker::console_error!("Worker panic: {info}")
     }));
-    // 日志级别来自 D1（后台「设置 → 系统」），因此要先读配置再决定级别。
-    // 读失败时保持默认的 error，不影响请求处理。
-    let log_level = Db::new(&env)
-        .get_advanced_config()
-        .await
-        .ok()
-        .map(|config| config.log_level);
-    logging::init_from_config(log_level.as_deref());
-
     let path = req.path();
 
     if !path.starts_with("/api/") {
@@ -1630,49 +1615,31 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
 
 /// Cron 入口：`*/5 * * * *`。
 #[event(scheduled)]
-pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    let log_level = Db::new(&env)
-        .get_advanced_config()
-        .await
-        .ok()
-        .map(|config| config.log_level);
-    logging::init_from_config(log_level.as_deref());
+pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    if let Err(err) = tasks::dispatch_cron(&env, event.schedule() as i64).await {
+        log_error!("Cron 派发失败：{err}");
+    }
+}
 
-    let scheduler = match Scheduler::new(&env).await {
-        Ok(scheduler) => scheduler,
-        Err(err) => {
-            log_error!("Cron 初始化失败：{err}");
-            return;
-        }
-    };
-
-    let db = Db::new(&env);
-    let _ = db.recover_jobs(now_ms()).await;
-    let report = scheduler.run_cron().await;
-    if let Ok(pending) = db.pending_jobs().await {
-        for job in pending {
-            jobs::execute_job(env.clone(), job.id).await;
+#[event(queue)]
+pub async fn queue(
+    batch: worker::MessageBatch<tasks::TaskMessage>,
+    env: Env,
+    _ctx: Context,
+) -> worker::Result<()> {
+    use worker::MessageExt;
+    let advanced = Db::new(&env).get_advanced_config().await?;
+    logging::init_from_config(Some(&advanced.log_level));
+    for message in batch.messages()? {
+        match tasks::consume(&env, message.body()).await {
+            Ok(()) => message.ack(),
+            Err(err) => {
+                log_error!("队列任务失败，稍后重试：{err}");
+                message.retry();
+            }
         }
     }
-    log_info!("Cron 汇总：{}", report.summary());
-
-    if report.accounts_failed > 0 || report.thresholds_fired > 0 {
-        // 每 6 小时最多一条汇总：持续故障不应该每 5 分钟提醒一次。
-        let bucket = crate::models::now_ms() / (6 * 60 * 60 * 1000);
-        let _ = scheduler
-            .notify_once(
-                &format!("cron-alert:{bucket}"),
-                6 * 60 * 60 * 1000,
-                crate::notify::Message::new(
-                    "CDT-Monitor 巡检异常",
-                    report.summary(),
-                    NotifyLevel::Alert,
-                )
-                .with_details(report.notes.clone())
-                .with_group("CDT-Cron"),
-            )
-            .await;
-    }
+    Ok(())
 }
 
 #[cfg(test)]

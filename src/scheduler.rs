@@ -1,6 +1,6 @@
 //! # 调度器：采样、熔断、定时开关机、抢占式保活、日报
 //!
-//! 每次 Cron（`*/5 * * * *`）走一遍 [`Scheduler::run_cron`]：
+//! 每次 Cron（`*/5 * * * *`）走一遍 [`Scheduler::run_account_cron`]：
 //!
 //! ```text
 //! 1. 清理过期锁 / 旧任务 / 旧日志（每天一次）
@@ -52,9 +52,6 @@ use crate::notify::{
 pub const SCHEDULE_WINDOW_MINUTES: u32 = 10;
 /// 日报的补偿窗口（分钟）。与开关机窗口同宽，与上游一致。
 pub const REPORT_WINDOW_MINUTES: u32 = 10;
-/// 流量采样去重心跳：数值连续不变时，至少每 30 分钟落一个点，
-/// 保证小时粒度图表不断线。
-pub const HISTORY_HEARTBEAT_MS: i64 = 30 * 60 * 1000;
 /// 历史数据保留天数。
 ///
 /// 图表日视图最多 31 个点，更早的采样写了也读不到。
@@ -96,6 +93,8 @@ pub struct RefreshOutcome {
     pub account_name: String,
     /// 流量和实例均查询成功；余额失败作为警告返回。
     pub success: bool,
+    /// 本轮成功读取实例状态；失败时旧快照仅供展示，不能确认定时动作完成。
+    pub instances_fresh: bool,
     pub total_bytes: i64,
     pub domestic_bytes: i64,
     pub overseas_bytes: i64,
@@ -111,6 +110,7 @@ impl RefreshOutcome {
             account_id: account.id,
             account_name: account.name.clone(),
             success: false,
+            instances_fresh: false,
             total_bytes: 0,
             domestic_bytes: 0,
             overseas_bytes: 0,
@@ -317,7 +317,11 @@ impl Scheduler {
         if !acquired {
             return None;
         }
-        Some(self.notify(message).await)
+        let outcome = self.notify(message).await;
+        if !outcome.any_success() {
+            let _ = self.db.release_lock(dedup_key, &owner).await;
+        }
+        Some(outcome)
     }
 
     /// 通知渠道测试。
@@ -491,41 +495,6 @@ impl Scheduler {
                 },
             };
 
-        self.db
-            .upsert_snapshot(&SnapshotUpdate {
-                account_id: account.id,
-                balance_amount,
-                balance_currency,
-                balance_cash,
-                balance_credit,
-                cdt_domestic_bytes: domestic_bytes,
-                cdt_overseas_bytes: overseas_bytes,
-                billing_month: traffic_month,
-                instances: instances.clone(),
-                updated_at: if traffic_fresh || balance_fresh || instances_fresh {
-                    sampled_at
-                } else {
-                    previous.as_ref().map(|s| s.updated_at).unwrap_or(0)
-                },
-                traffic_updated_at: if traffic_fresh {
-                    Some(sampled_at)
-                } else {
-                    previous.as_ref().and_then(|s| s.traffic_updated_at)
-                },
-                balance_updated_at: if balance_fresh {
-                    Some(sampled_at)
-                } else {
-                    previous.as_ref().and_then(|s| s.balance_updated_at)
-                },
-                instances_updated_at: if instances_fresh {
-                    Some(sampled_at)
-                } else {
-                    previous.as_ref().and_then(|s| s.instances_updated_at)
-                },
-                sync_errors: sync.warnings.clone(),
-            })
-            .await?;
-
         // 账号落在哪个额度池由地域决定：中国内地 20 GB、其余（含香港）200 GB。
         // CDT 接口按地域分类汇总，这里取账号所属那一类的累计值。
         let total_bytes = domestic_bytes + overseas_bytes;
@@ -535,14 +504,49 @@ impl Scheduler {
             QuotaPool::Overseas => overseas_bytes,
         });
 
-        // 采样历史：按小时、按天各落一个点，存的是**当月累计用量**。
-        // 同一小时内多次采样覆盖同一个点，所以 5 分钟巡检不会把表撑大。
-        if sync.traffic.is_some() {
-            let day_start = local_day_start_ms(self.now, &self.timezone);
-            self.db
-                .add_traffic_stats(account.id, used_gb, self.now, day_start)
-                .await?;
-        }
+        self.db
+            .upsert_snapshot(
+                &SnapshotUpdate {
+                    account_id: account.id,
+                    balance_amount,
+                    balance_currency,
+                    balance_cash,
+                    balance_credit,
+                    cdt_domestic_bytes: domestic_bytes,
+                    cdt_overseas_bytes: overseas_bytes,
+                    billing_month: traffic_month,
+                    instances: instances.clone(),
+                    updated_at: if traffic_fresh || balance_fresh || instances_fresh {
+                        sampled_at
+                    } else {
+                        previous.as_ref().map(|s| s.updated_at).unwrap_or(0)
+                    },
+                    traffic_updated_at: if traffic_fresh {
+                        Some(sampled_at)
+                    } else {
+                        previous.as_ref().and_then(|s| s.traffic_updated_at)
+                    },
+                    balance_updated_at: if balance_fresh {
+                        Some(sampled_at)
+                    } else {
+                        previous.as_ref().and_then(|s| s.balance_updated_at)
+                    },
+                    instances_updated_at: if instances_fresh {
+                        Some(sampled_at)
+                    } else {
+                        previous.as_ref().and_then(|s| s.instances_updated_at)
+                    },
+                    sync_errors: sync.warnings.clone(),
+                },
+                traffic_fresh.then(|| {
+                    (
+                        used_gb,
+                        self.now,
+                        local_day_start_ms(self.now, &self.timezone),
+                    )
+                }),
+            )
+            .await?;
 
         let already_triggered = previous
             .as_ref()
@@ -582,6 +586,7 @@ impl Scheduler {
             account_name: account.name.clone(),
             // 流量与实例是自动化决策所需数据，失败时不能用旧快照冒充刷新成功。
             success: traffic_fresh && instances_fresh,
+            instances_fresh,
             total_bytes,
             domestic_bytes,
             overseas_bytes,
@@ -1003,71 +1008,65 @@ impl Scheduler {
     // Cron 主流程
     // -----------------------------------------------------------------------
 
-    /// 执行一次完整巡检。
-    pub async fn run_cron(&self) -> CronReport {
-        let mut report = CronReport::default();
-
-        self.housekeeping(&mut report).await;
-
-        let accounts = match self.db.list_accounts(true).await {
-            Ok(accounts) => accounts,
-            Err(err) => {
-                log_error!("读取账号失败：{err}");
-                report.notes.push(format!("读取账号失败：{err}"));
-                return report;
-            }
+    /// 一个队列消息只巡检一个账号，独享该次 Worker 的 D1 调用额度。
+    pub async fn run_account_cron(&self, account: &AccountRow) -> CronReport {
+        let mut report = CronReport {
+            accounts_total: 1,
+            ..CronReport::default()
         };
-        report.accounts_total = accounts.len();
-
-        for account in &accounts {
-            let outcome = self.refresh_account(account).await;
-            if outcome.success {
-                report.accounts_refreshed += 1;
-            } else {
-                report.accounts_failed += 1;
-                report.notes.push(format!(
-                    "{} 刷新失败：{}",
-                    account.name,
-                    outcome.warnings.join("；")
-                ));
-            }
-            if outcome.threshold_fired {
-                report.thresholds_fired += 1;
-                report.notes.push(format!("{} 触发流量熔断", account.name));
-            }
-
-            // 快照可能已被本次刷新更新，重新读取用于后续判断
-            let snapshot = self.db.get_snapshot(account.id).await.ok().flatten();
-
-            if let Err(err) = self.maybe_scheduled_stop(account, &mut report).await {
-                report
-                    .notes
-                    .push(format!("{} 定时关机异常：{err}", account.name));
-            }
-            if let Err(err) = self.maybe_scheduled_start(account, &mut report).await {
-                report
-                    .notes
-                    .push(format!("{} 定时开机异常：{err}", account.name));
-            }
-            if let Err(err) = self
-                .maybe_keep_alive(account, snapshot.as_ref(), &mut report)
-                .await
-            {
-                report
-                    .notes
-                    .push(format!("{} 保活异常：{err}", account.name));
-            }
+        let outcome = self.refresh_account(account).await;
+        if outcome.success {
+            report.accounts_refreshed += 1;
+        } else {
+            report.accounts_failed += 1;
+            report.notes.push(format!(
+                "{} 刷新失败：{}",
+                account.name,
+                outcome.warnings.join("；")
+            ));
+        }
+        if outcome.threshold_fired {
+            report.thresholds_fired += 1;
+            report.notes.push(format!("{} 触发流量熔断", account.name));
         }
 
-        if let Err(err) = self.maybe_daily_report(&mut report).await {
-            report.notes.push(format!("日报异常：{err}"));
+        if !outcome.instances_fresh {
+            report.notes.push(format!(
+                "{} 实例状态未更新，保留定时任务重试机会",
+                account.name
+            ));
+            return report;
         }
 
-        for note in &report.notes {
-            log_info!("{}", note);
+        // 快照可能已被本次刷新更新，重新读取用于后续判断
+        let snapshot = self.db.get_snapshot(account.id).await.ok().flatten();
+
+        if let Err(err) = self.maybe_scheduled_stop(account, &mut report).await {
+            report
+                .notes
+                .push(format!("{} 定时关机异常：{err}", account.name));
         }
-        log_info!("Cron 完成：{}", report.summary());
+        if let Err(err) = self.maybe_scheduled_start(account, &mut report).await {
+            report
+                .notes
+                .push(format!("{} 定时开机异常：{err}", account.name));
+        }
+        if let Err(err) = self
+            .maybe_keep_alive(account, snapshot.as_ref(), &mut report)
+            .await
+        {
+            report
+                .notes
+                .push(format!("{} 保活异常：{err}", account.name));
+        }
         report
+    }
+
+    pub async fn maintenance(&self) -> worker::Result<()> {
+        let mut report = CronReport::default();
+        self.housekeeping(&mut report).await;
+        self.maybe_daily_report(&mut report).await?;
+        Ok(())
     }
 
     /// 清理过期数据：每天只跑一次（锁保证）。

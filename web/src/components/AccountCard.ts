@@ -11,7 +11,7 @@
  * 直到接口返回，避免连点触发服务端 409。
  */
 
-import { formatTime, api, humanAmount, relativeTime, type AccountOverview, type InstanceInfo } from '@/api/client'
+import { api, humanAmount, relativeTime, type AccountOverview, type InstanceInfo } from '@/api/client'
 import { el, iconSvg, iconButton, replaceChildren } from '@/lib/dom'
 import { icons, type IconNode } from '@/lib/icons'
 import { preloadHistoryChart } from '@/components/HistoryModal'
@@ -97,9 +97,7 @@ function signatureOf(account: AccountOverview): string {
     used: account.traffic_used_gb,
     percent: account.percentage,
     triggered: account.threshold_triggered,
-    stopStatus: account.threshold_stop_status,
-    freshness: [account.traffic_updated_at, account.balance_updated_at, account.instances_updated_at, account.traffic_current],
-    errors: account.sync_errors,
+    trafficCurrent: account.traffic_current,
     instances: account.instances.map((instance) => ({
       id: instance.instance_id,
       status: instance.status,
@@ -174,21 +172,7 @@ export class AccountCard {
       },
       this.buildHeader(),
       this.buildTrafficBlock(),
-      this.buildSyncStatus(),
       this.buildFooter(),
-    )
-  }
-
-  private buildSyncStatus(): HTMLElement {
-    const account = this.account
-    const source = (label: string, at: number | null) => `${label}：${at ? formatTime(at) : '尚无成功采集'}`
-    return el('details', { class: 'sync-status' },
-      el('summary', { text: account.sync_errors.length ? '采集异常 · 查看详情' : '查看各项更新时间' }),
-      el('div', { text: source('流量', account.traffic_updated_at) }),
-      el('div', { text: source('余额', account.balance_updated_at) }),
-      el('div', { text: source('实例', account.instances_updated_at) }),
-      account.threshold_triggered && account.over_limit_action === 'stop_and_notify' ? el('div', { text: account.threshold_stop_status === 'confirmed' ? '熔断停机：已确认停止' : '熔断停机：尚未确认，将继续重试' }) : null,
-      ...account.sync_errors.map(text => el('div', { text })),
     )
   }
 

@@ -266,9 +266,9 @@ pub struct NotifyOutcome {
 }
 
 impl NotifyOutcome {
-    /// 是否至少有一个通道成功（没有任何通道配置时视为「无需发送」，返回 true）。
+    /// 是否至少有一个通道实际送达；未配置渠道不能标记通知已发送。
     pub fn any_success(&self) -> bool {
-        self.results.is_empty() || self.results.iter().any(|r| r.success)
+        self.results.iter().any(|r| r.success)
     }
 
     /// 拼接失败原因，供日志使用。
@@ -707,7 +707,7 @@ mod tests {
         let empty = NotifyOutcome {
             results: Vec::new(),
         };
-        assert!(empty.any_success());
+        assert!(!empty.any_success());
         assert_eq!(empty.summary(), "未配置任何通知渠道");
     }
 

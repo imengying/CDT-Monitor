@@ -7,16 +7,19 @@ const { Miniflare } = miniflare
 const compatibleOptions = miniflare.convertV4MiniflareOptions ?? (options => options)
 
 // 全部凭据均为测试夹具；所有出站请求在此拦截，绝不访问云账号。
-const state = { traffic: 190, trafficFailed: false, balanceFailed: false, instancesFailed: false, stopFailed: true, notifyFailed: true, notifications: 0, stallTraffic: false, stallBody: false, status: 'Running', stops: 0, starts: 0, requests: 0 }
+const state = { traffic: 190, trafficFailed: false, balanceFailed: false, instancesFailed: false, stopFailed: true, startFailed: false, notifyFailed: true, notifications: 0, stallTraffic: false, stallBody: false, status: 'Running', stops: 0, starts: 0, requests: 0 }
 const testDirectory = await mkdtemp(resolve(tmpdir(), 'cdt-worker-test-'))
 const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirectory, workers: [{ name: 'monitor',
   modules: [
+    { type: 'ESModule', path: resolve('tests/budget-worker.mjs') },
     { type: 'ESModule', path: resolve('build/index.js') },
     { type: 'CompiledWasm', path: resolve('build/index_bg.wasm') },
   ],
   compatibilityDate: '2026-10-01',
   compatibilityFlags: ['no_nodejs_global_timers'],
   d1Databases: ['DB'],
+  queueProducers: { TASKS: 'cdt-monitor-tasks' },
+  queueConsumers: { 'cdt-monitor-tasks': { maxBatchSize: 1, maxBatchTimeout: 0, retryDelay: 1 } },
   bindings: { MASTER_KEY: 'ab'.repeat(32), ADMIN_USERNAME: 'review', ADMIN_PASSWORD: 'test-password-only' },
   outboundService: async request => {
     state.requests++
@@ -39,7 +42,7 @@ const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirect
         if (state.stopFailed) return fail()
         state.status = 'Stopped'
         return Response.json({ RequestId: 'fixture' })
-      case 'StartInstance': state.starts++; state.status = 'Running'; return Response.json({ RequestId: 'fixture' })
+      case 'StartInstance': state.starts++; if (state.startFailed) return fail(); state.status = 'Running'; return Response.json({ RequestId: 'fixture' })
       default: throw new Error(`Unexpected outbound request: ${url.origin}${url.pathname}`)
     }
   },
@@ -70,6 +73,24 @@ async function runJob(path, expected = 'success') {
   }
   throw new Error(`Job timed out: ${accepted.job_id}`)
 }
+async function eventually(check, label, timeout = 35_000) {
+  const end = Date.now() + timeout
+  while (Date.now() < end) {
+    const result = await check()
+    if (result) return result
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  throw new Error(`Timed out: ${label}`)
+}
+let cronSequence = Date.now() - 60_000
+async function cronAccount(worker, accountId) {
+  const result = await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
+    body: { Cron: { account_id: accountId, scheduled_at: ++cronSequence } },
+  }])
+  assert.equal(result.outcome, 'ok', JSON.stringify(result))
+  assert.equal(result.retryMessages.length, 0, JSON.stringify(result))
+}
+
 try {
   const db = await mf.getD1Database('DB')
   for (const filename of (await readdir('migrations')).filter(f => f.endsWith('.sql')).sort()) {
@@ -169,10 +190,14 @@ try {
   response = await request('refresh', 'POST')
   assert.equal(response.status, 409, 'unfinished batch must retain mutual exclusion beyond lock TTL')
   await db.prepare("UPDATE jobs SET created_at = 1 WHERE id = 'queued-batch'").run()
-  const all = await runJob('refresh')
+  const batchJob = await api('refresh', 'POST')
+  const all = await eventually(async () => {
+    const row = await db.prepare('SELECT * FROM jobs WHERE id = ?').bind(batchJob.job_id).first()
+    return row?.status === 'success' && row
+  }, 'batch should finish without HTTP polling')
   assert.match(all.result_msg, /2 个账号刷新成功/)
   assert.equal((await api('jobs/queued-batch')).status, 'failed')
-  console.log('✓ 批量任务分段推进并持久化进度')
+  console.log('✓ 批量任务无需浏览器轮询即可完成，并持久化进度')
   console.log('✓ 未完成批量任务过锁期仍防重复提交，超期任务可回收')
 
   await db.prepare("INSERT INTO jobs (id, job_type, status, created_at, started_at, payload_json) VALUES ('interrupted', 'stop_instance', 'running', ?, ?, '{}')").bind(Date.now() - 120_000, Date.now() - 120_000).run()
@@ -189,11 +214,97 @@ try {
   state.status = 'Running'
   const worker = await mf.getWorker('monitor')
   await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: Date.now() })
+  await eventually(async () => (await db.prepare('SELECT last_schedule_stop_at AS at FROM accounts WHERE id = ?').bind(id).first()).at, 'scheduled stop')
   assert.equal(state.status, 'Stopped')
   const starts = state.starts
-  await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: Date.now() })
+  await cronAccount(worker, id)
   assert.equal(state.starts, starts, 'Cron stop must not be undone by keep alive')
   console.log('✓ 真实 Cron 入口：进阶关机后下轮保活不会重新开机')
+
+  // 旧快照显示已停止，云端实际运行；本轮查询失败不能把定时关机标记完成。
+  await db.prepare('UPDATE accounts SET last_schedule_stop_at = NULL, last_schedule_stop_date = NULL WHERE id = ?').bind(id).run()
+  state.status = 'Stopped'
+  await refresh()
+  state.status = 'Running'
+  state.instancesFailed = true
+  const previousStops = state.stops
+  await cronAccount(worker, id)
+  assert.equal((await db.prepare('SELECT last_schedule_stop_at AS at FROM accounts WHERE id = ?').bind(id).first()).at, null)
+  assert.equal(state.stops, previousStops)
+  state.instancesFailed = false
+  await cronAccount(worker, id)
+  assert.equal(state.stops, previousStops + 1)
+  console.log('✓ 实例查询失败不会用旧快照标记定时关机完成，恢复后补偿执行')
+
+  await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: true })
+  await db.prepare('UPDATE accounts SET last_schedule_stop_at = NULL, last_schedule_stop_date = NULL WHERE id = ?').bind(id).run()
+  state.status = 'Stopped'
+  state.startFailed = true
+  const previousStarts = state.starts
+  await cronAccount(worker, id)
+  assert.equal(state.starts, previousStarts + 1)
+  assert.equal(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`keepalive:${id}:i-review`).first(), null)
+  state.startFailed = false
+  await cronAccount(worker, id)
+  assert.equal(state.starts, previousStarts + 2)
+  assert.equal(state.status, 'Running')
+  console.log('✓ 保活开机失败释放冷却锁，下轮核实状态后重试')
+
+  await api('settings/telegram', 'PUT', { enabled: true })
+  state.trafficFailed = true
+  state.notifyFailed = true
+  const beforeNotice = state.notifications
+  await cronAccount(worker, id)
+  assert.equal(state.notifications, beforeNotice + 1)
+  state.notifyFailed = false
+  await cronAccount(worker, id)
+  assert.equal(state.notifications, beforeNotice + 2)
+  await cronAccount(worker, id)
+  assert.equal(state.notifications, beforeNotice + 2, 'successful alert is deduplicated')
+  state.trafficFailed = false
+  await api('settings/telegram', 'PUT', { enabled: false })
+  console.log('✓ 巡检通知失败后重试，送达后才保留去重锁')
+
+  const keyword = '长中文关键词测试'.repeat(10) + '%_Test'
+  await db.prepare("INSERT INTO action_logs (action_type, detail, created_at) VALUES ('search_fixture', ?, ?)").bind(keyword, Date.now()).run()
+  await db.prepare("INSERT INTO action_logs (action_type, detail, created_at) VALUES ('search_fixture', 'unrelated', ?)").bind(Date.now()).run()
+  assert.equal((await api(`logs?q=${encodeURIComponent(keyword.toLowerCase())}`)).length, 1)
+  assert.equal((await api('logs?q=%25_')).length, 1, 'wildcards must be literal')
+  await api(`logs?q=${encodeURIComponent(keyword)}`, 'DELETE')
+  assert.equal((await api('logs?action=search_fixture')).length, 1, 'filtered deletion preserves unrelated logs')
+  console.log('✓ 长中文日志关键词与通配符按字面匹配，查询和删除条件一致')
+
+  const beforeDuplicate = state.starts
+  const manual = await api(`accounts/${id}/instances/i-review/stop`, 'POST')
+  await eventually(async () => (await db.prepare('SELECT status FROM jobs WHERE id = ?').bind(manual.job_id).first()).status === 'success', 'manual stop')
+  const afterManualStop = state.stops
+  await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1, body: { Job: { id: manual.job_id } } }])
+  assert.equal(state.stops, afterManualStop, 'redelivered completed job cannot replay the command')
+  assert.equal(state.starts, beforeDuplicate)
+  console.log('✓ 队列重复投递不重放已完成的开关机任务')
+
+  // 账号规模超过原单次 Cron 的免费额度；每个消费调用受 50 次 D1 上限检查。
+  await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: false })
+  for (let index = 0; index < 10; index++) {
+    await api('accounts', 'POST', { ...config, name: `Scale ${index}`, traffic_threshold_gb: 0 })
+  }
+  const cycleAt = Date.now()
+  await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: cycleAt })
+  await eventually(async () => {
+    const { count } = await db.prepare('SELECT COUNT(*) AS count FROM accounts a JOIN account_snapshots s ON s.account_id = a.id WHERE a.enabled = 1 AND s.traffic_updated_at >= ?').bind(cycleAt).first()
+    return count === 11
+  }, 'all 11 accounts must be sampled within separate D1 budgets')
+  await db.prepare('UPDATE accounts SET enabled = 0 WHERE id != ?').bind(id).run()
+  console.log('✓ 11 个账号通过真实 Cron 分发完成采样，每次执行不超过 50 次 D1 调用')
+
+  const beforeAtomic = await snapshot()
+  await db.prepare("CREATE TRIGGER fail_daily BEFORE INSERT ON traffic_daily BEGIN SELECT RAISE(ABORT, 'fixture history write failure'); END").run()
+  state.traffic = 42
+  await refresh('failed')
+  assert.equal((await snapshot()).cdt_overseas_bytes, beforeAtomic.cdt_overseas_bytes, 'history failure must roll back the snapshot')
+  await db.prepare('DROP TRIGGER fail_daily').run()
+  state.traffic = 1
+  console.log('✓ 历史写入失败会回滚同批快照，避免部分写入')
 
   state.stallTraffic = true
   let began = Date.now()

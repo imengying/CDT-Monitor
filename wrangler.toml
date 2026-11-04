@@ -28,7 +28,7 @@
 
 name = "cdt-monitor"
 
-# 由 [build] 生成，不要手改
+# 由 bun run build 生成，不要手改
 main = "build/worker/shim.mjs"
 
 compatibility_date = "2026-10-01"
@@ -44,10 +44,7 @@ workers_dev = true
 # 而这里存的是阿里云凭据。
 preview_urls = false
 
-# 云端构建入口（控制台 Build command 也填 `bun run build`）。
-# 脚本负责装 Bun / Rust / worker-build 再构建，详见 scripts/build-ci.sh。
-[build]
-command = "bash scripts/build-ci.sh"
+# 构建由 bun run build / bun run dev 显式负责，部署不重复构建。
 
 # ---------------------------------------------------------------------------
 # D1：**刻意不写 database_id**
@@ -79,6 +76,19 @@ run_worker_first = ["/api/*"]
 # 每 5 分钟巡检一次：流量采样 → 额度熔断 → 定时开关机 → 抢占式保活 → 日报
 [triggers]
 crons = ["*/5 * * * *"]
+
+# 每条消息处理一个账号或一段任务，避免共享免费版 50 次 D1 调用额度。
+[[queues.producers]]
+binding = "TASKS"
+queue = "cdt-monitor-tasks"
+
+[[queues.consumers]]
+queue = "cdt-monitor-tasks"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+retry_delay = 60
+max_concurrency = 2
 
 # ---------------------------------------------------------------------------
 # 可观测性：**默认关闭**

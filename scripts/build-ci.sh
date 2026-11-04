@@ -7,7 +7,7 @@
 #
 # 调用来源：
 #   1. Dashboard → Settings → Build → Build command
-#   2. wrangler.toml 的 [build] command（wrangler deploy 时）
+#   2. 本地 bun run build / bun run dev；部署仅上传已构建产物。
 #
 # 必需构建期变量（Settings → Build → Build variables）：
 #   BUN_VERSION   Bun 版本，例如 1.4.4
@@ -70,9 +70,15 @@ log "Rust: $(cargo --version)"
 
 # rust-toolchain.toml 声明了 wasm32-unknown-unknown，但 Cloudflare 用的是
 # 一次性容器，rustup 可能还没装这个 target。
-if ! rustup target list --installed | grep -qx wasm32-unknown-unknown; then
+target_libdir="$(rustc --print target-libdir --target wasm32-unknown-unknown)"
+if [ ! -d "$target_libdir" ]; then
   log "安装 wasm32-unknown-unknown target"
-  rustup target add wasm32-unknown-unknown
+  if command -v rustup >/dev/null 2>&1; then
+    rustup target add wasm32-unknown-unknown
+  else
+    echo "错误：当前 Rust 缺少 wasm32-unknown-unknown 标准库，请通过系统包管理器或 rustup 安装。" >&2
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -85,12 +91,12 @@ if [ -d /usr/include/openssl ]; then
   export OPENSSL_LIB_DIR="${OPENSSL_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"
 fi
 
-if ! command -v worker-build >/dev/null 2>&1; then
+if [ "$(worker-build --version 2>/dev/null || true)" != "0.8.7" ]; then
   log "安装 worker-build 0.8.7（首次约 3-5 分钟）"
   # 在临时目录里安装：避免 rust-toolchain.toml 覆盖工具链导致
   # "default toolchain implicitly overridden by rustup toolchain file"。
   #
-  ( cd "$(mktemp -d)" && cargo +stable install worker-build --version 0.8.7 --locked )
+  ( cd "$(mktemp -d)" && cargo install worker-build --version 0.8.7 --locked )
 fi
 log "worker-build: $(command -v worker-build)"
 
@@ -129,23 +135,11 @@ if [ ! -f build/worker/shim.mjs ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. 体积报告（Workers 免费版单文件上限 3 MiB，付费 10 MiB）
+# 7. 用 Wrangler 打包完整产物并校验大小（不发布、不连接云资源）。
 # ---------------------------------------------------------------------------
-# worker-build 把产物放在 build/ 下：index.js + index_bg.wasm，
-# build/worker/shim.mjs 只是兼容旧路径的转发壳。
-wasm_file="$(find build -maxdepth 2 -name '*_bg.wasm' | head -n1 || true)"
-if [ -n "$wasm_file" ]; then
-  size=$(stat -c%s "$wasm_file" 2>/dev/null || stat -f%z "$wasm_file")
-  log "Wasm 体积: $((size / 1024)) KiB ($wasm_file)"
-  # Workers 免费版单文件上限 3 MiB，付费版 10 MiB
-  if [ "$size" -gt 10485760 ]; then
-    warn "Wasm 超过 10 MiB（付费版上限），部署可能被拒绝"
-  elif [ "$size" -gt 3145728 ]; then
-    warn "Wasm 超过 3 MiB（免费版上限），免费账户部署会失败"
-  fi
-else
-  warn "未找到 wasm 产物，请检查 worker-build 输出"
-fi
+# 当前平台按未压缩 Worker 包体计数，上限 64 MiB；不按单个 Wasm 文件判断。
+log "校验 Worker 包体"
+bun run scripts/check-bundle.ts
 
 log "完成。产物："
 echo "  web/dist/index.html"

@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
 /**
- * 部署脚本：建库 → 迁移 → 发布。
+ * 部署脚本：检查构建产物 → 建库和队列 → 迁移 → 发布。
  * ============================================================================
  * `bun run deploy` 执行本脚本，也是 Cloudflare 控制台的 **Deploy command**。
  *
  * 三个步骤均可重复执行：
- *   1. 创建 D1 库，已存在则跳过
+ *   1. 创建 D1 库和任务队列，已存在则跳过
  *   2. 应用 `migrations/` 下未执行的 SQL（D1 记录已执行的文件名）
  *   3. `wrangler deploy`
  *
@@ -14,9 +14,11 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 
 /** D1 数据库名，必须与 wrangler.toml 的 database_name 一致。 */
 const DATABASE = "cdt-monitor";
+const QUEUE = "cdt-monitor-tasks";
 
 const log = (msg: string) => console.log(`\n\x1b[1;34m==> ${msg}\x1b[0m`);
 const warn = (msg: string) => console.log(`\x1b[1;33m[warn] ${msg}\x1b[0m`);
@@ -79,6 +81,15 @@ function migrate(): void {
   }
 }
 
+function ensureQueue(): void {
+  log(`确保任务队列 ${QUEUE} 存在`);
+  const result = run(["queues", "create", QUEUE], true);
+  if (!result.ok && !/already exists|already taken|已存在|duplicate/i.test(result.out)) {
+    console.error(result.out.trim());
+    throw new Error("创建任务队列失败，请检查 API Token 的 Queues 编辑权限");
+  }
+}
+
 /** 发布 Worker。 */
 function deploy(): void {
   log("发布 Worker");
@@ -104,7 +115,11 @@ function remindSecrets(): void {
 }
 
 function main(): void {
+  for (const file of ["build/worker/shim.mjs", "web/dist/index.html", "web/dist/_headers"]) {
+    if (!existsSync(file)) throw new Error(`缺少构建产物 ${file}，请先运行 bun run build`);
+  }
   ensureDatabase();
+  ensureQueue();
   migrate();
   deploy();
   log("部署完成");

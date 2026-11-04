@@ -282,7 +282,7 @@ impl Scheduler {
 
     /// 今天是否已经执行过定时关机。
     ///
-    /// 必须重新读库：`run_cron` 手里那份 `AccountRow` 是循环开始时的快照，
+    /// 必须重新读库：`run_account_cron` 手里那份 `AccountRow` 是本轮开始时的快照，
     /// 而定时关机就在同一轮里把它写进了 `last_schedule_stop_date`。
     ///
     /// 注意这里用「刚刚」而不是「今天」：定时关机后只在
@@ -413,6 +413,8 @@ impl Scheduler {
                         instance.instance_id,
                         err.short()
                     ));
+                    // 下一轮先重新查询真实状态，再决定是否重试；失败不占用成功冷却窗口。
+                    let _ = self.db.release_lock(&lock_name, &owner).await;
                     self.db
                         .add_log(
                             Some(account.id),

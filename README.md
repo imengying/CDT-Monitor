@@ -6,7 +6,7 @@
 ![TypeScript](https://img.shields.io/badge/Frontend-Vanilla_TS_%2B_ECharts-3178C6?logo=typescript)
 
 阿里云 **CDT 流量监控** 与 **ECS 自动化控制**面板，运行在 Cloudflare Workers 上。  
-参考 [`wang4386/CDT-Monitor`](https://github.com/wang4386/CDT-Monitor) 的业务语义，实现为 **Rust/Wasm + D1 + Cron Triggers + Turnstile**，前端为无框架纯 TypeScript。
+参考 [`wang4386/CDT-Monitor`](https://github.com/wang4386/CDT-Monitor) 的业务语义，实现为 **Rust/Wasm + D1 + Queues + Cron Triggers + Turnstile**，前端为无框架纯 TypeScript。
 
 ```text
 ┌───────────────────────────────────────────────────────────────────┐
@@ -18,7 +18,7 @@
 │  Worker (Rust → Wasm)                                             │
 │    ├─ fetch:      路由 + 登录 + Cookie 鉴权                       │
 │    ├─ scheduled:  */5 * * * * 巡检                                │
-│    └─ wait_until: 异步 Job（刷新 / 开关机 / 通知测试 / 日报）     │
+│    └─ queue:      异步 Job（刷新 / 开关机 / 通知测试 / 日报）     │
 │         │                                                         │
 │         ├─ D1：accounts / snapshots / history / jobs / logs       │
 │         └─ fetch → 阿里云 RPC（CDT / ECS / BSS）                  │
@@ -134,6 +134,10 @@
 | 构建命令（Build command） | `bun run build` |
 | 部署命令（Deploy command） | `bun run deploy` |
 
+部署脚本会创建 `cdt-monitor-tasks` 队列并绑定生产者和消费者。自定义构建 API Token 需要 D1、Workers Scripts 和 Queues 的编辑权限。构建仅在 Build command 执行一次，部署上传已有产物；本地部署前也请先运行 `bun run build`。
+
+队列每条消息默认包含一次写入、读取和删除操作；每五分钟每账号巡检一次，约 864 次操作/账号/天，另有维护、手动任务和重试。请按账号规模核对 [Queues 当前额度](https://developers.cloudflare.com/queues/platform/pricing/)。
+
 ### 2. 设置 `BUN_VERSION`
 
 展开 **高级设置**（Advanced settings），添加一个构建变量：
@@ -193,7 +197,7 @@ openssl rand -hex 32
 ```text
 cdt-monitor/
 ├── Cargo.toml                   # Rust 2024，cdylib → wasm32
-├── wrangler.toml                # D1 / Assets / Cron / 构建入口
+├── wrangler.toml                # D1 / Queues / Assets / Cron
 ├── package.json                 # 根脚本（Bun）
 ├── rust-toolchain.toml
 ├── .dev.vars.example            # 本地开发变量模板
@@ -208,6 +212,7 @@ cdt-monitor/
 ├── src/
 │   ├── lib.rs                   # fetch / scheduled 入口、路由、鉴权
 │   ├── jobs.rs                  # D1 任务执行器与批量进度
+│   ├── tasks.rs                 # 队列派发与单账号巡检
 │   ├── runtime.rs               # 并发请求、超时与取消
 │   ├── models.rs                # D1 实体行 + 前后端 DTO + 时区/单位换算
 │   ├── db.rs                    # D1 SQL 封装（含幂等锁）
@@ -322,15 +327,16 @@ debug  同 info
 #### Cron（`*/5 * * * *`）
 
 ```text
-1. housekeeping（每日一次，锁保护）
+0. Cron 按账号派发队列消息，每次消费一条；账号增多不会共用一次 D1 调用额度
+1. housekeeping（独立队列消息，每日一次，锁保护）
      清理过期锁 / 32 天前历史 / 32 天前日志 / 7 天前 Job
-2. 逐账号：CDT 流量 + 余额 + 该地域 ECS 实例 → 写快照 → 采样历史
+2. 单账号：CDT 流量 + 余额 + ECS 实例 → 一次 D1 batch 写快照和采样历史
 3. 额度判定：任一池（内地 / 非内地）超出各自额度
      首次超限 → 标记账期；每轮核实停机，失败重试；通知送达后去重
-4. 定时关机（10 分钟窗口，失败下轮重试）
+4. 定时关机（10 分钟窗口；本轮实例查询失败不标记完成，保留重试）
 5. 定时开机（同窗口，受熔断闸门约束）
 6. 抢占式保活（见下方闸门）
-7. 每日日报（10 分钟窗口，当天仅一次）
+7. 每日日报（独立延迟消息，读取最近完成的快照；10 分钟窗口，当天仅一次）
 ```
 
 窗口取 10 分钟（与上游一致）：巡检间隔 5 分钟，每个触发点有准点与 +5 分钟两次尝试机会。
@@ -373,6 +379,8 @@ debug  同 info
 
 #### 异步 Job
 
+任务提交写入 D1 后发送到 Queues，队列投递失败由 Cron 补发。队列采用至少一次投递，任务使用原子领取去重，已完成或结果不确定的启停任务不会因重投而重新执行。
+
 写接口返回 `202 Accepted + { job_id }`，前端轮询 `GET /api/v1/jobs/{job_id}`：
 
 ```json
@@ -389,9 +397,9 @@ debug  同 info
 
 刷新任务按范围、手动启停任务按实例以 D1 锁互斥（owner = `job_id`，收尾按 owner 释放），并发提交返回 `409 job_locked`。未完成批量任务的锁保留到任务完成或超时回收，分段等待期间也不会重复提交。
 
-任务参数与批量进度存入 D1。批量刷新每段处理一个账号，任务轮询或每五分钟 Cron 继续推进；每段预算 25 秒，账号刷新预算 20 秒，阿里云单次请求预算 4 秒（含响应体）。`running` 超过 60 秒会标记失败并释放任务锁，不自动重放结果不确定的启停指令。成功结果通过 `result_msg` 返回，包含部分采集失败的说明。
+任务参数与批量进度存入 D1。批量刷新每段处理一个账号，Cloudflare Queues 自动继续推进，关闭页面仍会执行；每段总预算 28 秒（含初始化与收尾），业务处理最多使用前 24 秒，账号刷新预算 20 秒，阿里云单次请求预算 4 秒（含响应体）。`running` 超过 60 秒会标记失败并释放任务锁，不自动重放结果不确定的启停指令。成功结果通过 `result_msg` 返回，包含部分采集失败的说明。
 
-熔断后会持续核实实例状态，直到确认停止；通知失败也会重试。提高阈值或将其设为 0 后，需成功刷新流量且满足新阈值才解除熔断，界面会记录解除日志。各项最近成功采集时间和本次错误可在账号卡片展开查看。
+熔断后会持续核实实例状态，直到确认停止；通知失败也会重试。提高阈值或将其设为 0 后，需成功刷新流量且满足新阈值才解除熔断，界面会记录解除日志。各项最近成功采集时间保留在后端，用于避免旧数据参与自动化决策。
 
 登录接口每个来源 IP 在五分钟窗口内最多接受 10 次尝试（含并发请求），超出返回 `429` 和 `Retry-After`。已启用的人机校验在配置损坏或读取失败时拒绝登录。
 
