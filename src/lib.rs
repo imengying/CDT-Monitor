@@ -692,7 +692,7 @@ async fn handle_delete_other_sessions(app: &AppCtx, current_sid: &str) -> worker
 async fn handle_overview(app: &AppCtx, req: &Request) -> worker::Result<Response> {
     let params = query_map(req);
     let accounts = app.db.list_accounts(false).await?;
-    let mut snapshots: HashMap<i64, crate::models::SnapshotRow> = app
+    let snapshots: HashMap<i64, crate::models::SnapshotRow> = app
         .db
         .list_snapshots()
         .await?
@@ -700,46 +700,22 @@ async fn handle_overview(app: &AppCtx, req: &Request) -> worker::Result<Response
         .map(|snapshot| (snapshot.account_id, snapshot))
         .collect();
 
-    // `?refresh=transitional`：仅当存在处于过渡态的实例时，才对这些账号补一次采集。
-    // 过渡态只持续几十秒，光靠 Cron（5 分钟）读不到终态，前端 1 分钟轮询也只会
-    // 反复读到旧快照。这里按需触发，不会让常规轮询打阿里云。
+    // 补采独立入队，HTTP 请求只读取快照，不随账号数累积采集调用。
     if query_str(&params, "refresh") == Some("transitional") {
-        let stale: Vec<_> = accounts
+        let ids: Vec<_> = accounts
             .iter()
             .filter(|account| {
-                snapshots
-                    .get(&account.id)
-                    .map(|snapshot| {
-                        let instances = snapshot.instances();
-                        // 没有实例时也算「需要采集」：可能是首次配置还没拉过
-                        instances.is_empty() || instances.iter().any(|i| i.is_transitional())
-                    })
-                    .unwrap_or(true)
+                snapshots.get(&account.id).is_none_or(|snapshot| {
+                    let instances = snapshot.instances();
+                    instances.is_empty() || instances.iter().any(|i| i.is_transitional())
+                })
             })
-            .cloned()
+            .map(|account| account.id)
             .collect();
-
-        if !stale.is_empty() {
-            let scheduler = crate::scheduler::Scheduler::new(&app.env).await?;
-            let mut refreshed = false;
-            for account in &stale {
-                // 带防抖：多标签页同时轮询时不会成倍打阿里云
-                if let Some(outcome) = scheduler.refresh_account_throttled(account).await
-                    && outcome.success
-                {
-                    refreshed = true;
-                }
-            }
-            // 有新数据时重读快照，保证本次响应就返回最新状态
-            if refreshed {
-                snapshots = app
-                    .db
-                    .list_snapshots()
-                    .await?
-                    .into_iter()
-                    .map(|snapshot| (snapshot.account_id, snapshot))
-                    .collect();
-            }
+        if !ids.is_empty()
+            && let Err(err) = tasks::enqueue_refreshes(&app.env, &ids).await
+        {
+            log_warn!("概览补采入队失败，将在下次轮询重试：{err}");
         }
     }
 
@@ -851,7 +827,7 @@ async fn handle_clear_logs(app: &AppCtx, req: &Request) -> worker::Result<Respon
 
 /// `GET /api/v1/jobs/{id}` 与 `GET /api/v1/jobs`
 async fn handle_job(_ctx: &Context, app: &AppCtx, job_id: &str) -> worker::Result<Response> {
-    app.db.recover_jobs(now_ms()).await?;
+    app.db.recover_job(job_id, now_ms()).await?;
     match app.db.get_job(job_id).await? {
         Some(job) => ok(&job.to_dto()),
         None => error_response(404, "任务不存在"),
@@ -900,12 +876,26 @@ async fn handle_create_account(app: &AppCtx, mut req: Request) -> worker::Result
         .encrypt(secret)
         .map_err(|err| worker::Error::RustError(err.to_string()))?;
 
+    let cloud_id = match aliyun::AliyunClient::new(
+        payload.access_key_id.trim(),
+        secret,
+        payload.site_type,
+        aliyun::Endpoints::for_site(payload.site_type),
+    )
+    .caller_account_id()
+    .await
+    {
+        Ok(id) => id,
+        Err(err) => return error_response(502, format!("无法核实云账号身份：{}", err.short())),
+    };
+
     let id = app
         .db
         .create_account(
             payload.name.trim(),
             payload.site_type.as_str(),
             payload.access_key_id.trim(),
+            &cloud_id,
             &encrypted,
             &payload.normalized_region(),
             payload.require_instance_id()?,
@@ -945,12 +935,37 @@ async fn handle_update_account(
     account_id: i64,
     mut req: Request,
 ) -> worker::Result<Response> {
-    let existing = match app.db.get_account(account_id).await? {
+    account_edit_response(
+        app.db
+            .with_account_lock(
+                account_id,
+                20_000,
+                update_account_locked(app, account_id, &mut req),
+            )
+            .await,
+    )
+}
+
+fn account_edit_response(result: worker::Result<Response>) -> worker::Result<Response> {
+    match result {
+        Err(worker::Error::RustError(message)) if message == db::ACCOUNT_BUSY => {
+            error_response_with_code(409, message, "account_busy")
+        }
+        other => other,
+    }
+}
+
+async fn update_account_locked(
+    app: &AppCtx,
+    account_id: i64,
+    req: &mut Request,
+) -> worker::Result<Response> {
+    let mut existing = match app.db.get_account(account_id).await? {
         Some(account) => account,
         None => return error_response(404, "账号不存在"),
     };
 
-    let payload: AccountInput = match read_json(&mut req).await {
+    let payload: AccountInput = match read_json(req).await {
         Ok(payload) => payload,
         Err(err) => return error_response(400, err),
     };
@@ -978,9 +993,69 @@ async fn handle_update_account(
         }
     };
 
+    let supplied_secret = payload
+        .access_key_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let credentials_changed = access_key_id != existing.access_key_id
+        || supplied_secret.is_some()
+        || payload.site_type != existing.site();
+    let cloud_id = if credentials_changed {
+        let secret = match supplied_secret {
+            Some(secret) => secret.to_string(),
+            None => app
+                .crypto
+                .decrypt(&existing.encrypted_access_key_secret)
+                .map_err(|e| worker::Error::RustError(e.to_string()))?,
+        };
+        match aliyun::AliyunClient::new(
+            &access_key_id,
+            secret,
+            payload.site_type,
+            aliyun::Endpoints::for_site(payload.site_type),
+        )
+        .caller_account_id()
+        .await
+        {
+            Ok(id) => Some(id),
+            Err(err) => return error_response(502, format!("无法核实云账号身份：{}", err.short())),
+        }
+    } else {
+        existing.cloud_account_id.clone()
+    };
+    if existing.cloud_account_id.is_none() && cloud_id.is_some() {
+        // 同一个 AccessKey ID 必然属于同一个主账号；也允许重存密钥修复密文。
+        if access_key_id == existing.access_key_id {
+            existing.cloud_account_id = cloud_id.clone();
+        } else {
+            let old_secret = app
+                .crypto
+                .decrypt(&existing.encrypted_access_key_secret)
+                .map_err(|e| worker::Error::RustError(e.to_string()))?;
+            match aliyun::AliyunClient::from_account(&existing, old_secret)
+                .caller_account_id()
+                .await
+            {
+                Ok(id) => existing.cloud_account_id = Some(id),
+                Err(err) => {
+                    return error_response(
+                        502,
+                        format!(
+                            "无法核实原云账号身份：{}。请恢复原密钥后重试；若原密钥已失效，请新增账号迁移",
+                            err.short()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     app.db
         .update_account(
             account_id,
+            &existing,
+            cloud_id.as_deref(),
             payload.name.trim(),
             payload.site_type.as_str(),
             &access_key_id,
@@ -1011,7 +1086,6 @@ async fn handle_update_account(
         )
         .await?;
 
-    let _ = existing;
     match app.db.get_account(account_id).await? {
         Some(account) => ok(&account.to_dto()),
         None => error_response(404, "账号不存在"),
@@ -1020,6 +1094,14 @@ async fn handle_update_account(
 
 /// `DELETE /api/v1/accounts/{id}`
 async fn handle_delete_account(app: &AppCtx, account_id: i64) -> worker::Result<Response> {
+    account_edit_response(
+        app.db
+            .with_account_lock(account_id, 20_000, delete_account_locked(app, account_id))
+            .await,
+    )
+}
+
+async fn delete_account_locked(app: &AppCtx, account_id: i64) -> worker::Result<Response> {
     if app.db.get_account(account_id).await?.is_none() {
         return error_response(404, "账号不存在");
     }
@@ -1484,6 +1566,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
                         JobTask::StartInstance {
                             account_id,
                             instance_id: instance_id.to_string(),
+                            config_version: 0,
                         },
                     )
                     .await
@@ -1500,6 +1583,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
                         JobTask::StopInstance {
                             account_id,
                             instance_id: instance_id.to_string(),
+                            config_version: 0,
                         },
                     )
                     .await
@@ -1617,7 +1701,17 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> worker::Result<Respon
 #[event(scheduled)]
 pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if let Err(err) = tasks::dispatch_cron(&env, event.schedule() as i64).await {
-        log_error!("Cron 派发失败：{err}");
+        log_error!(
+            "{}",
+            serde_json::json!({"event": "cron_dispatch_failed", "error": err.to_string()})
+        );
+    }
+    let health = async { Scheduler::new(&env).await?.check_collection_health().await };
+    if let Err(err) = runtime::timeout(20_000, health)
+        .await
+        .unwrap_or_else(|e| Err(worker::Error::RustError(e.into())))
+    {
+        log_error!("采集健康检查失败：{err}");
     }
 }
 
@@ -1634,7 +1728,10 @@ pub async fn queue(
         match tasks::consume(&env, message.body()).await {
             Ok(()) => message.ack(),
             Err(err) => {
-                log_error!("队列任务失败，稍后重试：{err}");
+                log_error!(
+                    "{}",
+                    serde_json::json!({"event": "queue_task_failed", "task": message.body(), "error": err.to_string()})
+                );
                 message.retry();
             }
         }
@@ -1660,6 +1757,7 @@ mod tests {
         let task = JobTask::StartInstance {
             account_id: 7,
             instance_id: "i-1".to_string(),
+            config_version: 1,
         };
         assert_eq!(task.job_type(), JobType::StartInstance);
         assert_eq!(task.account_id(), Some(7));

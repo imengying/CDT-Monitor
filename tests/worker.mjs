@@ -7,7 +7,8 @@ const { Miniflare } = miniflare
 const compatibleOptions = miniflare.convertV4MiniflareOptions ?? (options => options)
 
 // 全部凭据均为测试夹具；所有出站请求在此拦截，绝不访问云账号。
-const state = { traffic: 190, trafficFailed: false, balanceFailed: false, instancesFailed: false, stopFailed: true, startFailed: false, notifyFailed: true, notifications: 0, stallTraffic: false, stallBody: false, status: 'Running', stops: 0, starts: 0, requests: 0 }
+const state = { instanceId: 'i-review', stoppedIds: [], trafficCalls: 0, traffic: 190, trafficFailed: false, balanceFailed: false, instancesFailed: false, stopFailed: true, startFailed: false, notifyFailed: true, notifications: 0, stallTraffic: false, stallBody: false, status: 'Running', stops: 0, starts: 0, requests: 0 }
+let trafficGate = null
 const testDirectory = await mkdtemp(resolve(tmpdir(), 'cdt-worker-test-'))
 const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirectory, workers: [{ name: 'monitor',
   modules: [
@@ -31,14 +32,18 @@ const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirect
       return state.notifyFailed ? fail() : Response.json({ ok: true })
     }
     switch (action) {
+      case 'GetCallerIdentity': return url.searchParams.get('AccessKeyId') === 'invalid-key' ? fail() : Response.json({ AccountId: url.searchParams.get('AccessKeyId') === 'replacement-key' ? '2002' : '1001' })
       case 'ListCdtInternetTraffic':
+        state.trafficCalls++
+        if (trafficGate) await trafficGate
         if (state.stallTraffic) return new Promise(() => {})
         if (state.stallBody) return new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{')); } }), { headers: { 'content-type': 'application/json' } })
         return state.trafficFailed ? fail() : Response.json({ TrafficDetails: [{ BusinessRegionId: 'cn-hongkong', Traffic: state.traffic * 1024 ** 3 }] })
       case 'QueryAccountBalance': return state.balanceFailed ? fail() : Response.json({ Data: { AvailableAmount: '42.00', Currency: 'USD' } })
-      case 'DescribeInstances': return state.instancesFailed ? fail() : Response.json({ Instances: { Instance: [{ InstanceId: 'i-review', RegionId: 'cn-hongkong', Status: state.status, SpotStrategy: 'SpotAsPriceGo' }] } })
+      case 'DescribeInstances': return state.instancesFailed ? fail() : Response.json({ Instances: { Instance: [{ InstanceId: state.instanceId, RegionId: 'cn-hongkong', Status: state.status, SpotStrategy: 'SpotAsPriceGo' }] } })
       case 'StopInstance':
         state.stops++
+        state.stoppedIds.push(url.searchParams.get('InstanceId'))
         if (state.stopFailed) return fail()
         state.status = 'Stopped'
         return Response.json({ RequestId: 'fixture' })
@@ -83,12 +88,12 @@ async function eventually(check, label, timeout = 35_000) {
   throw new Error(`Timed out: ${label}`)
 }
 let cronSequence = Date.now() - 60_000
-async function cronAccount(worker, accountId) {
+async function cronAccount(worker, accountId, retry = false) {
   const result = await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
     body: { Cron: { account_id: accountId, scheduled_at: ++cronSequence } },
   }])
   assert.equal(result.outcome, 'ok', JSON.stringify(result))
-  assert.equal(result.retryMessages.length, 0, JSON.stringify(result))
+  assert.equal(result.retryMessages.length, retry ? 1 : 0, JSON.stringify(result))
 }
 
 try {
@@ -170,6 +175,13 @@ try {
   const overview = await api('overview')
   assert.equal(overview.accounts[0].traffic_current, false)
   assert.ok(overview.accounts[0].sync_errors.length)
+  const staleReport = await runJob('reports/daily')
+  assert.match(staleReport.result_msg, /本月合计流量 0\.00 GB/)
+  assert.match(staleReport.result_msg, /1 个账号本月流量待采集/)
+  assert.match(staleReport.result_msg, /本月流量待采集（未计入合计）/)
+  assert.match(staleReport.result_msg, /采集异常/)
+  assert.doesNotMatch(staleReport.result_msg, /190\.00/)
+  console.log('✓ 日报排除旧账期流量，并说明未采集账号与异常')
   state.trafficFailed = false
   state.traffic = 1
   await refresh()
@@ -228,7 +240,7 @@ try {
   state.status = 'Running'
   state.instancesFailed = true
   const previousStops = state.stops
-  await cronAccount(worker, id)
+  await cronAccount(worker, id, true)
   assert.equal((await db.prepare('SELECT last_schedule_stop_at AS at FROM accounts WHERE id = ?').bind(id).first()).at, null)
   assert.equal(state.stops, previousStops)
   state.instancesFailed = false
@@ -241,7 +253,7 @@ try {
   state.status = 'Stopped'
   state.startFailed = true
   const previousStarts = state.starts
-  await cronAccount(worker, id)
+  await cronAccount(worker, id, true)
   assert.equal(state.starts, previousStarts + 1)
   assert.equal(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`keepalive:${id}:i-review`).first(), null)
   state.startFailed = false
@@ -254,12 +266,12 @@ try {
   state.trafficFailed = true
   state.notifyFailed = true
   const beforeNotice = state.notifications
-  await cronAccount(worker, id)
+  await cronAccount(worker, id, true)
   assert.equal(state.notifications, beforeNotice + 1)
   state.notifyFailed = false
-  await cronAccount(worker, id)
+  await cronAccount(worker, id, true)
   assert.equal(state.notifications, beforeNotice + 2)
-  await cronAccount(worker, id)
+  await cronAccount(worker, id, true)
   assert.equal(state.notifications, beforeNotice + 2, 'successful alert is deduplicated')
   state.trafficFailed = false
   await api('settings/telegram', 'PUT', { enabled: false })
@@ -283,6 +295,65 @@ try {
   assert.equal(state.starts, beforeDuplicate)
   console.log('✓ 队列重复投递不重放已完成的开关机任务')
 
+  // 同一消息失败 → 重投成功 → 再次重复投递，不依赖下一轮 Cron。
+  await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: false })
+  const sameCycle = Date.now()
+  const message = { id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
+    body: { Cron: { account_id: id, scheduled_at: sameCycle } } }
+  state.trafficFailed = true
+  let delivery = await worker.queue('cdt-monitor-tasks', [message])
+  assert.equal(delivery.retryMessages.length, 1)
+  assert.equal(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`cron-account:${id}:${sameCycle}`).first(), null)
+  state.trafficFailed = false
+  const beforeRetry = state.requests
+  delivery = await worker.queue('cdt-monitor-tasks', [{ ...message, attempts: 2 }])
+  assert.equal(delivery.retryMessages.length, 0)
+  assert.ok(state.requests > beforeRetry)
+  const completedRequests = state.requests
+  await worker.queue('cdt-monitor-tasks', [{ ...message, attempts: 3 }])
+  assert.equal(state.requests, completedRequests)
+  console.log('✓ 同一 Cron 消息失败可重投，成功后才去重')
+
+  const leaseCycle = sameCycle + 1
+  const leaseKey = `cron-account:${id}:${leaseCycle}`
+  const leaseMessage = { ...message, id: crypto.randomUUID(), body: { Cron: { account_id: id, scheduled_at: leaseCycle } } }
+  await db.prepare('INSERT INTO locks (name, owner, expires_at) VALUES (?, ?, ?)').bind(leaseKey, 'interrupted-consumer', Date.now() + 120_000).run()
+  delivery = await worker.queue('cdt-monitor-tasks', [leaseMessage])
+  assert.equal(delivery.retryMessages.length, 1, 'busy lease must retry instead of acknowledging')
+  assert.equal(state.requests, completedRequests)
+  await db.prepare('UPDATE locks SET expires_at = 1 WHERE name = ?').bind(leaseKey).run()
+  delivery = await worker.queue('cdt-monitor-tasks', [{ ...leaseMessage, attempts: 2 }])
+  assert.equal(delivery.retryMessages.length, 0)
+  assert.equal((await db.prepare('SELECT owner FROM locks WHERE name = ?').bind(leaseKey).first()).owner, 'completed')
+  console.log('✓ 执行租约未到期时重试，中断租约过期后可以接管')
+
+  for (const start of [false, true]) {
+    const hhmm = new Date(Date.now() + 8 * 3600_000).toISOString().slice(11, 16)
+    await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: false,
+      schedule_mode: 'simple', ...(start ? { schedule_start_time: hhmm } : { schedule_stop_time: hhmm }) })
+    const dateColumn = start ? 'last_schedule_start_date' : 'last_schedule_stop_date'
+    await db.prepare(`UPDATE accounts SET ${dateColumn} = NULL WHERE id = ?`).bind(id).run()
+    const scheduled = Date.now()
+    const scheduleMessage = { ...message, id: crypto.randomUUID(), body: { Cron: { account_id: id, scheduled_at: scheduled } } }
+    const beforeAction = start ? state.starts : state.stops
+    for (const status of [start ? 'Stopping' : 'Starting', 'Unknown']) {
+      state.status = status
+      delivery = await worker.queue('cdt-monitor-tasks', [scheduleMessage])
+      assert.equal(delivery.retryMessages.length, 1)
+      assert.equal((await db.prepare(`SELECT ${dateColumn} AS date FROM accounts WHERE id = ?`).bind(id).first()).date, null)
+      assert.equal(start ? state.starts : state.stops, beforeAction)
+    }
+    state.status = start ? 'Stopped' : 'Running'
+    delivery = await worker.queue('cdt-monitor-tasks', [{ ...scheduleMessage, attempts: 2 }])
+    assert.equal(delivery.retryMessages.length, 0)
+    assert.equal(start ? state.starts : state.stops, beforeAction + 1)
+    assert.ok((await db.prepare(`SELECT ${dateColumn} AS date FROM accounts WHERE id = ?`).bind(id).first()).date)
+    await worker.queue('cdt-monitor-tasks', [{ ...scheduleMessage, attempts: 3 }])
+    assert.equal(start ? state.starts : state.stops, beforeAction + 1, 'completed scheduled action cannot repeat')
+  }
+  console.log('✓ 定时启停遇到过渡态或未知状态保留重试，终态恢复后同消息补偿执行')
+
+
   // 账号规模超过原单次 Cron 的免费额度；每个消费调用受 50 次 D1 上限检查。
   await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: false })
   for (let index = 0; index < 10; index++) {
@@ -297,6 +368,28 @@ try {
   await db.prepare('UPDATE accounts SET enabled = 0 WHERE id != ?').bind(id).run()
   console.log('✓ 11 个账号通过真实 Cron 分发完成采样，每次执行不超过 50 次 D1 调用')
 
+  // 阻塞云端采集，概览仍应立即返回；多账号补采各自消费独立 D1 额度。
+  await db.prepare("UPDATE account_snapshots SET instances_json = '[]'").run()
+  let releaseTraffic
+  trafficGate = new Promise(resolve => { releaseTraffic = resolve })
+  const beforeOverview = Date.now()
+  try {
+    const pendingOverview = await api('overview?refresh=transitional')
+    assert.equal(pendingOverview.accounts.length, 12)
+    assert.ok(Date.now() - beforeOverview < 3000, 'overview must not await cloud sampling')
+    await api('overview?refresh=transitional') // 多标签页重复请求由全局防抖合并。
+  } finally {
+    releaseTraffic()
+    trafficGate = null
+  }
+  await eventually(async () => {
+    const { count } = await db.prepare('SELECT COUNT(*) AS count FROM account_snapshots WHERE instances_json != ? AND traffic_updated_at >= ?').bind('[]', beforeOverview).first()
+    return count === 12
+  }, 'all overview refreshes finish in separate queue consumers')
+  assert.equal((await api('overview')).accounts.every(account => account.instances[0].status === 'Running'), true)
+  console.log('✓ 12 个账号补采在队列中完成，慢云接口不阻塞概览且不突破 D1 预算')
+
+
   const beforeAtomic = await snapshot()
   await db.prepare("CREATE TRIGGER fail_daily BEFORE INSERT ON traffic_daily BEGIN SELECT RAISE(ABORT, 'fixture history write failure'); END").run()
   state.traffic = 42
@@ -305,6 +398,164 @@ try {
   await db.prepare('DROP TRIGGER fail_daily').run()
   state.traffic = 1
   console.log('✓ 历史写入失败会回滚同批快照，避免部分写入')
+
+  // 云控制台改变真实状态，缓存恰好与手动意图一致，仍必须执行所需动作。
+  state.status = 'Running'
+  await refresh()
+  state.status = 'Stopped'
+  const manualStarts = state.starts
+  await runJob(`accounts/${id}/instances/i-review/start`)
+  assert.equal(state.starts, manualStarts + 1)
+  assert.equal(state.status, 'Running')
+  state.status = 'Stopped'
+  await refresh()
+  state.status = 'Running'
+  const manualStops = state.stops
+  await runJob(`accounts/${id}/instances/i-review/stop`)
+  assert.equal(state.stops, manualStops + 1)
+  state.status = 'Running'
+  const noOp = await runJob(`accounts/${id}/instances/i-review/start`)
+  assert.match(noOp.result_msg, /已核实/)
+  assert.equal(state.starts, manualStarts + 1)
+  assert.equal(JSON.parse((await snapshot()).instances_json)[0].status, 'Running')
+  state.instancesFailed = true
+  await runJob(`accounts/${id}/instances/i-review/stop`, 'failed')
+  assert.equal(state.stops, manualStops + 1)
+  state.instancesFailed = false
+  state.status = 'Starting'
+  await runJob(`accounts/${id}/instances/i-review/start`, 'failed')
+  assert.equal(state.starts, manualStarts + 1)
+  state.status = 'Running'
+  console.log('✓ 手动启停核实云端状态；已达目标刷新快照，查询失败或过渡态不发指令')
+
+  const replacement = await api('accounts', 'POST', { ...config, name: 'Identity test' })
+  const replacementId = replacement.id
+  const replacementSnapshot = () => db.prepare('SELECT * FROM account_snapshots WHERE account_id = ?').bind(replacementId).first()
+  const replacementRow = () => db.prepare('SELECT * FROM accounts WHERE id = ?').bind(replacementId).first()
+  state.traffic = 190
+  await runJob(`accounts/${replacementId}/refresh`)
+  const breaker = (await replacementSnapshot()).threshold_triggered_month
+  assert.ok(breaker)
+  // 同主账号轮换 AccessKey、升级前尚无身份记录，都必须保留熔断。
+  await db.prepare('UPDATE accounts SET cloud_account_id = NULL WHERE id = ?').bind(replacementId).run()
+  await api(`accounts/${replacementId}`, 'PUT', { ...config, access_key_id: 'rotated-key', access_key_secret: 'rotated-secret' })
+  assert.equal((await replacementSnapshot()).threshold_triggered_month, breaker)
+  assert.equal((await replacementRow()).cloud_account_id, '1001')
+  await db.prepare("UPDATE accounts SET cloud_account_id = NULL, access_key_id = 'invalid-key' WHERE id = ?").bind(replacementId).run()
+  const beforeOfflineEdit = state.requests
+  await api(`accounts/${replacementId}`, 'PUT', { ...config, access_key_id: '', access_key_secret: undefined, enabled: false })
+  assert.equal(state.requests, beforeOfflineEdit, 'editing legacy configuration must not require working cloud credentials')
+  assert.equal((await replacementSnapshot()).threshold_triggered_month, breaker)
+  await db.prepare("UPDATE accounts SET cloud_account_id = '1001', access_key_id = 'rotated-key' WHERE id = ?").bind(replacementId).run()
+  const preservedVersion = (await replacementRow()).config_version
+  response = await request(`accounts/${replacementId}`, 'PUT', { ...config, access_key_id: 'invalid-key' })
+  assert.equal(response.status, 502)
+  assert.equal((await replacementRow()).config_version, preservedVersion)
+  assert.equal((await replacementSnapshot()).threshold_triggered_month, breaker)
+  console.log('✓ 同账号密钥轮换与存量身份补齐保留熔断，验证失败不改变配置')
+
+  // 在清理关联状态时注入数据库错误，整个配置更新必须回滚。
+  await db.prepare("CREATE TRIGGER fail_identity_reset BEFORE DELETE ON account_snapshots BEGIN SELECT RAISE(ABORT, 'fixture reset failure'); END").run()
+  response = await request(`accounts/${replacementId}`, 'PUT', { ...config, access_key_id: 'replacement-key', instance_id: 'i-new-account' })
+  assert.equal(response.status, 500)
+  assert.equal((await replacementRow()).config_version, preservedVersion)
+  assert.equal((await replacementRow()).access_key_id, 'rotated-key')
+  assert.equal((await replacementSnapshot()).threshold_triggered_month, breaker)
+  await db.prepare('DROP TRIGGER fail_identity_reset').run()
+  await api(`accounts/${replacementId}`, 'PUT', { ...config, access_key_id: 'replacement-key', instance_id: 'i-new-account' })
+  assert.equal(await replacementSnapshot(), null)
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM traffic_hourly WHERE account_id = ?').bind(replacementId).first()).n, 0)
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM traffic_daily WHERE account_id = ?').bind(replacementId).first()).n, 0)
+  const replacementView = (await api('overview')).accounts.find(a => a.id === replacementId)
+  assert.ok(replacementView.instances.every(i => i.instance_id === 'i-new-account'))
+  state.instanceId = 'i-new-account'
+  state.status = 'Running'
+  state.traffic = 1
+  const afterReplacementStops = state.stops
+  await runJob(`accounts/${replacementId}/refresh`)
+  assert.equal(state.stops, afterReplacementStops)
+  assert.equal((await replacementSnapshot()).threshold_triggered_month, null)
+  console.log('✓ 更换云账号原子清理旧快照和历史；新账号低用量不会继承熔断误停机')
+
+  const oldVersion = (await replacementRow()).config_version
+  await api(`accounts/${replacementId}`, 'PUT', { ...config, access_key_id: 'replacement-key', instance_id: 'i-new-account', name: 'Updated' })
+  const obsoleteTask = JSON.stringify({ StopInstance: { account_id: replacementId, instance_id: 'i-new-account', config_version: oldVersion } })
+  await db.prepare("INSERT INTO jobs (id, account_id, job_type, status, created_at, payload_json) VALUES ('obsolete-action', ?, 'stop_instance', 'pending', ?, ?)").bind(replacementId, Date.now(), obsoleteTask).run()
+  await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1, body: { Job: { id: 'obsolete-action' } } }])
+  assert.equal((await api('jobs/obsolete-action')).status, 'failed')
+  assert.match((await api('jobs/obsolete-action')).error_msg, /配置已变更/)
+  assert.equal(state.stops, afterReplacementStops)
+  console.log('✓ 旧配置排队的启停任务被拒绝，不操作新配置的资源')
+
+  // 采集正在访问旧资源时不允许修改或删除配置，也不允许手动动作交错执行。
+  const beforeConcurrentTraffic = state.trafficCalls
+  trafficGate = new Promise(resolve => { releaseTraffic = resolve })
+  let activeRefresh
+  try {
+    activeRefresh = await api(`accounts/${replacementId}/refresh`, 'POST')
+    await eventually(() => state.trafficCalls > beforeConcurrentTraffic, 'refresh reaches cloud')
+    response = await request(`accounts/${replacementId}`, 'PUT', { ...config, access_key_id: 'replacement-key', instance_id: 'i-new-account' })
+    assert.equal(response.status, 409)
+    assert.equal((await response.json()).code, 'account_busy')
+    response = await request(`accounts/${replacementId}`, 'DELETE')
+    assert.equal(response.status, 409)
+    const concurrentStop = await api(`accounts/${replacementId}/instances/i-new-account/stop`, 'POST')
+    // 显式投递第二个消费调用，避免本地自动消费者串行排队掩盖并发场景。
+    await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1, body: { Job: { id: concurrentStop.job_id } } }])
+    assert.equal((await api(`jobs/${concurrentStop.job_id}`)).status, 'failed')
+    assert.equal(state.stops, afterReplacementStops)
+  } finally {
+    releaseTraffic()
+    trafficGate = null
+  }
+  await eventually(async () => (await api(`jobs/${activeRefresh.job_id}`)).status === 'success', 'blocked refresh finishes')
+  await api(`accounts/${replacementId}`, 'DELETE')
+  state.instanceId = 'i-review'
+  state.status = 'Running'
+  console.log('✓ 刷新、账号编辑/删除、手动控制共用互斥，旧采集不能越过配置变更写回')
+
+  await db.prepare('UPDATE sessions SET last_seen_at = 1').run()
+  await api('jobs/obsolete-action')
+  const touched = (await db.prepare('SELECT last_seen_at FROM sessions').first()).last_seen_at
+  await db.prepare("INSERT INTO jobs (id, job_type, status, created_at, started_at) VALUES ('unrelated-stale', 'refresh_all', 'running', 1, 1)").run()
+  for (let i = 0; i < 5; i++) await api('jobs/obsolete-action')
+  assert.equal((await db.prepare('SELECT last_seen_at FROM sessions').first()).last_seen_at, touched)
+  assert.equal((await db.prepare("SELECT status FROM jobs WHERE id = 'unrelated-stale'").first()).status, 'running')
+  assert.equal((await api('jobs/unrelated-stale')).status, 'failed')
+  console.log('✓ 高频轮询每分钟最多更新一次会话，只回收所查询任务')
+
+  // 刚替换的存量账号尚无快照，应有完整的首次采集窗口。
+  await db.prepare('DELETE FROM account_snapshots WHERE account_id = ?').bind(id).run()
+  await db.prepare('UPDATE accounts SET created_at = ?, updated_at = ? WHERE id = ?').bind(Date.now() - 60 * 60_000, Date.now(), id).run()
+  trafficGate = new Promise(resolve => { releaseTraffic = resolve })
+  try {
+    await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: Date.now() })
+    assert.equal((await api('logs?action=collection_stalled')).length, 0)
+  } finally {
+    releaseTraffic()
+    trafficGate = null
+  }
+  await eventually(async () => (await snapshot())?.traffic_updated_at, 'replacement initial collection completes')
+  await eventually(async () => !(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`account-operation:${id}`).first()), 'initial collection releases operation')
+  // 模拟积压：本轮队列仍在等待云接口，派发端独立发现旧采样并告警。
+  await api('settings/telegram', 'PUT', { enabled: true })
+  await db.prepare('UPDATE account_snapshots SET traffic_updated_at = ?, instances_updated_at = ? WHERE account_id = ?').bind(Date.now() - 20 * 60_000, Date.now() - 20 * 60_000, id).run()
+  const beforeHealth = state.notifications
+  trafficGate = new Promise(resolve => { releaseTraffic = resolve })
+  try {
+    await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: Date.now() })
+    assert.equal(state.notifications, beforeHealth + 1)
+    assert.equal((await api('logs?action=collection_stalled')).length, 1)
+    await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: Date.now() + 1 })
+    assert.equal(state.notifications, beforeHealth + 1, 'stalled health alert must be deduplicated')
+  } finally {
+    releaseTraffic()
+    trafficGate = null
+  }
+  await eventually(async () => (await snapshot()).traffic_updated_at > Date.now() - 60_000, 'health test refresh completes')
+  await eventually(async () => !(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`account-operation:${id}`).first()), 'account operation finishes')
+  await api('settings/telegram', 'PUT', { enabled: false })
+  console.log('✓ 采集停滞告警在派发端执行，队列未完成仍可告警，并在送达后去重')
 
   state.stallTraffic = true
   let began = Date.now()

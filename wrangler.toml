@@ -89,21 +89,17 @@ max_batch_timeout = 1
 max_retries = 3
 retry_delay = 60
 max_concurrency = 2
+dead_letter_queue = "cdt-monitor-tasks-dlq"
 
 # ---------------------------------------------------------------------------
-# 可观测性：**默认关闭**
+# 可观测性：保留应用错误日志，关闭逐请求调用日志以控制写入量。
 #
-# Workers Logs 按写入量计费，而本项目每 5 分钟跑一次巡检，
-# 长时间开着会持续产生噪音与费用。应用层日志也默认只留 error
-# （见 src/logging.rs）。
-#
-# 排障时临时打开：
-#   1. 把下面的 enabled 改成 true 并推送，或
-#   2. 只在控制台 Settings → Observability 打开（不用改代码）
-# 同时到面板「设置 → 系统 → 日志级别」调成 info / warn 才能看到流程日志。
+# 默认应用层只输出 error；排障时在设置中临时改为 info / warn。
 # ---------------------------------------------------------------------------
-[observability]
-enabled = false
+[observability.logs]
+enabled = true
+invocation_logs = false
+head_sampling_rate = 1
 
 # ---------------------------------------------------------------------------
 # 无 [vars] 段

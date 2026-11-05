@@ -134,9 +134,11 @@
 | 构建命令（Build command） | `bun run build` |
 | 部署命令（Deploy command） | `bun run deploy` |
 
-部署脚本会创建 `cdt-monitor-tasks` 队列并绑定生产者和消费者。自定义构建 API Token 需要 D1、Workers Scripts 和 Queues 的编辑权限。构建仅在 Build command 执行一次，部署上传已有产物；本地部署前也请先运行 `bun run build`。
+部署脚本会创建 `cdt-monitor-tasks` 任务队列和 `cdt-monitor-tasks-dlq` 死信队列，并绑定生产者和消费者。自定义构建 API Token 需要 D1、Workers Scripts 和 Queues 的编辑权限。构建仅在 Build command 执行一次，部署上传已有产物；本地部署前也请先运行 `bun run build`。
 
 队列每条消息默认包含一次写入、读取和删除操作；每五分钟每账号巡检一次，约 864 次操作/账号/天，另有维护、手动任务和重试。请按账号规模核对 [Queues 当前额度](https://developers.cloudflare.com/queues/platform/pricing/)。
+
+按当前每轮每账号一条巡检消息、另加一条维护消息，基础用量为 `864 ×（启用账号数 + 1）次/天`。截至 2026-11-05，免费版包含 10,000 次操作/天：10 个账号约 9,504 次，11 个账号约 10,368 次。10 个账号也只剩 496 次余量，手动任务、页面补采和失败重试还会增加用量；接近边界时应减少启用账号数或使用付费套餐。
 
 ### 2. 设置 `BUN_VERSION`
 
@@ -276,7 +278,7 @@ cdt-monitor/
 | 项目 | 默认 | 调整方式 |
 |---|---|---|
 | 应用日志 | 仅 `error` | 设置 → 系统 → 日志级别 |
-| Workers Logs | 关闭 | `wrangler.toml` 的 `[observability] enabled`，或控制台开关 |
+| Workers Logs | 开启应用日志，关闭逐请求调用日志 | `wrangler.toml` 的 `[observability.logs]` |
 
 ```text
 error  解密失败、D1 不可用、任务失败
@@ -285,7 +287,11 @@ info   Cron 汇总、任务完成、保活拉起实例
 debug  同 info
 ```
 
-两级开关要同时开才看得到日志：级别控制「发不发」，Workers Logs 控制「收不收」。日志在 Cloudflare 控制台 **Workers → 本应用 → Logs** 里查看。
+应用默认只输出错误，Workers Logs 保留这些日志；正常请求不生成调用日志。排障时可临时将应用日志级别改为 `warn` / `info`，日志在 Cloudflare 控制台 **Workers → 本应用 → Logs** 里查看。
+
+Cron 派发端检查启用账号的流量和实例最近成功采集时间，超过 15 分钟未更新时记录「采集停滞」并通过已配置的通知渠道告警；送达后抑制重复告警 1 小时，失败则下一轮重试。该检查不依赖队列消费，可发现队列积压，但无法在 Cron 本身停止触发时发送告警，这种情况需由外部监控检测。
+
+队列重试耗尽的消息进入 `cdt-monitor-tasks-dlq`，在 Cloudflare Queues 控制台检查积压和死信。死信仅用于排障，不自动重放启停；处理故障后应核实实例当前状态，再提交新的操作。死信仍受队列保留期限制，并非永久备份。参见 [Cloudflare 死信队列说明](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/) 与 [Workers Logs 配置](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)。
 
 ---
 
@@ -381,6 +387,12 @@ debug  同 info
 
 任务提交写入 D1 后发送到 Queues，队列投递失败由 Cron 补发。队列采用至少一次投递，任务使用原子领取去重，已完成或结果不确定的启停任务不会因重投而重新执行。
 
+账号巡检采用 120 秒执行租约及 90 秒处理预算，成功后才写完成标记。采集失败、定时启停遇到过渡态或未知状态时允许消息重试；执行进程中断后可在租约过期时接管。重试前重新读取实例状态，并沿用启停动作各自的去重记录。超过 10 分钟的旧消息直接跳过，由新一轮巡检处理。
+
+概览的过渡态补采同样按账号入队，HTTP 直接返回已有快照。多页面请求在 45 秒内合并派发，后续轮询读取更新后的状态，避免多个账号的云请求和 D1 调用集中到一次 HTTP 请求中。
+
+日报只汇总有成功采集记录的当前账期流量，旧账期数值不计入合计；未采集账号及最近采集异常会在汇总和明细中说明。
+
 写接口返回 `202 Accepted + { job_id }`，前端轮询 `GET /api/v1/jobs/{job_id}`：
 
 ```json
@@ -403,7 +415,15 @@ debug  同 info
 
 登录接口每个来源 IP 在五分钟窗口内最多接受 10 次尝试（含并发请求），超出返回 `429` 和 `Retry-After`。已启用的人机校验在配置损坏或读取失败时拒绝登录。
 
-本次升级新增 `init_003_reliability.sql`，通过现有部署脚本先迁移再发布。迁移会将旧版尚未完成的任务标记失败，需要重新提交；存量快照的分项成功时间在下次成功采集时补齐。
+可靠性迁移 `init_003_reliability.sql` 会将旧执行器尚未完成的任务标记失败；分项成功时间在下次采集时补齐。本次新增 `init_004_account_identity.sql`，增加云账号身份、配置版本及锁 owner 索引，通过现有部署脚本先迁移再发布。升级前排队的手动启停消息没有配置版本，会失败并要求重新提交。部署迁移前应等待正在执行的旧版任务结束，避免新旧版本同时操作账号。
+
+新增账号及更换凭据时使用 STS [GetCallerIdentity](https://www.alibabacloud.com/help/en/ram/developer-reference/api-sts-2015-04-01-getcalleridentity) 核实所属主账号：同账号密钥轮换保留熔断和历史；更换主账号、站点或额度池时，配置更新与旧快照/流量历史清理原子提交。同一额度池内仅更换实例或地域时清空实例状态，保留账号级熔断。定时规则或资源变化会清除对应执行记录。
+
+存量账号在下次采集时补齐身份；若身份尚未记录且旧 AccessKey 已失效，替换为不同 AccessKey 时无法确认是否属于同一主账号，更新会被拒绝。此时可恢复旧密钥完成身份核实，或新增账号后迁移。使用相同 AccessKey ID 重新保存 Secret 可修复密文。
+
+账号编辑、删除、刷新、手动启停及自动化控制共用账号租约；忙碌时编辑返回 `409 account_busy`，需稍后重试。配置更新递增版本，旧版本排队的手动启停任务会失败，不会作用于新配置。手动启停先查询实时状态，达到目标时更新快照；查询失败、过渡态或未知状态不会直接报告成功。
+
+任务轮询只恢复所查询的任务，全局清理由 Cron 和任务提交时执行。会话的「最近活跃」每分钟最多写入一次，鉴权和吊销检查仍逐请求执行。
 
 `wrangler.toml` 保留 `no_nodejs_global_timers`，使 Rust SDK 的超时定时器使用数字 ID。配置自检会检查此项；删除后可能导致 Wasm 定时器运行异常。
 
@@ -541,11 +561,15 @@ curl http://localhost:8787/cdn-cgi/local/scheduled
 
 #### 4. 测试与构建校验
 
+`bun run build` 会在发布前执行 Rust 单元测试、Clippy、前端类型检查及 Worker 集成测试，任一失败即停止构建；集成测试直接使用本轮构建产物，Worker 只编译一次。
+
 ```bash
 cargo test --locked                                            # 单元测试
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 bun run typecheck:web
 bun run check:config
-bun run test:worker                                            # 本地 Worker + D1 流程测试（云接口模拟）
+bun run test:worker                                            # 构建并运行 Worker + D1 流程测试（云接口模拟）
+bun run test:worker:built                                      # 复用已有 Worker 产物运行集成测试
+bun run test                                                  # 单测、类型/配置检查、Clippy、Worker 集成测试
 bun run build
 ```

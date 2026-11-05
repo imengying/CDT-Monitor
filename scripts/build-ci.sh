@@ -68,6 +68,10 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 log "Rust: $(cargo --version)"
 
+if ! cargo clippy --version >/dev/null 2>&1; then
+  rustup component add clippy
+fi
+
 # rust-toolchain.toml 声明了 wasm32-unknown-unknown，但 Cloudflare 用的是
 # 一次性容器，rustup 可能还没装这个 target。
 target_libdir="$(rustc --print target-libdir --target wasm32-unknown-unknown)"
@@ -115,6 +119,10 @@ log "安装前端依赖"
 log "前端类型检查"
 bun run typecheck:web
 
+log "Rust 单元测试与 Clippy"
+cargo test --locked
+cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+
 log "构建前端 → web/dist"
 ( cd web && bun run build )
 
@@ -133,6 +141,9 @@ if [ ! -f build/worker/shim.mjs ]; then
   echo "错误：Worker 构建失败，build/worker/shim.mjs 不存在" >&2
   exit 1
 fi
+
+log "Worker 集成测试（复用已构建产物，云接口全部模拟）"
+bun run test:worker:built
 
 # ---------------------------------------------------------------------------
 # 7. 用 Wrangler 打包完整产物并校验大小（不发布、不连接云资源）。

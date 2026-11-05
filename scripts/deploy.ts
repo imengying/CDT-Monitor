@@ -81,9 +81,9 @@ function migrate(): void {
   }
 }
 
-function ensureQueue(): void {
-  log(`确保任务队列 ${QUEUE} 存在`);
-  const result = run(["queues", "create", QUEUE], true);
+function ensureQueue(name: string): void {
+  log(`确保队列 ${name} 存在`);
+  const result = run(["queues", "create", name], true);
   if (!result.ok && !/already exists|already taken|已存在|duplicate/i.test(result.out)) {
     console.error(result.out.trim());
     throw new Error("创建任务队列失败，请检查 API Token 的 Queues 编辑权限");
@@ -119,7 +119,8 @@ function main(): void {
     if (!existsSync(file)) throw new Error(`缺少构建产物 ${file}，请先运行 bun run build`);
   }
   ensureDatabase();
-  ensureQueue();
+  ensureQueue(QUEUE);
+  ensureQueue(`${QUEUE}-dlq`);
   migrate();
   deploy();
   log("部署完成");

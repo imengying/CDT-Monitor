@@ -587,6 +587,8 @@ impl HistoryBucket {}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccountRow {
     pub id: i64,
+    pub cloud_account_id: Option<String>,
+    pub config_version: i64,
     pub name: String,
     pub site_type: String,
     pub access_key_id: String,
@@ -2027,6 +2029,8 @@ mod tests {
     #[test]
     fn overview_synthesizes_instance_without_snapshot() {
         let account = AccountRow {
+            cloud_account_id: None,
+            config_version: 1,
             id: 1,
             name: "测试".to_string(),
             site_type: "china".to_string(),
@@ -2069,6 +2073,8 @@ mod tests {
     #[test]
     fn overview_keeps_snapshot_instances() {
         let account = AccountRow {
+            cloud_account_id: None,
+            config_version: 1,
             id: 2,
             name: "测试".to_string(),
             site_type: "china".to_string(),

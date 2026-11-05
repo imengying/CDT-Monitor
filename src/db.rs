@@ -25,6 +25,8 @@ use crate::models::{
     LogFilter, SessionRow, SnapshotRow, SnapshotUpdate, TrafficSample, setting_key,
 };
 
+pub const ACCOUNT_BUSY: &str = "账号正在执行操作，请稍后重试";
+
 // ===========================================================================
 // 参数绑定辅助
 // ===========================================================================
@@ -88,6 +90,50 @@ pub struct Db {
 impl Db {
     pub fn new(env: &Env) -> Self {
         Self { env: env.clone() }
+    }
+
+    /// 配置编辑、采集与所有实例控制共用租约；预算短于租约，超时后释放。
+    pub async fn with_account_lock<T>(
+        &self,
+        id: i64,
+        budget_ms: u64,
+        work: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let key = format!("account-operation:{id}");
+        let owner = crate::crypto::random_hex(8)?;
+        if !self
+            .acquire_lock(&key, &owner, crate::models::now_ms(), 120_000)
+            .await?
+        {
+            return Err(worker::Error::RustError(ACCOUNT_BUSY.into()));
+        }
+        let result = crate::runtime::timeout(budget_ms.min(85_000), work)
+            .await
+            .unwrap_or_else(|e| Err(worker::Error::RustError(e.into())));
+        self.release_lock(&key, &owner).await?;
+        result
+    }
+
+    pub async fn account_at_version(&self, id: i64, version: i64) -> Result<AccountRow> {
+        let account = self
+            .get_account(id)
+            .await?
+            .ok_or_else(|| worker::Error::RustError("账号不存在".into()))?;
+        if account.config_version != version {
+            return Err(worker::Error::RustError(
+                "账号配置已变更，请刷新后重新提交".into(),
+            ));
+        }
+        Ok(account)
+    }
+
+    pub async fn set_cloud_account_id(&self, id: i64, cloud_id: &str) -> Result<()> {
+        self.exec(
+            "UPDATE accounts SET cloud_account_id = ? WHERE id = ?",
+            &[j_text(cloud_id), j_i64(id)],
+        )
+        .await?;
+        Ok(())
     }
 
     /// 取出 D1 绑定（`wrangler.toml` 中 `binding = "DB"`）。
@@ -255,6 +301,7 @@ impl Db {
         name: &str,
         site_type: &str,
         access_key_id: &str,
+        cloud_account_id: &str,
         encrypted_secret: &str,
         region_id: &str,
         instance_id: &str,
@@ -272,7 +319,7 @@ impl Db {
     ) -> Result<i64> {
         self.insert(
             "INSERT INTO accounts (
-                name, site_type, access_key_id, encrypted_access_key_secret,
+                name, site_type, access_key_id, cloud_account_id, encrypted_access_key_secret,
                 region_id, instance_id, traffic_threshold_gb,
                 over_limit_action, stop_mode,
                 schedule_start_time, schedule_stop_time, spot_keep_alive, enabled,
@@ -280,11 +327,12 @@ impl Db {
                 last_schedule_start_date, last_schedule_stop_date,
                 last_schedule_start_at, last_schedule_stop_at,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
             &[
                 j_text(name),
                 j_text(site_type),
                 j_text(access_key_id),
+                j_text(cloud_account_id),
                 j_text(encrypted_secret),
                 j_text(region_id),
                 j_text(instance_id),
@@ -310,6 +358,8 @@ impl Db {
     pub async fn update_account(
         &self,
         id: i64,
+        previous: &AccountRow,
+        cloud_account_id: Option<&str>,
         name: &str,
         site_type: &str,
         access_key_id: &str,
@@ -336,7 +386,7 @@ impl Db {
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
                     schedule_mode = ?, schedule_start_cron = ?, schedule_stop_cron = ?,
-                    enabled = ?, updated_at = ?
+                    enabled = ?, updated_at = ?, cloud_account_id = ?, config_version = config_version + 1
                  WHERE id = ?"
             }
             None => {
@@ -346,7 +396,7 @@ impl Db {
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
                     schedule_mode = ?, schedule_start_cron = ?, schedule_stop_cron = ?,
-                    enabled = ?, updated_at = ?
+                    enabled = ?, updated_at = ?, cloud_account_id = ?, config_version = config_version + 1
                  WHERE id = ?"
             }
         };
@@ -369,15 +419,39 @@ impl Db {
             j_opt_text(schedule_stop_cron),
             j_bool(enabled),
             j_i64(now_ms),
+            j_opt_text(cloud_account_id),
             j_i64(id),
         ]);
 
-        let changed = self.exec(sql, &params).await?;
-        // SQLite 会把「值相同的 UPDATE」也算作 1 行变更；这里只在 0 行时
-        // 额外确认一次账号是否真的不存在，避免把正常的无改动更新误报成错误。
-        if changed == 0 && self.get_account(id).await?.is_none() {
-            return Err(worker::Error::RustError("账号不存在".to_string()));
+        let db = self.conn()?;
+        let mut statements = vec![db.prepare(sql).bind(&params)?];
+        let identity_changed = previous.cloud_account_id.as_deref() != cloud_account_id;
+        let pool_changed = previous.quota_pool() != crate::models::QuotaPool::of_region(region_id);
+        let reset_traffic = identity_changed || previous.site_type != site_type || pool_changed;
+        let resource_changed = reset_traffic
+            || previous.region_id != region_id
+            || previous.instance_id_opt() != Some(instance_id);
+        if reset_traffic {
+            for table in ["account_snapshots", "traffic_hourly", "traffic_daily"] {
+                statements.push(
+                    db.prepare(format!("DELETE FROM {table} WHERE account_id = ?"))
+                        .bind(&[j_i64(id)])?,
+                );
+            }
+        } else if resource_changed {
+            statements.push(db.prepare("UPDATE account_snapshots SET instances_json = '[]', instances_updated_at = NULL, threshold_stop_status = NULL, threshold_notified_month = NULL WHERE account_id = ?").bind(&[j_i64(id)])?);
         }
+        if resource_changed
+            || previous.schedule_start_time.as_deref() != schedule_start_time
+            || previous.schedule_stop_time.as_deref() != schedule_stop_time
+            || previous.schedule_mode.as_deref().unwrap_or("simple") != schedule_mode
+            || previous.schedule_start_cron.as_deref() != schedule_start_cron
+            || previous.schedule_stop_cron.as_deref() != schedule_stop_cron
+        {
+            statements.push(db.prepare("UPDATE accounts SET last_schedule_start_date = NULL, last_schedule_stop_date = NULL, last_schedule_start_at = NULL, last_schedule_stop_at = NULL WHERE id = ?").bind(&[j_i64(id)])?);
+        }
+        // 配置和关联状态一起提交，失败时全部回滚。
+        db.batch(statements).await?;
         Ok(())
     }
 
@@ -448,6 +522,20 @@ impl Db {
             &[j_i64(account_id)],
         )
         .await
+    }
+
+    /// 手动动作前的实时实例查询只更新实例来源，保留流量、余额与熔断。
+    pub async fn save_live_instance(
+        &self,
+        account_id: i64,
+        instance: &InstanceInfo,
+        now: i64,
+    ) -> Result<()> {
+        let json = serde_json::to_string(&[instance])
+            .map_err(|e| worker::Error::RustError(e.to_string()))?;
+        self.exec("INSERT INTO account_snapshots (account_id, instances_json, instances_updated_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET instances_json = excluded.instances_json, instances_updated_at = excluded.instances_updated_at, updated_at = excluded.updated_at",
+            &[j_i64(account_id), j_text(&json), j_i64(now), j_i64(now)]).await?;
+        Ok(())
     }
 
     /// 覆盖写入快照。
@@ -707,6 +795,17 @@ impl Db {
         Ok(())
     }
 
+    /// 轮询和单任务投递只回收目标任务；owner 索引避免扫描全部历史锁。
+    pub async fn recover_job(&self, id: &str, now: i64) -> Result<()> {
+        self.conn()?.batch(vec![
+            self.stmt("UPDATE jobs SET status = 'failed', error_msg = '执行中断或超时，请刷新实例状态后重新提交', finished_at = ? WHERE id = ? AND ((status = 'running' AND COALESCE(started_at, created_at) <= ?) OR (status = 'pending' AND created_at <= ?))")?
+                .bind(&[j_i64(now), j_text(id), j_i64(now - 60_000), j_i64(now - 24 * 60 * 60_000)])?,
+            self.stmt("DELETE FROM locks WHERE owner = ? AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status IN ('failed', 'success'))")?
+                .bind(&[j_text(id), j_text(id)])?,
+        ]).await?;
+        Ok(())
+    }
+
     pub async fn pending_jobs(&self) -> Result<Vec<JobRow>> {
         self.query(
             "SELECT * FROM jobs WHERE status = 'pending' ORDER BY created_at LIMIT 10",
@@ -909,6 +1008,33 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// 此消息是否已成功执行；完成标记与短期执行租约共用 locks 表。
+    pub async fn task_completed(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .query_first::<serde_json::Value>(
+                "SELECT name FROM locks WHERE name = ? AND owner = 'completed'",
+                &[j_text(name)],
+            )
+            .await?
+            .is_some())
+    }
+
+    /// 将执行租约转为完成标记；旧执行者不能覆盖后继执行者的租约。
+    pub async fn complete_task(&self, name: &str, owner: &str, expires_at: i64) -> Result<()> {
+        let changed = self
+            .exec(
+                "UPDATE locks SET owner = 'completed', expires_at = ? WHERE name = ? AND owner = ?",
+                &[j_i64(expires_at), j_text(name), j_text(owner)],
+            )
+            .await?;
+        if changed == 0 {
+            return Err(worker::Error::RustError(
+                "任务租约已失效，请重试核实".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// 释放自己持有的锁（owner 不匹配时不会误删）。
     pub async fn release_lock(&self, name: &str, owner: &str) -> Result<bool> {
         let changed = self
@@ -987,8 +1113,8 @@ impl Db {
     /// 刷新活跃时间（供「最近活跃」展示）。
     pub async fn touch_session(&self, sid: &str, now_ms: i64) -> Result<()> {
         self.exec(
-            "UPDATE sessions SET last_seen_at = ? WHERE sid = ?",
-            &[j_i64(now_ms), j_text(sid)],
+            "UPDATE sessions SET last_seen_at = ? WHERE sid = ? AND last_seen_at <= ?",
+            &[j_i64(now_ms), j_text(sid), j_i64(now_ms - 60_000)],
         )
         .await?;
         Ok(())

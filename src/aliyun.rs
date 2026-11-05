@@ -283,6 +283,23 @@ impl AliyunClient {
         self.site
     }
 
+    /// 使用所属主账号 ID 识别身份，RAM 用户和 AccessKey 轮换不会改变它。
+    pub async fn caller_account_id(&self) -> Result<String, AliyunError> {
+        let endpoint = match self.site {
+            SiteType::China => "https://sts.cn-hangzhou.aliyuncs.com",
+            SiteType::Intl => "https://sts.ap-southeast-1.aliyuncs.com",
+        };
+        let value = self
+            .call(endpoint, "2015-04-01", "GetCallerIdentity", vec![])
+            .await?;
+        value
+            .get("AccountId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            .map(str::to_owned)
+            .ok_or_else(|| AliyunError::Parse("STS 未返回有效的 AccountId".into()))
+    }
+
     // -----------------------------------------------------------------------
     // 底层 RPC
     // -----------------------------------------------------------------------

@@ -28,6 +28,7 @@ export const ACTION_LABELS: Record<string, string> = {
   manual_stop_failed: '手动关机失败',
   refresh_warning: '采集告警',
   refresh_failed: '采集失败',
+  collection_stalled: '采集停滞',
   account_created: '新增账号',
   account_updated: '更新账号',
   account_deleted: '删除账号',
@@ -61,6 +62,7 @@ export type LogFilterKey = (typeof LOG_FILTERS)[number][0]
 function dotClass(actionType: string): string {
   if (
     actionType.includes('failed') ||
+    actionType.includes('stalled') ||
     actionType.includes('threshold') ||
     actionType.includes('blocked')
   ) {

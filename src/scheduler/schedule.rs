@@ -88,10 +88,15 @@ impl Scheduler {
             .acquire_lock(&lock_name, &owner, now_ms(), 60_000)
             .await?
         {
+            report.retry_needed = true;
             return Ok(());
         }
 
         let instances = self.db.snapshot_instances(account.id).await?;
+        let unresolved = instances.is_empty()
+            || instances
+                .iter()
+                .any(|instance| !instance.is_running() && !instance.is_stopped());
         let running: Vec<InstanceInfo> = instances
             .into_iter()
             .filter(|instance| instance.is_running())
@@ -144,12 +149,13 @@ impl Scheduler {
             }
         }
 
-        // 只在「全部成功」或「本来就没有运行中的实例」时标记当日完成。
-        // 任一实例失败都不标记，让 10 分钟窗口内的下一轮 Cron 继续重试。
-        if ok_count == running.len() {
+        // 过渡态、未知或缺少实例都不能证明关机目标已完成。
+        if !unresolved && ok_count == running.len() {
             self.db
                 .mark_schedule_done(account.id, false, &today, now_ms())
                 .await?;
+        } else {
+            report.retry_needed = true;
         }
         let _ = self.db.release_lock(&lock_name, &owner).await;
 
@@ -207,10 +213,15 @@ impl Scheduler {
             .acquire_lock(&lock_name, &owner, now_ms(), 60_000)
             .await?
         {
+            report.retry_needed = true;
             return Ok(());
         }
 
         let instances = self.db.snapshot_instances(account.id).await?;
+        let unresolved = instances.is_empty()
+            || instances
+                .iter()
+                .any(|instance| !instance.is_running() && !instance.is_stopped());
         let stopped: Vec<InstanceInfo> = instances
             .into_iter()
             .filter(|instance| instance.is_stopped())
@@ -259,10 +270,12 @@ impl Scheduler {
             }
         }
 
-        if ok_count == stopped.len() {
+        if !unresolved && ok_count == stopped.len() {
             self.db
                 .mark_schedule_done(account.id, true, &today, now_ms())
                 .await?;
+        } else {
+            report.retry_needed = true;
         }
         let _ = self.db.release_lock(&lock_name, &owner).await;
 
@@ -407,6 +420,7 @@ impl Scheduler {
                         .await?;
                 }
                 Err(err) => {
+                    report.retry_needed = true;
                     report.notes.push(format!(
                         "{} 保活失败（{}）：{}",
                         account.name,

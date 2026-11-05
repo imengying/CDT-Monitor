@@ -16,10 +16,14 @@ pub(crate) enum JobTask {
     StartInstance {
         account_id: i64,
         instance_id: String,
+        #[serde(default)]
+        config_version: i64,
     },
     StopInstance {
         account_id: i64,
         instance_id: String,
+        #[serde(default)]
+        config_version: i64,
     },
     NotifyTest {
         channel: Option<NotifyChannel>,
@@ -64,10 +68,12 @@ impl JobTask {
             JobTask::StartInstance {
                 account_id,
                 instance_id,
+                ..
             }
             | JobTask::StopInstance {
                 account_id,
                 instance_id,
+                ..
             } => Some(format!("job:instance:{account_id}:{instance_id}")),
             _ => None,
         }
@@ -214,15 +220,17 @@ async fn execute_segment(env: Env, job_id: String) {
                     JobTask::StartInstance {
                         account_id,
                         instance_id,
+                        config_version,
                     } => scheduler
-                        .instance_action(account_id, &instance_id, true)
+                        .instance_action(account_id, &instance_id, true, config_version)
                         .await
                         .map(|result| result.detail),
                     JobTask::StopInstance {
                         account_id,
                         instance_id,
+                        config_version,
                     } => scheduler
-                        .instance_action(account_id, &instance_id, false)
+                        .instance_action(account_id, &instance_id, false, config_version)
                         .await
                         .map(|result| result.detail),
                     JobTask::NotifyTest { channel } => {
@@ -282,7 +290,7 @@ pub(crate) async fn spawn_job(
     task: JobTask,
 ) -> worker::Result<Response> {
     app.db.recover_jobs(now_ms()).await?;
-    let task = if matches!(task, JobTask::RefreshAll) {
+    let mut task = if matches!(task, JobTask::RefreshAll) {
         let remaining: Vec<i64> = app
             .db
             .list_accounts(true)
@@ -307,10 +315,17 @@ pub(crate) async fn spawn_job(
     // 先确认账号存在：jobs 表对 account_id 有外键，直接插入会得到
     // 「FOREIGN KEY constraint failed」并被翻译成 500，掩盖了真实原因
     // （账号已被删除或 ID 手误）。在这里提前给出 404。
-    if let Some(id) = account_id
-        && app.db.get_account(id).await?.is_none()
-    {
-        return error_response(404, "账号不存在");
+    if let Some(id) = account_id {
+        let Some(account) = app.db.get_account(id).await? else {
+            return error_response(404, "账号不存在");
+        };
+        match &mut task {
+            JobTask::StartInstance { config_version, .. }
+            | JobTask::StopInstance { config_version, .. } => {
+                *config_version = account.config_version;
+            }
+            _ => {}
+        }
     }
 
     let job_id =

@@ -131,6 +131,8 @@ pub struct CronReport {
     pub instances_stopped: usize,
     pub keep_alive_started: usize,
     pub report_sent: bool,
+    /// 采集、状态过渡或自动化动作尚未完成，允许队列重新核实。
+    pub retry_needed: bool,
     /// 逐条明细（日志用）。
     pub notes: Vec<String>,
 }
@@ -365,20 +367,30 @@ impl Scheduler {
 
     /// 刷新单个账号：采集 → 合并保活标记 → 写快照 → 采样 → 阈值判定。
     pub async fn refresh_account(&self, account: &AccountRow) -> RefreshOutcome {
-        let owner = match random_hex(8) {
-            Ok(owner) => owner,
-            Err(e) => return RefreshOutcome::failed(account, e.to_string()),
-        };
-        let lock = format!("account-refresh:{}", account.id);
-        match self.db.acquire_lock(&lock, &owner, now_ms(), 60_000).await {
-            Ok(true) => {}
-            Ok(false) => return RefreshOutcome::failed(account, "账号正在刷新，请稍后重试".into()),
-            Err(e) => return RefreshOutcome::failed(account, e.to_string()),
-        }
+        let result = self
+            .db
+            .with_account_lock(account.id, 20_000, async {
+                self.db
+                    .account_at_version(account.id, account.config_version)
+                    .await?;
+                self.refresh_account_inner(account).await
+            })
+            .await;
+        self.refresh_outcome(account, result).await
+    }
+
+    async fn refresh_locked(&self, account: &AccountRow) -> RefreshOutcome {
         let result = crate::runtime::timeout(20_000, Box::pin(self.refresh_account_inner(account)))
             .await
             .unwrap_or_else(|e| Err(worker::Error::RustError(e.into())));
-        let _ = self.db.release_lock(&lock, &owner).await;
+        self.refresh_outcome(account, result).await
+    }
+
+    async fn refresh_outcome(
+        &self,
+        account: &AccountRow,
+        result: worker::Result<RefreshOutcome>,
+    ) -> RefreshOutcome {
         match result {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -392,28 +404,15 @@ impl Scheduler {
         }
     }
 
-    /// 过渡态下的按需采集：带 45 秒防抖。
-    ///
-    /// 前端在实例处于 `Starting` / `Stopping` 时每分钟请求一次 overview，
-    /// 多标签页同时开着仍会成倍放大调用量。这里用 TTL 锁把同一账号的采集
-    /// 频率压到最多 45 秒一次（下一分钟轮询时锁已过期，可正常再采）。
-    pub async fn refresh_account_throttled(&self, account: &AccountRow) -> Option<RefreshOutcome> {
-        let owner = random_hex(8).ok()?;
-        let key = format!("transition-refresh:{}", account.id);
-        let acquired = self
-            .db
-            .acquire_lock(&key, &owner, now_ms(), TRANSITION_REFRESH_TTL_MS)
-            .await
-            .ok()?;
-        if !acquired {
-            return None;
-        }
-        Some(self.refresh_account(account).await)
-    }
-
     async fn refresh_account_inner(&self, account: &AccountRow) -> worker::Result<RefreshOutcome> {
         let secret = self.account_secret(account)?;
         let client = AliyunClient::from_account(account, secret);
+        if account.cloud_account_id.is_none() {
+            match client.caller_account_id().await {
+                Ok(id) => self.db.set_cloud_account_id(account.id, &id).await?,
+                Err(err) => log_error!("账号 {} 身份核实失败：{}", account.id, err.short()),
+            }
+        }
         let sync =
             crate::aliyun::sync_account(&client, &account.region_id, account.instance_id_opt())
                 .await;
@@ -716,6 +715,8 @@ impl Scheduler {
 
         let mut details = Vec::new();
         let mut used_total_gb = 0.0f64;
+        let mut missing_traffic = 0usize;
+        let mut collection_warnings = 0usize;
         let mut triggered = 0usize;
         let mut running = 0usize;
         let mut stopped = 0usize;
@@ -723,7 +724,14 @@ impl Scheduler {
         for account in &accounts {
             let snapshot = snapshots.get(&account.id);
             let overview: AccountOverview = build_overview(account, snapshot, tz, self.now);
-            used_total_gb += overview.traffic_used_gb;
+            if overview.traffic_current {
+                used_total_gb += overview.traffic_used_gb;
+            } else {
+                missing_traffic += 1;
+            }
+            if !overview.sync_errors.is_empty() {
+                collection_warnings += 1;
+            }
             if overview.threshold_triggered {
                 triggered += 1;
             }
@@ -742,20 +750,36 @@ impl Scheduler {
                 (Some(amount), currency) => human_amount(amount, currency),
                 (None, _) => "未知".to_string(),
             };
+            let traffic = if overview.traffic_current {
+                format!(
+                    "{:.2} / {} GB（{:.2}%）",
+                    overview.traffic_used_gb,
+                    trim_float(overview.quota_gb),
+                    overview.percentage
+                )
+            } else {
+                "本月流量待采集（未计入合计）".to_string()
+            };
             details.push(format!(
-                "{}（{} · {}）：{:.2} / {} GB（{:.2}%）｜余额 {}｜实例 {} 台{}",
+                "{}（{} · {}）：{}｜余额 {}｜实例 {} 台{}{}",
                 overview.name,
                 overview.region_name,
                 overview.quota_label,
-                overview.traffic_used_gb,
-                trim_float(overview.quota_gb),
-                overview.percentage,
+                traffic,
                 balance,
                 overview.instances.len(),
                 if overview.threshold_triggered {
                     "｜⚠️ 已熔断"
                 } else {
                     ""
+                },
+                if overview.sync_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "｜采集异常，展示最近成功数据：{}",
+                        overview.sync_errors.join("；")
+                    )
                 }
             ));
         }
@@ -765,10 +789,12 @@ impl Scheduler {
         }
 
         let body = format!(
-            "{} 概览：{} 个账号，合计流量 {:.2} GB，实例运行 {} / 停止 {}，已熔断 {} 个。",
+            "{} 概览：{} 个账号，已采集的本月合计流量 {:.2} GB，{} 个账号本月流量待采集，{} 个账号最近采集异常，实例运行 {} / 停止 {}，已熔断 {} 个。",
             local_date(self.now, tz),
             accounts.len(),
             used_total_gb,
+            missing_traffic,
+            collection_warnings,
             running,
             stopped,
             triggered
@@ -799,58 +825,78 @@ impl Scheduler {
         account_id: i64,
         instance_id: &str,
         start: bool,
+        config_version: i64,
     ) -> worker::Result<InstanceActionResult> {
-        let account = self
-            .db
-            .get_account(account_id)
-            .await?
-            .ok_or_else(|| worker::Error::RustError(format!("账号 {account_id} 不存在")))?;
+        self.db
+            .with_account_lock(account_id, 20_000, async {
+                let account = self
+                    .db
+                    .account_at_version(account_id, config_version)
+                    .await?;
+                self.instance_action_locked(&account, instance_id, start)
+                    .await
+            })
+            .await
+    }
+
+    async fn instance_action_locked(
+        &self,
+        account: &AccountRow,
+        instance_id: &str,
+        start: bool,
+    ) -> worker::Result<InstanceActionResult> {
+        let account_id = account.id;
 
         if account.instance_id_opt() != Some(instance_id) {
             return Err(worker::Error::RustError("实例 ID 与账号配置不一致".into()));
         }
-        let instances = self.db.snapshot_instances(account_id).await?;
-        let target = instances
-            .into_iter()
-            .find(|instance| instance.instance_id == instance_id);
-
-        let region_id = match target.as_ref() {
-            Some(instance) => instance.region_id.clone(),
-            None => account.region_id.clone(),
-        };
-
-        if start && self.threshold_blocked(&account).await? {
+        if start && self.threshold_blocked(account).await? {
             return Err(worker::Error::RustError(
-                "本月已触发流量熔断停机，禁止开机；请提升阈值并成功刷新，或等待下个账期"
-                    .to_string(),
+                "本月已触发流量熔断停机，禁止开机；请提升阈值并成功刷新，或等待下个账期".into(),
+            ));
+        }
+        let client = AliyunClient::from_account(account, self.account_secret(account)?);
+        let region_id = &account.region_id;
+        let mut instance = client
+            .describe_instance(region_id, instance_id)
+            .await?
+            .filter(|i| i.instance_id == instance_id)
+            .ok_or_else(|| {
+                worker::Error::RustError("云端找不到配置的实例，请核实地域和实例 ID".into())
+            })?;
+        instance.keep_alive = self
+            .db
+            .snapshot_instances(account_id)
+            .await?
+            .iter()
+            .find(|i| i.instance_id == instance_id)
+            .is_some_and(|i| i.keep_alive);
+        self.db
+            .save_live_instance(account_id, &instance, now_ms())
+            .await?;
+        if (start && instance.is_running()) || (!start && instance.is_stopped()) {
+            return Ok(InstanceActionResult {
+                instance_id: instance_id.into(),
+                ok: true,
+                detail: if start {
+                    "已核实实例正在运行，无需开机"
+                } else {
+                    "已核实实例已停止，无需关机"
+                }
+                .into(),
+            });
+        }
+        if !(instance.is_running() || instance.is_stopped()) {
+            return Err(worker::Error::RustError(
+                "实例正在过渡或状态未知，请稍后刷新重试".into(),
             ));
         }
 
-        if let Some(instance) = target.as_ref() {
-            if start && instance.is_running() {
-                return Ok(InstanceActionResult {
-                    instance_id: instance_id.to_string(),
-                    ok: true,
-                    detail: "实例已在运行中，无需开机".to_string(),
-                });
-            }
-            if !start && instance.is_stopped() {
-                return Ok(InstanceActionResult {
-                    instance_id: instance_id.to_string(),
-                    ok: true,
-                    detail: "实例已处于停止状态".to_string(),
-                });
-            }
-        }
-
-        let secret = self.account_secret(&account)?;
-        let client = AliyunClient::from_account(&account, secret);
-
         let result = if start {
-            client.start_instance(instance_id, &region_id).await
+            client.start_instance(instance_id, region_id).await
         } else {
             client
-                .stop_instance(instance_id, &region_id, account.stop_mode())
+                .stop_instance(instance_id, region_id, account.stop_mode())
                 .await
         };
 
@@ -899,7 +945,7 @@ impl Scheduler {
         // 动作后立即刷新，保证前端轮询结束时看到的是真实状态；
         // 若阿里云尚未落到终态（刚发出指令常如此），把快照置为过渡态，
         // 让前端显示「正在启动…」并切到 1 分钟轮询。
-        let refresh = self.refresh_account(&account).await;
+        let refresh = self.refresh_locked(account).await;
         if !refresh.success {
             log_warn!("动作后刷新失败：{}", refresh.warnings.join("；"));
         }
@@ -952,6 +998,21 @@ impl Scheduler {
 
     /// 切换逐实例抢占式保活开关。
     pub async fn set_instance_keep_alive(
+        &self,
+        account_id: i64,
+        instance_id: &str,
+        enabled: bool,
+    ) -> worker::Result<()> {
+        self.db
+            .with_account_lock(
+                account_id,
+                10_000,
+                self.set_instance_keep_alive_locked(account_id, instance_id, enabled),
+            )
+            .await
+    }
+
+    async fn set_instance_keep_alive_locked(
         &self,
         account_id: i64,
         instance_id: &str,
@@ -1010,15 +1071,40 @@ impl Scheduler {
 
     /// 一个队列消息只巡检一个账号，独享该次 Worker 的 D1 调用额度。
     pub async fn run_account_cron(&self, account: &AccountRow) -> CronReport {
+        match self
+            .db
+            .with_account_lock(account.id, 85_000, async {
+                self.db
+                    .account_at_version(account.id, account.config_version)
+                    .await?;
+                Ok(self.run_account_cron_locked(account).await)
+            })
+            .await
+        {
+            Ok(report) => report,
+            Err(err) => CronReport {
+                accounts_total: 1,
+                accounts_failed: usize::from(
+                    !matches!(&err, worker::Error::RustError(message) if message == crate::db::ACCOUNT_BUSY),
+                ),
+                retry_needed: true,
+                notes: vec![err.to_string()],
+                ..CronReport::default()
+            },
+        }
+    }
+
+    async fn run_account_cron_locked(&self, account: &AccountRow) -> CronReport {
         let mut report = CronReport {
             accounts_total: 1,
             ..CronReport::default()
         };
-        let outcome = self.refresh_account(account).await;
+        let outcome = self.refresh_locked(account).await;
         if outcome.success {
             report.accounts_refreshed += 1;
         } else {
             report.accounts_failed += 1;
+            report.retry_needed = true;
             report.notes.push(format!(
                 "{} 刷新失败：{}",
                 account.name,
@@ -1039,14 +1125,25 @@ impl Scheduler {
         }
 
         // 快照可能已被本次刷新更新，重新读取用于后续判断
-        let snapshot = self.db.get_snapshot(account.id).await.ok().flatten();
+        let snapshot = match self.db.get_snapshot(account.id).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                report.retry_needed = true;
+                report
+                    .notes
+                    .push(format!("{} 读取快照失败：{err}", account.name));
+                return report;
+            }
+        };
 
         if let Err(err) = self.maybe_scheduled_stop(account, &mut report).await {
+            report.retry_needed = true;
             report
                 .notes
                 .push(format!("{} 定时关机异常：{err}", account.name));
         }
         if let Err(err) = self.maybe_scheduled_start(account, &mut report).await {
+            report.retry_needed = true;
             report
                 .notes
                 .push(format!("{} 定时开机异常：{err}", account.name));
@@ -1055,6 +1152,7 @@ impl Scheduler {
             .maybe_keep_alive(account, snapshot.as_ref(), &mut report)
             .await
         {
+            report.retry_needed = true;
             report
                 .notes
                 .push(format!("{} 保活异常：{err}", account.name));
@@ -1066,6 +1164,63 @@ impl Scheduler {
         let mut report = CronReport::default();
         self.housekeeping(&mut report).await;
         self.maybe_daily_report(&mut report).await?;
+        Ok(())
+    }
+
+    /// 在 Cron 派发端运行，队列积压时仍可发现采集停滞。
+    pub async fn check_collection_health(&self) -> worker::Result<()> {
+        let accounts = self.db.list_accounts(true).await?;
+        let snapshots: HashMap<_, _> = self
+            .db
+            .list_snapshots()
+            .await?
+            .into_iter()
+            .map(|s| (s.account_id, s))
+            .collect();
+        let mut details = Vec::new();
+        for account in accounts {
+            let snapshot = snapshots.get(&account.id);
+            // 刚更换身份导致快照清空时，从配置更新时间开始给采集留出窗口。
+            let baseline = if snapshot.is_none() {
+                account.updated_at
+            } else {
+                account.created_at
+            };
+            let traffic_at = snapshot
+                .and_then(|s| s.traffic_updated_at)
+                .unwrap_or(baseline);
+            let instances_at = snapshot
+                .and_then(|s| s.instances_updated_at)
+                .unwrap_or(baseline);
+            let age = self.now.saturating_sub(traffic_at.min(instances_at));
+            if age >= 15 * 60_000 {
+                details.push(format!(
+                    "{}：流量或实例状态已 {} 分钟未成功采集",
+                    account.name,
+                    age / 60_000
+                ));
+            }
+        }
+        if details.is_empty() {
+            return Ok(());
+        }
+        let message = Message::alert("采集停滞", "请检查云接口、队列积压及 Worker 错误日志")
+            .with_details(details.clone())
+            .with_group("CDT-Health");
+        if self
+            .notify_once("collection-health", 60 * 60_000, message)
+            .await
+            .is_some()
+        {
+            let detail = details.join("；");
+            log_error!(
+                "{}",
+                serde_json::json!({"event": "collection_stalled", "at": self.now, "detail": detail})
+            );
+            self.db
+                .add_log(None, "collection_stalled", None, &detail, self.now)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1246,6 +1401,8 @@ mod tests {
 
     fn account_with_schedule(start: Option<&str>, stop: Option<&str>) -> AccountRow {
         AccountRow {
+            cloud_account_id: None,
+            config_version: 1,
             id: 1,
             name: "测试账号".to_string(),
             site_type: "china".to_string(),
@@ -1427,6 +1584,7 @@ mod tests {
             instances_stopped: 1,
             keep_alive_started: 1,
             report_sent: false,
+            retry_needed: false,
             notes: Vec::new(),
         };
         let summary = report.summary();

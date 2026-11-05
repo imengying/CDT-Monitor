@@ -23,8 +23,9 @@
     "lint": "cargo clippy --target wasm32-unknown-unknown -- -D warnings",
     "check": "cargo check --target wasm32-unknown-unknown",
     "check:config": "bun run scripts/check-config.ts",
-    "test:worker": "worker-build --release --locked && node tests/worker.mjs",
-    "test": "cargo test --locked && bun run typecheck:web && bun run check:config"
+    "test:worker:built": "node tests/worker.mjs",
+    "test:worker": "worker-build --release --locked && bun run test:worker:built",
+    "test": "cargo test --locked && bun run typecheck:web && bun run check:config && bun run lint && bun run test:worker"
   },
   "devDependencies": {
     "wrangler": "^4.40.0",
