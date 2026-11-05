@@ -11,7 +11,8 @@
 #
 # 必需构建期变量（Settings → Build → Build variables）：
 #   BUN_VERSION   Bun 版本，例如 1.4.4
-#                 不指定会使用镜像预装的旧版本（1.2.5），构建可能失败
+#                 Cloudflare 也会读取 package.json 的 packageManager
+#   NODE_VERSION  可省略；.node-version 固定 Node 26.13.0
 #
 # 构建期变量仅在构建阶段可见。运行时变量 MASTER_KEY / ADMIN_USERNAME /
 # ADMIN_PASSWORD 需配置在 Settings → Variables and Secrets 并选择 Secret。
@@ -22,7 +23,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
-warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*"; }
+
+log "Node: $(node --version)"
+node --input-type=module -e 'import {readFileSync} from "node:fs"; const expected = readFileSync(".node-version", "utf8").trim(); if (process.versions.node !== expected) { console.error(`需要 Node ${expected}，当前 ${process.versions.node}；请检查构建变量 NODE_VERSION`); process.exit(1) }'
 
 # ---------------------------------------------------------------------------
 # 1. Bun
@@ -37,7 +40,6 @@ installed="$(bun --version 2>/dev/null || true)"
 if [ -z "${BUN_VERSION:-}" ]; then
   if [ -n "$installed" ]; then
     # 本地开发未指定版本：用现有版本，避免每次构建都下载
-    warn "未设置 BUN_VERSION，使用当前 Bun $installed"
     BUN_VERSION="$installed"
   else
     echo "错误：未设置 BUN_VERSION，且环境中没有 Bun。" >&2
@@ -88,21 +90,8 @@ fi
 # ---------------------------------------------------------------------------
 # 3. worker-build
 # ---------------------------------------------------------------------------
-# worker-build 通过 ureq / native-tls 间接依赖 openssl-sys，在某些镜像里
-# 缺少 pkg-config 或头文件会直接 panic。显式给出路径就能绕开探测。
-if [ -d /usr/include/openssl ]; then
-  export OPENSSL_INCLUDE_DIR="${OPENSSL_INCLUDE_DIR:-/usr/include}"
-  export OPENSSL_LIB_DIR="${OPENSSL_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"
-fi
-
-if [ "$(worker-build --version 2>/dev/null || true)" != "0.8.7" ]; then
-  log "安装 worker-build 0.8.7（首次约 3-5 分钟）"
-  # 在临时目录里安装：避免 rust-toolchain.toml 覆盖工具链导致
-  # "default toolchain implicitly overridden by rustup toolchain file"。
-  #
-  ( cd "$(mktemp -d)" && cargo install worker-build --version 0.8.7 --locked )
-fi
-log "worker-build: $(command -v worker-build)"
+bash scripts/install-worker-build.sh
+log "worker-build: $ROOT/.tools/worker-build/bin/worker-build"
 
 # ---------------------------------------------------------------------------
 # 4. 依赖安装
@@ -135,7 +124,7 @@ fi
 # 6. 构建 Worker（Rust → Wasm）
 # ---------------------------------------------------------------------------
 log "构建 Worker → build/worker/shim.mjs"
-worker-build --release --locked
+bun run build:worker
 
 if [ ! -f build/worker/shim.mjs ]; then
   echo "错误：Worker 构建失败，build/worker/shim.mjs 不存在" >&2

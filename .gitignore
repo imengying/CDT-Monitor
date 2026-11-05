@@ -1,5 +1,6 @@
 # Rust / Cargo
 /target/
+/.tools/
 **/*.rs.bk
 
 # Worker 构建产物（worker-build 输出）

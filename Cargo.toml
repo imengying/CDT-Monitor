@@ -39,7 +39,7 @@ getrandom = { version = "0.2", features = ["js"] }
 # Cron 表达式解析（进阶定时开关机）。
 # 关闭默认特性避开 jiff，只留 chrono 后端与项目已有的时间类型对齐；
 # 实测 Wasm 体积增量约 79 KiB（wasm-opt -Oz 后）。
-croner = { version = "4.0.2", default-features = false, features = ["chrono"] }
+croner = { version = "4.0.3", default-features = false, features = ["chrono"] }
 
 [profile.release]
 opt-level = "z"

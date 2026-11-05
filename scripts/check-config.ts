@@ -4,11 +4,15 @@ import { readFileSync } from 'node:fs'
 const config = Bun.TOML.parse(readFileSync('wrangler.toml', 'utf8')) as any
 const crate = Bun.TOML.parse(readFileSync('Cargo.toml', 'utf8')) as any
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+const webPkg = JSON.parse(readFileSync('web/package.json', 'utf8'))
+const nodeVersion = readFileSync('.node-version', 'utf8').trim()
 const date = config.compatibility_date
 const validDate = typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)
   && Number.isFinite(Date.parse(date)) && new Date(date).toISOString().slice(0, 10) === date
   && date <= new Date().toISOString().slice(0, 10)
 const checks: [string, boolean][] = [
+  ['Node 26 构建版本一致', /^26\.\d+\.\d+$/.test(nodeVersion) && pkg.engines.node === `>=${nodeVersion} <27` && webPkg.engines.node === pkg.engines.node],
+  ['Node 类型定义使用 26', /^\^26\./.test(webPkg.devDependencies['@types/node'])],
   ['静态资源绑定', config.assets?.binding === 'ASSETS'],
   ['静态资源目录', config.assets?.directory === './web/dist'],
   ['API 优先进入 Worker', config.assets?.run_worker_first?.includes('/api/*') === true],

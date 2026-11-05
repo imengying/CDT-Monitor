@@ -140,16 +140,17 @@
 
 按当前每轮每账号一条巡检消息、另加一条维护消息，基础用量为 `864 ×（启用账号数 + 1）次/天`。截至 2026-11-05，免费版包含 10,000 次操作/天：10 个账号约 9,504 次，11 个账号约 10,368 次。10 个账号也只剩 496 次余量，手动任务、页面补采和失败重试还会增加用量；接近边界时应减少启用账号数或使用付费套餐。
 
-### 2. 设置 `BUN_VERSION`
+### 2. 构建工具版本
 
-展开 **高级设置**（Advanced settings），添加一个构建变量：
+项目通过 `.node-version` 固定 Node **26.13.0 LTS**，根 `package.json` 固定 Bun **1.4.4**。Cloudflare 会读取这些文件选择版本；已有构建变量应与它们保持一致：
 
 | 变量名 | 变量值 |
 |---|---|
 | `BUN_VERSION` | `1.4.4` |
+| `NODE_VERSION` | `26.13.0`（可省略，由 `.node-version` 选择） |
 
 > [!IMPORTANT]
-> 这一项**必须配**。Cloudflare 构建镜像预装的是 Bun 1.2.5，不指定版本就会用旧版编译，可能直接失败。`build-ci.sh` 检测到版本不符会自行装指定版本；本地未设置时使用已安装的 Bun；云端请显式设置版本。
+> 如果控制台已有 `NODE_VERSION=24`，请改为 `26.13.0` 或删除该变量；构建脚本会检查实际 Node 版本。Bun 与 Node 的版本选择方式见 [Cloudflare 构建镜像文档](https://developers.cloudflare.com/workers/ci-cd/builds/build-image/)。
 
 点 **部署**（Deploy）。
 
@@ -527,7 +528,7 @@ assert_eq!(sign("testsecret", &to_sign), "OLeaidS1JvxuMvnyHOwuJ+uX5qY=");
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo install worker-build --version 0.8.7 --locked
+bash scripts/install-worker-build.sh
 bun install
 bun run install:web
 ```
@@ -558,6 +559,8 @@ bun run dev:web                  # :5173
 ```bash
 curl http://localhost:8787/cdn-cgi/local/scheduled
 ```
+
+构建工具安装脚本下载并校验官方 `worker-build 0.8.7` 源码包，使用仓库中的 `scripts/worker-build.Cargo.lock` 安装到 `.tools/worker-build`。该锁文件将上游撤回的 `yoke-derive 0.8.3` 及配套 `yoke` 更新为 `0.8.4`；安装仍使用 `--locked`，不会在每次构建时重新解析依赖。`bun run build:worker` 和 CI 使用同一套工具，锁文件变化会触发重新安装。根项目仅允许 `esbuild`、`workerd` 执行安装脚本。
 
 #### 4. 测试与构建校验
 

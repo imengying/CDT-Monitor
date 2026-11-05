@@ -5,12 +5,12 @@
   "type": "module",
   "packageManager": "bun@1.4.4",
   "engines": {
-    "node": ">=24.0",
+    "node": ">=26.13.0 <27",
     "bun": ">=1.2"
   },
   "scripts": {
     "build": "bash scripts/build-ci.sh",
-    "build:worker": "worker-build --release --locked",
+    "build:worker": "bash scripts/build-worker.sh",
     "build:web": "bun run --cwd web build",
     "install:web": "bun install --cwd web",
     "dev": "bun run build && bunx wrangler dev",
@@ -24,11 +24,15 @@
     "check": "cargo check --target wasm32-unknown-unknown",
     "check:config": "bun run scripts/check-config.ts",
     "test:worker:built": "node tests/worker.mjs",
-    "test:worker": "worker-build --release --locked && bun run test:worker:built",
+    "test:worker": "bun run build:worker && bun run test:worker:built",
     "test": "cargo test --locked && bun run typecheck:web && bun run check:config && bun run lint && bun run test:worker"
   },
   "devDependencies": {
-    "wrangler": "^4.40.0",
-    "miniflare": "5.20261019.2-beta"
-  }
+    "wrangler": "^4.157.0",
+    "miniflare": "5.20261103.0-beta"
+  },
+  "trustedDependencies": [
+    "esbuild",
+    "workerd"
+  ]
 }

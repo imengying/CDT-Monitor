@@ -10,6 +10,7 @@
 #        Build command : bun run build
 #        Deploy command: bun run deploy      ← 自动建库 + 迁移 + 发布
 #        Build variable: BUN_VERSION=1.4.4
+#        Node: .node-version 指定 26.13.0；已有 NODE_VERSION 变量需同步或删除
 #   2. 配运行时 Secret：Settings → Variables and Secrets
 #        MASTER_KEY      openssl rand -hex 32
 #        ADMIN_USERNAME  管理员用户名
