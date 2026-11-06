@@ -29,8 +29,8 @@ use sha2::Sha256;
 
 /// 会话 Cookie 名称。
 pub const SESSION_COOKIE: &str = "cdt_session";
-/// 默认会话有效期：7 天。
-pub const DEFAULT_SESSION_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// 会话有效期固定为 7 天。
+pub const SESSION_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Nonce 长度（XChaCha20 为 24 字节）。
 pub const NONCE_LEN: usize = 24;
 /// 认证标签长度。

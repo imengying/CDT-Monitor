@@ -26,32 +26,8 @@ import { LoginModal } from '@/components/LoginModal'
 import { SettingsModal } from '@/components/SettingsModal'
 import { renderToasts } from '@/components/ToastStack'
 
-/**
- * 概览静默轮询间隔（毫秒）。
- *
- * 数据实际由 Cron 每 5 分钟写一次，轮询比它更勤只会白烧请求，
- * 因此取 5 分钟，保证刷新后能较快看到新数据即可。
- */
-const OVERVIEW_POLL_MS = 5 * 60_000
-
-/**
- * 过渡态轮询间隔（毫秒）。
- *
- * 对齐上游的 1 分钟：阿里云从 `Stopping` 到 `Stopped` 通常 30~60 秒，
- * 更短的间隔并不会让用户更快看到结果，却会放大阿里云 API 调用量。
- * 常规轮询是 5 分钟，状态一稳定就退回。
- */
-const TRANSITION_POLL_MS = 60_000
-
-/** 实例是否处于阿里云的过渡态（与后端 `InstanceInfo::is_transitional` 一致）。 */
-function hasTransitionalInstance(state: Readonly<AppState>): boolean {
-  return (state.overview?.accounts ?? []).some((account) =>
-    account.instances.some((instance) => {
-      const status = instance.status.toLowerCase()
-      return status === 'starting' || status === 'stopping' || status === 'pending'
-    }),
-  )
-}
+/** 每分钟读取概览，自动化动作写入的过渡态由后端按需补采。 */
+const OVERVIEW_POLL_MS = 60_000
 
 /**
  * 顶栏主题切换按钮。
@@ -98,8 +74,6 @@ export class App {
   private menuOpen = false
 
   private pollTimer: number | null = null
-  /** 当前是否处于过渡态加速轮询，用于避免重复重排定时器 */
-  private fastPolling = false
   private lastPhase: AppState['phase'] | null = null
 
   constructor(root: HTMLElement) {
@@ -118,29 +92,21 @@ export class App {
     })
   }
 
-  /**
-   * 安排下一次概览轮询。
-   *
-   * 用 setTimeout 自我重排而不是 setInterval：间隔要随「是否有实例处于过渡态」
-   * 动态变化，固定间隔做不到。
-   */
+  /** 请求结束后安排下一次轮询，避免慢请求重叠。 */
   private schedulePoll(): void {
     if (this.pollTimer !== null) window.clearTimeout(this.pollTimer)
-
-    const state = store.get()
-    const fast = state.phase === 'ready' && hasTransitionalInstance(state)
 
     this.pollTimer = window.setTimeout(() => {
       this.pollTimer = null
       void this.runPoll()
-    }, fast ? TRANSITION_POLL_MS : OVERVIEW_POLL_MS)
+    }, OVERVIEW_POLL_MS)
   }
 
   private async runPoll(): Promise<void> {
     const state = store.get()
     if (state.phase === 'ready' && !state.refreshingAll && !state.overviewLoading) {
-      // 过渡态下让后端顺带采集一次，否则光读快照永远等不到终态
-      await loadOverview(hasTransitionalInstance(state))
+      // 由后端当前快照决定是否补采，也能发现其它页面或 Cron 发起的动作。
+      await loadOverview(true)
     }
     this.schedulePoll()
   }
@@ -155,13 +121,6 @@ export class App {
       this.switchPhase(state)
     } else if (state.phase === 'ready') {
       this.updateShell(state)
-    }
-
-    // 进出过渡态时立刻切换轮询节奏，不必等当前这一轮定时器到点
-    const fast = state.phase === 'ready' && hasTransitionalInstance(state)
-    if (fast !== this.fastPolling) {
-      this.fastPolling = fast
-      this.schedulePoll()
     }
 
     this.settingsModal?.update(state.settings)

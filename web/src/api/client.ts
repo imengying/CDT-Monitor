@@ -311,7 +311,6 @@ export interface TimeZoneOption {
 export interface AdvancedSettings {
   log_level: string
   job_lock_ttl_ms: number
-  session_ttl_ms: number
 }
 
 export interface SettingsResponse {
@@ -509,7 +508,7 @@ export const api = {
    * 概览数据。
    *
    * `refreshTransitional` 为真时，后端会对处于 `Starting` / `Stopping` 的实例
-   * 补一次采集（带 10 秒防抖），用于过渡态的加速轮询。
+   * 入队补采（带防抖），用于每分钟轮询时核实终态。
    */
   overview(refreshTransitional = false): Promise<OverviewResponse> {
     const query = refreshTransitional ? '?refresh=transitional' : ''

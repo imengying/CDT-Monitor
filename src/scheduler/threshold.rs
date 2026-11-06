@@ -83,6 +83,7 @@ impl Scheduler {
                             .await
                         {
                             Ok(()) => {
+                                self.set_transitional_status(account.id, id, false).await?;
                                 details.push("停机指令已提交，等待确认；后续巡检将继续核实".into());
                                 self.db
                                     .add_log(

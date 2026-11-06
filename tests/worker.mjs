@@ -125,9 +125,23 @@ try {
     db.prepare("DELETE FROM jobs WHERE id IN ('legacy-pending', 'legacy-running', 'legacy-success')"),
   ])
   console.log('✓ 存量库升级保留账号密文和快照，清理旧执行器未完成任务')
+  // 存量配置可能设置过 30 天，新登录必须忽略旧字段并固定为 7 天。
+  await db.prepare("UPDATE settings SET value = ? WHERE key = 'advanced'")
+    .bind(JSON.stringify({ log_level: 'error', job_lock_ttl_ms: 600_000, session_ttl_ms: 30 * 86400_000 })).run()
   let response = await request('auth/login', 'POST', { username: 'review', password: 'test-password-only' })
   assert.equal(response.status, 200, await response.clone().text())
+  assert.match(response.headers.get('set-cookie'), /Max-Age=604800(?:;|$)/i)
   cookie = response.headers.get('set-cookie').split(';')[0]
+  const session = await db.prepare('SELECT created_at, expires_at FROM sessions').first()
+  assert.equal(session.expires_at - session.created_at, 7 * 86400_000)
+  assert.equal('session_ttl_ms' in (await api('settings')).advanced, false)
+  for (const extra of [{}, { session_ttl_ms: 60_000 }]) {
+    const settings = await api('settings/advanced', 'PUT', { log_level: 'error', job_lock_ttl_ms: 600_000, ...extra })
+    assert.equal('session_ttl_ms' in settings.advanced, false)
+    const stored = JSON.parse((await db.prepare("SELECT value FROM settings WHERE key = 'advanced'").first()).value)
+    assert.equal('session_ttl_ms' in stored, false)
+  }
+  console.log('✓ 新登录固定 7 天，旧会话有效期配置和旧客户端字段不再生效')
   const config = { name: 'Fixture', site_type: 'intl', access_key_id: 'fixture-access-key', access_key_secret: 'fixture-secret', region_id: 'cn-hongkong', instance_id: 'i-review', traffic_threshold_gb: 180, over_limit_action: 'stop_and_notify', stop_mode: 'StopCharging', enabled: true, spot_keep_alive: false }
   const account = await api('accounts', 'POST', config)
   const id = account.id
@@ -144,6 +158,7 @@ try {
   state.notifyFailed = false
   await refresh()
   assert.equal(state.stops, 2, 'previous failed stop must be retried')
+  assert.equal(JSON.parse((await snapshot()).instances_json)[0].status, 'Stopping')
   assert.ok((await snapshot()).threshold_notified_month)
   assert.equal(state.notifications, 2)
   await refresh()
@@ -228,6 +243,7 @@ try {
   await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: Date.now() })
   await eventually(async () => (await db.prepare('SELECT last_schedule_stop_at AS at FROM accounts WHERE id = ?').bind(id).first()).at, 'scheduled stop')
   assert.equal(state.status, 'Stopped')
+  assert.equal((await api('overview')).accounts.find(a => a.id === id).instances[0].status, 'Stopping')
   const starts = state.starts
   await cronAccount(worker, id)
   assert.equal(state.starts, starts, 'Cron stop must not be undone by keep alive')
@@ -255,11 +271,13 @@ try {
   const previousStarts = state.starts
   await cronAccount(worker, id, true)
   assert.equal(state.starts, previousStarts + 1)
+  assert.equal(JSON.parse((await snapshot()).instances_json)[0].status, 'Stopped', 'failed keep alive must not display Starting')
   assert.equal(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`keepalive:${id}:i-review`).first(), null)
   state.startFailed = false
   await cronAccount(worker, id)
   assert.equal(state.starts, previousStarts + 2)
   assert.equal(state.status, 'Running')
+  assert.equal(JSON.parse((await snapshot()).instances_json)[0].status, 'Starting')
   console.log('✓ 保活开机失败释放冷却锁，下轮核实状态后重试')
 
   await api('settings/telegram', 'PUT', { enabled: true })
@@ -329,7 +347,7 @@ try {
 
   for (const start of [false, true]) {
     const hhmm = new Date(Date.now() + 8 * 3600_000).toISOString().slice(11, 16)
-    await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: false,
+    await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: start,
       schedule_mode: 'simple', ...(start ? { schedule_start_time: hhmm } : { schedule_stop_time: hhmm }) })
     const dateColumn = start ? 'last_schedule_start_date' : 'last_schedule_stop_date'
     await db.prepare(`UPDATE accounts SET ${dateColumn} = NULL WHERE id = ?`).bind(id).run()
@@ -344,14 +362,34 @@ try {
       assert.equal(start ? state.starts : state.stops, beforeAction)
     }
     state.status = start ? 'Stopped' : 'Running'
+    const failureFlag = start ? 'startFailed' : 'stopFailed'
+    // 先验证指令失败不会写入过渡态；暂时关闭保活，以隔离定时失败路径。
+    await db.prepare('UPDATE accounts SET spot_keep_alive = 0 WHERE id = ?').bind(id).run()
+    state[failureFlag] = true
+    delivery = await worker.queue('cdt-monitor-tasks', [scheduleMessage])
+    assert.equal(delivery.retryMessages.length, 1)
+    assert.equal(JSON.parse((await snapshot()).instances_json)[0].status, start ? 'Stopped' : 'Running')
+    state[failureFlag] = false
+    await db.prepare('UPDATE accounts SET spot_keep_alive = ?, last_schedule_stop_at = NULL WHERE id = ?').bind(start ? 1 : 0, id).run()
+    if (start) {
+      assert.equal(JSON.parse((await snapshot()).instances_json)[0].keep_alive, true)
+      await db.prepare('DELETE FROM locks WHERE name = ?').bind(`keepalive:${id}:i-review`).run()
+    }
     delivery = await worker.queue('cdt-monitor-tasks', [{ ...scheduleMessage, attempts: 2 }])
     assert.equal(delivery.retryMessages.length, 0)
-    assert.equal(start ? state.starts : state.stops, beforeAction + 1)
+    assert.equal(start ? state.starts : state.stops, beforeAction + 2, 'schedule and keep alive must issue only one successful command')
+    assert.equal((await api('overview')).accounts.find(a => a.id === id).instances[0].status, start ? 'Starting' : 'Stopping')
     assert.ok((await db.prepare(`SELECT ${dateColumn} AS date FROM accounts WHERE id = ?`).bind(id).first()).date)
     await worker.queue('cdt-monitor-tasks', [{ ...scheduleMessage, attempts: 3 }])
-    assert.equal(start ? state.starts : state.stops, beforeAction + 1, 'completed scheduled action cannot repeat')
+    assert.equal(start ? state.starts : state.stops, beforeAction + 2, 'completed scheduled action cannot repeat')
+    // 页面下一次概览轮询按后端快照补采，最终收敛到真实云端状态。
+    await db.prepare("DELETE FROM locks WHERE name = 'overview-refresh'").run()
+    await api('overview?refresh=transitional')
+    await eventually(async () => JSON.parse((await snapshot()).instances_json)[0].status === (start ? 'Running' : 'Stopped'), 'transition reaches cloud state')
+    await eventually(async () => !(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`account-operation:${id}`).first()), 'transition refresh releases account')
   }
   console.log('✓ 定时启停遇到过渡态或未知状态保留重试，终态恢复后同消息补偿执行')
+  console.log('✓ 定时启停成功立即显示过渡态、失败不误报、轮询收敛终态，开机与保活同轮不重复下发')
 
 
   // 账号规模超过原单次 Cron 的免费额度；每个消费调用受 50 次 D1 上限检查。
@@ -369,6 +407,7 @@ try {
   console.log('✓ 11 个账号通过真实 Cron 分发完成采样，每次执行不超过 50 次 D1 调用')
 
   // 阻塞云端采集，概览仍应立即返回；多账号补采各自消费独立 D1 额度。
+  await db.prepare("DELETE FROM locks WHERE name = 'overview-refresh'").run()
   await db.prepare("UPDATE account_snapshots SET instances_json = '[]'").run()
   let releaseTraffic
   trafficGate = new Promise(resolve => { releaseTraffic = resolve })

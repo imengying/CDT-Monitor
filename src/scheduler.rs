@@ -944,7 +944,7 @@ impl Scheduler {
 
         // 动作后立即刷新，保证前端轮询结束时看到的是真实状态；
         // 若阿里云尚未落到终态（刚发出指令常如此），把快照置为过渡态，
-        // 让前端显示「正在启动…」并切到 1 分钟轮询。
+        // 让前端显示「正在启动…」，并在每分钟轮询时补采核实终态。
         let refresh = self.refresh_locked(account).await;
         if !refresh.success {
             log_warn!("动作后刷新失败：{}", refresh.warnings.join("；"));
@@ -1124,18 +1124,6 @@ impl Scheduler {
             return report;
         }
 
-        // 快照可能已被本次刷新更新，重新读取用于后续判断
-        let snapshot = match self.db.get_snapshot(account.id).await {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                report.retry_needed = true;
-                report
-                    .notes
-                    .push(format!("{} 读取快照失败：{err}", account.name));
-                return report;
-            }
-        };
-
         if let Err(err) = self.maybe_scheduled_stop(account, &mut report).await {
             report.retry_needed = true;
             report
@@ -1148,6 +1136,17 @@ impl Scheduler {
                 .notes
                 .push(format!("{} 定时开机异常：{err}", account.name));
         }
+        // 定时动作已写入过渡态，保活必须读取新快照，避免同轮再次发送开机指令。
+        let snapshot = match self.db.get_snapshot(account.id).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                report.retry_needed = true;
+                report
+                    .notes
+                    .push(format!("{} 读取快照失败：{err}", account.name));
+                return report;
+            }
+        };
         if let Err(err) = self
             .maybe_keep_alive(account, snapshot.as_ref(), &mut report)
             .await

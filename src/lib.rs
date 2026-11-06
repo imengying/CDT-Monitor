@@ -56,8 +56,8 @@ use worker::{
 };
 
 use crate::crypto::{
-    Crypto, MasterKey, SessionToken, TokenState, constant_time_eq, random_hex, session_cookie,
-    session_token_from_cookie,
+    Crypto, MasterKey, SESSION_TTL_MS, SessionToken, TokenState, constant_time_eq, random_hex,
+    session_cookie, session_token_from_cookie,
 };
 use crate::db::Db;
 use crate::device::{client_ip, client_ua, same_origin_ok, short_device, short_ip};
@@ -161,7 +161,7 @@ struct AppCtx {
     db: Db,
     crypto: Crypto,
     timezone: String,
-    /// 高级配置（日志级别 / 锁窗口 / 会话有效期），来自 D1。
+    /// 高级配置（日志级别 / 锁窗口），来自 D1。
     advanced: AdvancedConfig,
     now: i64,
 }
@@ -245,11 +245,6 @@ impl AppCtx {
     /// Job 锁 TTL（已在 `AdvancedConfig::normalized` 中限制范围）。
     fn job_lock_ttl_ms(&self) -> i64 {
         self.advanced.job_lock_ttl_ms
-    }
-
-    /// 会话有效期（同上）。
-    fn session_ttl_ms(&self) -> i64 {
-        self.advanced.session_ttl_ms
     }
 
     /// 从请求中取出已验签的会话（不查库）。
@@ -547,7 +542,7 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
     // 3) 建立会话并签发 Token
     //
     // 先落库再签发：sid 必须在库中存在，否则首个请求就会被判为已吊销。
-    let ttl = app.session_ttl_ms();
+    let ttl = SESSION_TTL_MS;
     let now = now_ms();
     let sid = random_sid()?;
     let ua = client_ua(&req);
@@ -1375,8 +1370,7 @@ async fn handle_update_turnstile(app: &AppCtx, mut req: Request) -> worker::Resu
 
 /// `PUT /api/v1/settings/advanced`
 ///
-/// 日志级别、任务锁窗口、会话有效期。这些值不影响已签发的会话，
-/// 下次请求起按新配置执行。
+/// 日志级别、任务锁窗口，下次请求起按新配置执行。
 async fn handle_update_advanced(app: &AppCtx, mut req: Request) -> worker::Result<Response> {
     let payload: AdvancedSettingsDto = match read_json(&mut req).await {
         Ok(payload) => payload,
@@ -1395,10 +1389,9 @@ async fn handle_update_advanced(app: &AppCtx, mut req: Request) -> worker::Resul
             "settings_advanced",
             None,
             &format!(
-                "高级配置已更新（日志 {}，锁 {} 分钟，会话 {} 天）",
+                "高级配置已更新（日志 {}，锁 {} 分钟）",
                 config.log_level,
-                config.job_lock_ttl_ms / 60_000,
-                config.session_ttl_ms / (24 * 60 * 60 * 1000)
+                config.job_lock_ttl_ms / 60_000
             ),
             now_ms(),
         )

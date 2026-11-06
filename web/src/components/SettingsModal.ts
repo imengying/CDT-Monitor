@@ -238,7 +238,7 @@ export class SettingsModal {
   private reportDraft = { enabled: false, time: '09:00' }
   private timezoneDraft = 'UTC+8'
   private themeDraft: ThemeMode = currentMode()
-  private advancedDraft = { logLevel: 'error', jobLockMinutes: 10, sessionDays: 14 }
+  private advancedDraft = { logLevel: 'error', jobLockMinutes: 10 }
 
   private devices: SessionDevice[] = []
   private devicesLoaded = false
@@ -387,7 +387,6 @@ export class SettingsModal {
     this.advancedDraft = {
       logLevel: settings.advanced.log_level,
       jobLockMinutes: Math.round(settings.advanced.job_lock_ttl_ms / 60_000),
-      sessionDays: Math.round(settings.advanced.session_ttl_ms / (24 * 60 * 60 * 1000)),
     }
   }
 
@@ -1608,12 +1607,6 @@ export class SettingsModal {
               this.advancedDraft.jobLockMinutes = value
             }, { min: '1', suffix: '分钟' }),
           ),
-          field(
-            '会话有效期',
-            this.numberLine(this.advancedDraft.sessionDays, (value) => {
-              this.advancedDraft.sessionDays = value
-            }, { min: '1', suffix: '天' }),
-          ),
         ),
 
         el(
@@ -1656,7 +1649,6 @@ export class SettingsModal {
         await api.updateAdvanced({
           log_level: this.advancedDraft.logLevel,
           job_lock_ttl_ms: Math.round(this.advancedDraft.jobLockMinutes * 60_000),
-          session_ttl_ms: Math.round(this.advancedDraft.sessionDays * 24 * 60 * 60 * 1000),
         })
       },
       '系统设置已保存',

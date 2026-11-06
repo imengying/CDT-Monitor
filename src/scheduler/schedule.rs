@@ -116,6 +116,8 @@ impl Scheduler {
                     .await
                 {
                     Ok(()) => {
+                        self.set_transitional_status(account.id, &instance.instance_id, false)
+                            .await?;
                         ok_count += 1;
                         report.instances_stopped += 1;
                         self.db
@@ -237,6 +239,8 @@ impl Scheduler {
                     .await
                 {
                     Ok(()) => {
+                        self.set_transitional_status(account.id, &instance.instance_id, true)
+                            .await?;
                         ok_count += 1;
                         report.instances_started += 1;
                         self.db
@@ -404,6 +408,8 @@ impl Scheduler {
                 .await
             {
                 Ok(()) => {
+                    self.set_transitional_status(account.id, &instance.instance_id, true)
+                        .await?;
                     report.keep_alive_started += 1;
                     report.notes.push(format!(
                         "{} 抢占式保活拉起 {}",
