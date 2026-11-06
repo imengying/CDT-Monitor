@@ -490,8 +490,65 @@ impl AliyunClient {
 
         let instances = extract_array(&value, &["Instances", "Instance"]);
         Ok(instances
-            .first()
+            .iter()
+            .find(|item| item.get("InstanceId").and_then(Value::as_str) == Some(instance_id))
             .map(|item| parse_instance(item, region_id)))
+    }
+
+    /// 从 ECS 的弹性网卡列表补取 IPv6。查询失败时由调用方保留实例的其它字段，
+    /// 因为 IPv6 是展示信息，不应让整轮实例采集失败。
+    async fn describe_network_ipv6(
+        &self,
+        region_id: &str,
+        instance_id: &str,
+    ) -> Result<Option<String>, AliyunError> {
+        let mut next_token = String::new();
+        loop {
+            let mut params = vec![
+                ("RegionId", region_id.to_string()),
+                ("InstanceId", instance_id.to_string()),
+                ("MaxResults", "100".to_string()),
+            ];
+            if !next_token.is_empty() {
+                params.push(("NextToken", next_token.clone()));
+            }
+            let value = self
+                .call(
+                    &self.endpoints.ecs,
+                    "2014-05-26",
+                    "DescribeNetworkInterfaces",
+                    params,
+                )
+                .await?;
+            let interfaces = value
+                .get("NetworkInterfaceSets")
+                .and_then(|sets| sets.get("NetworkInterfaceSet"))
+                .ok_or_else(|| {
+                    AliyunError::Parse(
+                        "DescribeNetworkInterfaces 缺少 NetworkInterfaceSets.NetworkInterfaceSet"
+                            .into(),
+                    )
+                })?;
+            let mut interfaces = object_list(Some(interfaces));
+            interfaces.retain(|nic| {
+                nic.get("InstanceId")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| id == instance_id)
+            });
+            if let Some(ipv6) = first_interface_ipv6(interfaces) {
+                return Ok(Some(ipv6));
+            }
+            let token = value.get("NextToken").and_then(Value::as_str).unwrap_or("");
+            if token.is_empty() {
+                return Ok(None);
+            }
+            if token == next_token {
+                return Err(AliyunError::Parse(
+                    "DescribeNetworkInterfaces 返回重复的分页凭证".into(),
+                ));
+            }
+            next_token = token.to_string();
+        }
     }
 
     /// 启动实例。
@@ -777,31 +834,43 @@ fn first_address(value: Option<&Value>) -> Option<String> {
 ///
 /// DescribeInstances 需传 AdditionalAttributes.N=NETWORK_PRIMARY_ENI_IP。
 fn first_network_ipv6(item: &Value) -> Option<String> {
-    let interfaces = item
-        .get("NetworkInterfaces")
-        .and_then(|v| v.get("NetworkInterface"))
-        .or_else(|| item.get("NetworkInterface"));
+    let interfaces = [
+        item.get("NetworkInterfaces")
+            .map(|value| value.get("NetworkInterface").unwrap_or(value)),
+        item.get("NetworkInterface"),
+    ]
+    .into_iter()
+    .flat_map(object_list)
+    .collect();
+    first_interface_ipv6(interfaces)
+}
 
-    let list: Vec<&Value> = match interfaces {
+fn object_list(value: Option<&Value>) -> Vec<&Value> {
+    match value {
         Some(Value::Array(items)) => items.iter().collect(),
         Some(single @ Value::Object(_)) => vec![single],
-        _ => return None,
-    };
+        _ => Vec::new(),
+    }
+}
 
-    list.into_iter().find_map(|nic| {
-        let sets = nic
-            .get("Ipv6Sets")
-            .and_then(|v| v.get("Ipv6Set"))
-            .or_else(|| nic.get("Ipv6Sets"));
-        let entries: Vec<&Value> = match sets {
-            Some(Value::Array(items)) => items.iter().collect(),
-            Some(single @ Value::Object(_)) => vec![single],
-            _ => return None,
-        };
-        entries
-            .into_iter()
-            .find_map(|entry| first_address(entry.get("Ipv6Address")))
-    })
+fn first_interface_ipv6(mut interfaces: Vec<&Value>) -> Option<String> {
+    // 优先主网卡；IPv6 只分配给辅助网卡时仍能显示。
+    interfaces.sort_by_key(|nic| nic.get("Type").and_then(Value::as_str) != Some("Primary"));
+    interfaces.into_iter().find_map(first_ipv6_sets)
+}
+
+/// 从单个 ENI 对象读取官方 `Ipv6Sets.Ipv6Set` 结构。
+fn first_ipv6_sets(nic: &Value) -> Option<String> {
+    let sets = nic
+        .get("Ipv6Sets")
+        .and_then(|v| v.get("Ipv6Set"))
+        .or_else(|| nic.get("Ipv6Sets"));
+    let mut entries = object_list(sets);
+    entries.sort_by_key(|entry| entry.get("Primary").and_then(Value::as_bool) != Some(true));
+    entries
+        .into_iter()
+        .find_map(|entry| first_address(entry.get("Ipv6Address")))
+        .or_else(|| first_address(nic.get("Ipv6Address")))
 }
 
 /// 解析单个 ECS 实例对象。
@@ -1039,7 +1108,39 @@ pub async fn sync_account(
             Ok(None) => out.warnings.push(format!(
                 "{region_id} 未找到实例 {instance_id}（可能已释放）"
             )),
-            Ok(Some(instance)) => out.instances = vec![instance],
+            Ok(Some(mut instance)) => {
+                if instance.public_ipv6.is_none() {
+                    // IPv6 只用于展示：补查及分页总共最多 3 秒，不占满 20 秒采集
+                    // 预算，也不把这条查询加入手动启停前的状态核实路径。
+                    let ipv6 = crate::runtime::timeout(
+                        3_000,
+                        client.describe_network_ipv6(region_id, instance_id),
+                    )
+                    .await;
+                    match ipv6 {
+                        Ok(Ok(address)) => instance.public_ipv6 = address,
+                        Ok(Err(err)) => {
+                            let permission_hint = if matches!(
+                                err,
+                                AliyunError::Api {
+                                    http_status: 401 | 403,
+                                    ..
+                                }
+                            ) {
+                                "；请检查 RAM 权限 ecs:DescribeNetworkInterfaces"
+                            } else {
+                                ""
+                            };
+                            out.warnings
+                                .push(format!("IPv6 补充查询失败：{err}{permission_hint}"));
+                        }
+                        Err(_) => out
+                            .warnings
+                            .push("IPv6 补充查询超时，请稍后刷新重试".into()),
+                    }
+                }
+                out.instances = vec![instance];
+            }
             Err(err) => {
                 out.instances_failed = true;
                 out.warnings

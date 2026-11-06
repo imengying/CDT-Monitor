@@ -11,6 +11,11 @@ const state = { instanceId: 'i-review', stoppedIds: [], trafficCalls: 0, traffic
 state.trafficResponses = []
 state.trafficAttempts = null
 state.ipv6 = null
+state.hideInstanceIpv6 = false
+state.networkCalls = 0
+state.networkFailed = false
+state.stallNetwork = false
+state.networkPages = null
 let trafficGate = null
 const testDirectory = await mkdtemp(resolve(tmpdir(), 'cdt-worker-test-'))
 const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirectory, workers: [{ name: 'monitor',
@@ -51,11 +56,27 @@ const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirect
       case 'DescribeInstances': {
         if (state.instancesFailed) return fail()
         // 官方接口仅在请求扩展属性时返回主网卡 IPv6，避免只测解析器而漏测请求。
-        const ipv6Sets = url.searchParams.get('AdditionalAttributes.1') === 'NETWORK_PRIMARY_ENI_IP' && state.ipv6
+        const ipv6Sets = !state.hideInstanceIpv6 && url.searchParams.get('AdditionalAttributes.1') === 'NETWORK_PRIMARY_ENI_IP' && state.ipv6
           ? [{ Ipv6Address: state.ipv6, Primary: true }] : []
         return Response.json({ Instances: { Instance: [{ InstanceId: state.instanceId, RegionId: 'cn-hongkong', Status: state.status, SpotStrategy: 'SpotAsPriceGo',
           NetworkInterfaces: { NetworkInterface: [{ Type: 'Primary', Ipv6Sets: { Ipv6Set: ipv6Sets } }] },
         }] } })
+      }
+      case 'DescribeNetworkInterfaces': {
+        state.networkCalls++
+        assert.equal(url.searchParams.get('RegionId'), 'cn-hongkong')
+        assert.equal(url.searchParams.get('InstanceId'), state.instanceId)
+        assert.equal(url.searchParams.has('Type'), false, 'include secondary ENIs')
+        if (state.networkFailed) return fail()
+        if (state.stallNetwork) return new Promise(() => {})
+        if (state.networkPages) {
+          const token = url.searchParams.get('NextToken') ?? ''
+          assert.ok(Object.hasOwn(state.networkPages, token), 'unexpected ENI pagination token')
+          return Response.json(state.networkPages[token])
+        }
+        const ipv6Sets = state.ipv6 ? [{ Ipv6Address: state.ipv6, Primary: true }] : []
+        // DescribeNetworkInterfaces 官方结构使用 NetworkInterfaceSet，区别于实例详情。
+        return Response.json({ NetworkInterfaceSets: { NetworkInterfaceSet: [{ Type: 'Primary', InstanceId: state.instanceId, Ipv6Sets: { Ipv6Set: ipv6Sets } }] } })
       }
       case 'StopInstance':
         state.stops++
@@ -278,11 +299,54 @@ try {
 
   for (const ipv6 of ['2001:db8:1234:5678::1', '2001:db8:1234:5678::2', null]) {
     state.ipv6 = ipv6
+    const callsBefore = state.networkCalls
     await refresh()
+    assert.equal(state.networkCalls - callsBefore, ipv6 ? 0 : 1, 'only query ENIs when instance IPv6 is absent')
     assert.equal(JSON.parse((await snapshot()).instances_json)[0].public_ipv6, ipv6)
     assert.equal((await api('overview')).accounts.find(a => a.id === id).instances[0].public_ipv6, ipv6)
   }
   console.log('✓ 请求主网卡扩展字段，IPv6 首次分配、地址变化及移除均同步到概览')
+  state.hideInstanceIpv6 = true
+  for (const ipv6 of ['2001:db8:1234:5678::3', '2001:db8:1234:5678::4', null]) {
+    state.ipv6 = ipv6
+    await refresh()
+    assert.equal(JSON.parse((await snapshot()).instances_json)[0].public_ipv6, ipv6)
+    assert.equal((await api('overview')).accounts.find(a => a.id === id).instances[0].public_ipv6, ipv6)
+  }
+  const eni = (type, ip, instanceId = state.instanceId) => ({ Type: type, InstanceId: instanceId, Ipv6Sets: { Ipv6Set: [{ Ipv6Address: ip, Primary: true }] } })
+  state.networkPages = { '': { NetworkInterfaceSets: { NetworkInterfaceSet: [
+    eni('Primary', '2001:db8::bad', 'i-unrelated'),
+    eni('Secondary', '2001:db8::5'), eni('Primary', '2001:db8::6'),
+  ] } } }
+  await refresh()
+  assert.equal(JSON.parse((await snapshot()).instances_json)[0].public_ipv6, '2001:db8::6', 'prefer primary ENI and ignore unrelated instance')
+  state.networkPages = {
+    '': { NetworkInterfaceSets: { NetworkInterfaceSet: [] }, NextToken: 'page2' },
+    page2: { NetworkInterfaceSets: { NetworkInterfaceSet: [eni('Secondary', '2001:db8::7')] } },
+  }
+  await refresh()
+  assert.equal(JSON.parse((await snapshot()).instances_json)[0].public_ipv6, '2001:db8::7', 'find IPv6 on secondary ENI on next page')
+  state.networkPages = { '': {} }
+  const malformedNetwork = await refresh()
+  assert.match(malformedNetwork.result_msg, /IPv6 补充查询失败.*NetworkInterfaceSets.NetworkInterfaceSet/)
+  state.networkPages = null
+  state.networkFailed = true
+  const deniedCalls = state.networkCalls
+  const deniedNetwork = await refresh()
+  assert.match(deniedNetwork.result_msg, /IPv6 补充查询失败.*ecs:DescribeNetworkInterfaces/)
+  assert.equal(state.networkCalls - deniedCalls, 1)
+  assert.equal(JSON.parse((await snapshot()).instances_json)[0].status, state.status)
+  assert.ok(JSON.parse((await snapshot()).sync_errors_json).some(e => e.includes('ecs:DescribeNetworkInterfaces')))
+  state.networkFailed = false
+  state.stallNetwork = true
+  const stalledNetwork = await refresh()
+  assert.match(stalledNetwork.result_msg, /IPv6 补充查询超时/)
+  assert.equal(JSON.parse((await snapshot()).instances_json)[0].status, state.status)
+  state.stallNetwork = false
+  state.hideInstanceIpv6 = false
+  await refresh()
+  assert.deepEqual(JSON.parse((await snapshot()).sync_errors_json), [])
+  console.log('✓ 实例未返回 IPv6 时按官方 ENI 结构补查，覆盖主副网卡、分页、移除和权限/超时告警，不影响实例状态')
 
   await api('accounts', 'POST', { ...config, name: 'Second', traffic_threshold_gb: 0 })
   await db.prepare("INSERT INTO jobs (id, job_type, status, created_at, payload_json) VALUES ('queued-batch', 'refresh_all', 'pending', ?, '{}')").bind(Date.now()).run()

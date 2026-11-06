@@ -74,6 +74,11 @@
     },
     {
       "Effect": "Allow",
+      "Action": "ecs:DescribeNetworkInterfaces",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
       "Action": [
         "ecs:StartInstance",
         "ecs:StopInstance"
@@ -87,6 +92,7 @@
 > [!NOTE]
 > - **`bssapi:QueryAccountBalance` 可能提示「无效授权」**：忽略即可（阿里云文档写的是 `bssapi:Query*`，两种写法实测都能查到余额）。不想让程序读财务数据时可以删掉这一段，余额一栏会显示 `—`（通知里显示「未知」），不影响其他功能。
 > - **`ecs:DescribeInstances` 不能省**：启停接口内部会先校验实例状态。若实例在 VPC 内且报权限错误，再补 `vpc:DescribeVpcs` 等基础网络查询权限。
+> - **`ecs:DescribeNetworkInterfaces` 用于补取 IPv6**：实例详情未返回 IPv6 时，程序会按实例 ID 查询已挂载的主、副网卡。沿用旧权限策略的用户需要补上这一项；缺少权限会在「采集告警」中显示具体错误，实例状态仍正常更新。
 
 ### 3. 替换成你的实例信息
 
@@ -491,7 +497,8 @@ Cron 派发端检查启用账号的流量和实例最近成功采集时间，超
 | 用途 | Action | Version |
 |---|---|---|
 | CDT 流量 | `ListCdtInternetTraffic` | 2021-08-13 |
-| ECS 查询 | `DescribeInstances`（自动翻页，上限 2000 台） | 2014-05-26 |
+| ECS 查询 | `DescribeInstances`（按实例 ID 精确查询） | 2014-05-26 |
+| IPv6 补充查询 | `DescribeNetworkInterfaces`（按实例 ID 查询主、副网卡） | 2014-05-26 |
 | ECS 控制 | `StartInstance` / `StopInstance`（含 `StoppedMode`） | 2014-05-26 |
 | 余额 | `QueryAccountBalance` | 2017-12-14 |
 
