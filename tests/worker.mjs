@@ -340,7 +340,7 @@ try {
   state.networkFailed = false
   state.stallNetwork = true
   const stalledNetwork = await refresh()
-  assert.match(stalledNetwork.result_msg, /IPv6 补充查询超时/)
+  assert.match(stalledNetwork.result_msg, /IPv6 查询失败，网络连接超时，稍后重试/)
   assert.equal(JSON.parse((await snapshot()).instances_json)[0].status, state.status)
   state.stallNetwork = false
   state.hideInstanceIpv6 = false
@@ -736,13 +736,13 @@ try {
   state.stallTraffic = true
   let began = Date.now()
   const stalled = await refresh('failed')
-  assert.match(stalled.error_msg, /超时/)
+  assert.equal(stalled.error_msg, '流量查询失败，网络连接超时，稍后重试')
   assert.ok(Date.now() - began < 25_000, 'stalled headers must respect request budget')
   state.stallTraffic = false
   state.stallBody = true
   began = Date.now()
   const stalledBody = await refresh('failed')
-  assert.match(stalledBody.error_msg, /超时/)
+  assert.equal(stalledBody.error_msg, '流量查询失败，网络连接超时，稍后重试')
   assert.ok(Date.now() - began < 25_000, 'stalled response body must respect request budget')
   state.stallBody = false
   console.log('✓ 请求头和响应体卡住时均能超时收尾')

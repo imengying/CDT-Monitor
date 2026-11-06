@@ -149,6 +149,16 @@ impl AliyunError {
             other => other.to_string(),
         }
     }
+
+    /// 采集查询超时无需提示核实操作结果；启停操作继续使用原始错误说明。
+    fn query_failure(&self, query: &str) -> String {
+        match self {
+            Self::Network(message) if message == crate::runtime::TIMEOUT_MESSAGE => {
+                format!("{query}失败，网络连接超时，稍后重试")
+            }
+            _ => format!("{query}失败：{}", self.short()),
+        }
+    }
 }
 
 // ===========================================================================
@@ -1086,14 +1096,12 @@ pub async fn sync_account(
             }
             out.traffic = Some(traffic);
         }
-        Err(err) => out
-            .warnings
-            .push(format!("CDT 流量查询失败：{}", err.short())),
+        Err(err) => out.warnings.push(err.query_failure("流量查询")),
     }
 
     match balance {
         Ok(balance) => out.balance = Some(balance),
-        Err(err) => out.warnings.push(format!("余额查询失败：{}", err.short())),
+        Err(err) => out.warnings.push(err.query_failure("余额查询")),
     }
 
     // 一个账号固定一台实例：按 ID 精确查询，命中则只保留这一台。
@@ -1136,15 +1144,14 @@ pub async fn sync_account(
                         }
                         Err(_) => out
                             .warnings
-                            .push("IPv6 补充查询超时，请稍后刷新重试".into()),
+                            .push("IPv6 查询失败，网络连接超时，稍后重试".into()),
                     }
                 }
                 out.instances = vec![instance];
             }
             Err(err) => {
                 out.instances_failed = true;
-                out.warnings
-                    .push(format!("{region_id} 实例查询失败：{}", err.short()));
+                out.warnings.push(err.query_failure("实例查询"));
             }
         }
     }

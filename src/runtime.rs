@@ -5,6 +5,8 @@ use std::{
     time::Duration,
 };
 
+pub const TIMEOUT_MESSAGE: &str = "操作超时，执行结果可能尚未确认，请刷新状态";
+
 pub fn timeout<T>(
     ms: u64,
     future: impl Future<Output = T>,
@@ -21,7 +23,7 @@ fn race<T>(
     let mut timer = Box::pin(timer);
     poll_fn(move |cx| {
         if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err("操作超时，执行结果可能尚未确认，请刷新状态"));
+            return Poll::Ready(Err(TIMEOUT_MESSAGE));
         }
         future.as_mut().poll(cx).map(Ok)
     })
