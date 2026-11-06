@@ -8,6 +8,9 @@ const compatibleOptions = miniflare.convertV4MiniflareOptions ?? (options => opt
 
 // 全部凭据均为测试夹具；所有出站请求在此拦截，绝不访问云账号。
 const state = { instanceId: 'i-review', stoppedIds: [], trafficCalls: 0, traffic: 190, trafficFailed: false, balanceFailed: false, instancesFailed: false, stopFailed: true, startFailed: false, notifyFailed: true, notifications: 0, stallTraffic: false, stallBody: false, status: 'Running', stops: 0, starts: 0, requests: 0 }
+state.trafficResponses = []
+state.trafficAttempts = null
+state.ipv6 = null
 let trafficGate = null
 const testDirectory = await mkdtemp(resolve(tmpdir(), 'cdt-worker-test-'))
 const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirectory, workers: [{ name: 'monitor',
@@ -35,12 +38,25 @@ const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirect
       case 'GetCallerIdentity': return url.searchParams.get('AccessKeyId') === 'invalid-key' ? fail() : Response.json({ AccountId: url.searchParams.get('AccessKeyId') === 'replacement-key' ? '2002' : '1001' })
       case 'ListCdtInternetTraffic':
         state.trafficCalls++
+        state.trafficAttempts?.push({ nonce: url.searchParams.get('SignatureNonce'), timestamp: url.searchParams.get('Timestamp'), signature: url.searchParams.get('Signature') })
+        if (state.trafficResponses.length) {
+          const { status, body } = state.trafficResponses.shift()
+          return new Response(body, { status })
+        }
         if (trafficGate) await trafficGate
         if (state.stallTraffic) return new Promise(() => {})
         if (state.stallBody) return new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{')); } }), { headers: { 'content-type': 'application/json' } })
         return state.trafficFailed ? fail() : Response.json({ TrafficDetails: [{ BusinessRegionId: 'cn-hongkong', Traffic: state.traffic * 1024 ** 3 }] })
       case 'QueryAccountBalance': return state.balanceFailed ? fail() : Response.json({ Data: { AvailableAmount: '42.00', Currency: 'USD' } })
-      case 'DescribeInstances': return state.instancesFailed ? fail() : Response.json({ Instances: { Instance: [{ InstanceId: state.instanceId, RegionId: 'cn-hongkong', Status: state.status, SpotStrategy: 'SpotAsPriceGo' }] } })
+      case 'DescribeInstances': {
+        if (state.instancesFailed) return fail()
+        // 官方接口仅在请求扩展属性时返回主网卡 IPv6，避免只测解析器而漏测请求。
+        const ipv6Sets = url.searchParams.get('AdditionalAttributes.1') === 'NETWORK_PRIMARY_ENI_IP' && state.ipv6
+          ? [{ Ipv6Address: state.ipv6, Primary: true }] : []
+        return Response.json({ Instances: { Instance: [{ InstanceId: state.instanceId, RegionId: 'cn-hongkong', Status: state.status, SpotStrategy: 'SpotAsPriceGo',
+          NetworkInterfaces: { NetworkInterface: [{ Type: 'Primary', Ipv6Sets: { Ipv6Set: ipv6Sets } }] },
+        }] } })
+      }
       case 'StopInstance':
         state.stops++
         state.stoppedIds.push(url.searchParams.get('InstanceId'))
@@ -174,9 +190,58 @@ try {
   await refresh('failed')
   assert.ok((await snapshot()).threshold_triggered_month, 'failed sampling cannot release breaker')
   state.trafficFailed = false
+  const beforeEmpty = await snapshot()
+  const history = async () => (await db.prepare('SELECT * FROM traffic_hourly WHERE account_id = ? ORDER BY recorded_at').bind(id).all()).results
+  const beforeEmptyHistory = await history()
+  const emptyCalls = state.trafficCalls
+  state.trafficResponses = [
+    { status: 200, body: '{"TrafficDetails":[]}' },
+    { status: 200, body: '{"Data":{"TrafficDetails":[]}}' },
+    { status: 200, body: '{}' },
+  ]
+  const emptyJob = await refresh('failed')
+  assert.match(emptyJob.error_msg, /连续 3 次返回空流量明细/)
+  assert.equal(state.trafficCalls - emptyCalls, 3)
+  const afterEmpty = await snapshot()
+  for (const field of ['billing_month', 'cdt_domestic_bytes', 'cdt_overseas_bytes', 'traffic_updated_at', 'threshold_triggered_month', 'threshold_limit_gb']) {
+    assert.equal(afterEmpty[field], beforeEmpty[field], `empty traffic must preserve ${field}`)
+  }
+  assert.deepEqual(await history(), beforeEmptyHistory, 'empty traffic must not overwrite history with zero')
+  console.log('✓ 连续空流量响应重试耗尽后失败，保留用量、账期、成功时间、历史与熔断')
+  state.traffic = 0
+  state.trafficResponses = [{ status: 200, body: '{"TrafficDetails":[]}' }]
+  const recoveredCalls = state.trafficCalls
   await refresh()
+  assert.equal(state.trafficCalls - recoveredCalls, 2)
+  assert.equal((await snapshot()).cdt_overseas_bytes, 0, 'explicit zero traffic remains valid')
   assert.equal((await snapshot()).threshold_triggered_month, null)
+  state.traffic = 190
   console.log('✓ 提升阈值必须经成功采集才解除熔断')
+
+  for (const response of [
+    { status: 429, body: 'Too Many Requests' },
+    { status: 400, body: '{"Code":"InvalidTimeStamp.Expired","Message":"Request expired"}' },
+    { status: 200, body: '{"Code":"MissingParameter","Message":"The input parameter Timestamp is not supplied."}' },
+  ]) {
+    state.trafficResponses = [response]
+    state.trafficAttempts = []
+    await refresh()
+    assert.equal(state.trafficAttempts.length, 2)
+    assert.equal(new Set(state.trafficAttempts.map(a => a.nonce)).size, 2)
+    assert.equal(new Set(state.trafficAttempts.map(a => a.signature)).size, 2)
+    assert.ok(state.trafficAttempts.every(a => a.timestamp && Number.isFinite(Date.parse(a.timestamp))))
+  }
+  state.trafficResponses = Array.from({ length: 3 }, () => ({ status: 429, body: 'Too Many Requests' }))
+  state.trafficAttempts = []
+  await refresh('failed')
+  assert.equal(state.trafficAttempts.length, 3, 'persistent throttling must stop after three attempts')
+  state.trafficFailed = true
+  state.trafficAttempts = []
+  await refresh('failed')
+  assert.equal(state.trafficAttempts.length, 1, 'permission failures must not be retried')
+  state.trafficFailed = false
+  state.trafficAttempts = null
+  console.log('✓ HTTP 429 与瞬态时间戳错误重新签名后重试，持续失败有上限，权限错误不重试')
 
   await api(`accounts/${id}`, 'PUT', config)
   await db.prepare("UPDATE account_snapshots SET billing_month = '2000-01', threshold_triggered_month = '2000-01', cdt_overseas_bytes = ?, traffic_updated_at = 1234 WHERE account_id = ?").bind(190 * 1024 ** 3, id).run()
@@ -210,6 +275,14 @@ try {
   assert.equal((await snapshot()).balance_updated_at, oldBalanceAt)
   state.balanceFailed = false
   console.log('✓ 部分失败返回详情，保留各来源成功时间')
+
+  for (const ipv6 of ['2001:db8:1234:5678::1', '2001:db8:1234:5678::2', null]) {
+    state.ipv6 = ipv6
+    await refresh()
+    assert.equal(JSON.parse((await snapshot()).instances_json)[0].public_ipv6, ipv6)
+    assert.equal((await api('overview')).accounts.find(a => a.id === id).instances[0].public_ipv6, ipv6)
+  }
+  console.log('✓ 请求主网卡扩展字段，IPv6 首次分配、地址变化及移除均同步到概览')
 
   await api('accounts', 'POST', { ...config, name: 'Second', traffic_threshold_gb: 0 })
   await db.prepare("INSERT INTO jobs (id, job_type, status, created_at, payload_json) VALUES ('queued-batch', 'refresh_all', 'pending', ?, '{}')").bind(Date.now()).run()

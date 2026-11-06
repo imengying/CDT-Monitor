@@ -103,6 +103,7 @@ function signatureOf(account: AccountOverview): string {
       status: instance.status,
       keep: instance.keep_alive,
       ip: instance.public_ip,
+      ipv6: instance.public_ipv6,
     })),
   })
 }

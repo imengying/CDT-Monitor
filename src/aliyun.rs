@@ -113,17 +113,30 @@ impl AliyunError {
         match self {
             AliyunError::Network(_) => true,
             AliyunError::Api {
-                code, http_status, ..
+                code,
+                message,
+                http_status,
+                ..
             } => {
-                if *http_status >= 500 {
+                if *http_status == 429 || *http_status >= 500 {
                     return true;
                 }
                 let code = code.to_ascii_lowercase();
+                let detail = format!("{code} {message}")
+                    .to_ascii_lowercase()
+                    .split_whitespace()
+                    .collect::<String>();
+                // 重试会重新生成时间戳和签名；普通缺参或鉴权错误不应重试。
+                let timestamp_error = detail.contains("timestamp")
+                    && (detail.contains("expired")
+                        || detail.contains("notsupplied")
+                        || detail.contains("missing"));
                 code.starts_with("throttling")
                     || code.contains("serviceunavailable")
                     || code.contains("internalerror")
                     || code.contains("timeout")
                     || code.contains("busy")
+                    || timestamp_error
             }
             _ => false,
         }
@@ -400,9 +413,8 @@ impl AliyunClient {
 
     /// 查询当月 CDT 公网流量（国内 / 海外分开汇总）。
     ///
-    /// 先尝试 `ListCdtInternetTraffic`；若返回“不支持的 Action”等错误，
-    /// 再回退到 `GetCdtInternetTraffic`。两个接口的响应结构都按
-    /// [`CdtTraffic::parse`] 的宽松规则解析，尽量兼容字段差异。
+    /// 调用 `ListCdtInternetTraffic`，空明细重试耗尽后返回错误，
+    /// 防止把尚未返回的计量数据当作零流量覆盖已有快照。
     pub async fn query_cdt_traffic(&self) -> Result<CdtTraffic, AliyunError> {
         // 参数与上游一致：RegionId 固定 cn-hongkong，不传时间范围。
         // 该 Action 返回当前计费周期内的累计值。
@@ -410,7 +422,6 @@ impl AliyunClient {
         // 空 TrafficDetails 会重试：CDT 的计量数据有分钟级延迟，
         // 首次调用可能在数据落库前返回空数组，稍后重试即可拿到。
         const MAX_ATTEMPTS: usize = 3;
-        let mut last_value = Value::Null;
 
         for attempt in 0..MAX_ATTEMPTS {
             let value = self
@@ -426,14 +437,14 @@ impl AliyunClient {
                 return Ok(CdtTraffic::parse(&value, self.site));
             }
 
-            last_value = value;
             if attempt + 1 < MAX_ATTEMPTS {
                 Delay::from(Duration::from_millis(300 * 2u64.pow(attempt as u32))).await;
             }
         }
 
-        // 重试后仍为空：按无数据处理，由上层决定是否告警
-        Ok(CdtTraffic::parse(&last_value, self.site))
+        Err(AliyunError::Parse(
+            "ListCdtInternetTraffic 连续 3 次返回空流量明细，请稍后重试".to_string(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -465,7 +476,15 @@ impl AliyunClient {
                 &self.endpoints.ecs,
                 "2014-05-26",
                 "DescribeInstances",
-                vec![("RegionId", region_id.to_string()), ("InstanceIds", ids)],
+                vec![
+                    ("RegionId", region_id.to_string()),
+                    ("InstanceIds", ids),
+                    // DescribeInstances 仅在请求此扩展属性时返回网卡 Ipv6Sets。
+                    (
+                        "AdditionalAttributes.1",
+                        "NETWORK_PRIMARY_ENI_IP".to_string(),
+                    ),
+                ],
             )
             .await?;
 
@@ -756,8 +775,7 @@ fn first_address(value: Option<&Value>) -> Option<String> {
 
 /// 从网卡的 `Ipv6Sets` 里取第一个 IPv6。
 ///
-/// 实例分配了 IPv6 但没绑公网带宽时，地址只出现在网卡详情里，
-/// 顶层的 `Ipv6Address` 是空的。
+/// DescribeInstances 需传 AdditionalAttributes.N=NETWORK_PRIMARY_ENI_IP。
 fn first_network_ipv6(item: &Value) -> Option<String> {
     let interfaces = item
         .get("NetworkInterfaces")
@@ -808,10 +826,7 @@ fn parse_instance(item: &Value, fallback_region: &str) -> InstanceInfo {
             .and_then(|vpc| first_address(vpc.get("PrivateIpAddress")))
     });
 
-    // 公网 IPv6。三种存法都要试：
-    //   1. `Ipv6Address`   开了 Ipv6AddressCount 时
-    //   2. `Ipv6Addresses` 兼容旧字段
-    //   3. 网卡 `Ipv6Sets`  分配了 IPv6 但没有公网带宽实例时
+    // 兼容顶层地址字段和网卡 Ipv6Sets；返回已分配地址不代表已开通公网带宽。
     let public_ipv6 = first_address(item.get("Ipv6Address"))
         .or_else(|| first_address(item.get("Ipv6Addresses")))
         .or_else(|| first_network_ipv6(item));
@@ -1479,6 +1494,52 @@ mod tests {
             http_status: 503,
         };
         assert!(server_error.is_retryable());
+    }
+
+    #[test]
+    fn retryable_http_and_timestamp_responses() {
+        for (status, body, retryable) in [
+            (429, "Too Many Requests", true),
+            (429, "", true),
+            (
+                400,
+                r#"{"Code":"InvalidTimeStamp.Expired","Message":"Request expired"}"#,
+                true,
+            ),
+            (
+                200,
+                r#"{"Code":"MissingParameter","Message":"The input parameter Timestamp is not supplied."}"#,
+                true,
+            ),
+            (
+                400,
+                r#"{"Code":"MissingParameter","Message":"Timestamp is missing"}"#,
+                true,
+            ),
+            (
+                400,
+                r#"{"Code":"MissingParameter","Message":"InstanceId is not supplied"}"#,
+                false,
+            ),
+            (
+                400,
+                r#"{"Code":"InvalidTimeStamp.Format","Message":"Invalid Timestamp format"}"#,
+                false,
+            ),
+            (
+                403,
+                r#"{"Code":"SignatureDoesNotMatch","Message":"Signature mismatch"}"#,
+                false,
+            ),
+            (
+                403,
+                r#"{"Code":"Forbidden","Message":"Access denied"}"#,
+                false,
+            ),
+        ] {
+            let error = parse_rpc_response(status, body, "DescribeInstances").unwrap_err();
+            assert_eq!(error.is_retryable(), retryable, "{status}: {body}");
+        }
     }
 
     #[test]
