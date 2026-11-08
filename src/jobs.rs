@@ -221,18 +221,20 @@ async fn execute_segment(env: Env, job_id: String) {
                         account_id,
                         instance_id,
                         config_version,
-                    } => scheduler
-                        .instance_action(account_id, &instance_id, true, config_version)
-                        .await
-                        .map(|result| result.detail),
+                    } => {
+                        scheduler
+                            .instance_action(account_id, &instance_id, true, config_version)
+                            .await
+                    }
                     JobTask::StopInstance {
                         account_id,
                         instance_id,
                         config_version,
-                    } => scheduler
-                        .instance_action(account_id, &instance_id, false, config_version)
-                        .await
-                        .map(|result| result.detail),
+                    } => {
+                        scheduler
+                            .instance_action(account_id, &instance_id, false, config_version)
+                            .await
+                    }
                     JobTask::NotifyTest { channel } => {
                         let outcome = scheduler.test_notification(channel).await;
                         if outcome.results.is_empty() {

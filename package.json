@@ -13,7 +13,7 @@
     "build:worker": "bash scripts/build-worker.sh",
     "build:web": "bun run --cwd web build",
     "install:web": "bun install --cwd web",
-    "dev": "bun run build && bunx wrangler dev",
+    "dev": "bun run build:web && bun run build:worker && bunx wrangler dev",
     "dev:web": "bun run --cwd web dev",
     "deploy": "bun run scripts/deploy.ts",
     "db:migrate:local": "bunx wrangler d1 migrations apply DB --local",
@@ -28,8 +28,11 @@
     "test": "cargo test --locked && bun run typecheck:web && bun run check:config && bun run lint && bun run test:worker"
   },
   "devDependencies": {
-    "wrangler": "^4.157.0",
-    "miniflare": "5.20261103.0-beta"
+    "wrangler": "4.158.0",
+    "miniflare": "4.20260730.0"
+  },
+  "overrides": {
+    "workerd": "1.20261104.1"
   },
   "trustedDependencies": [
     "esbuild",

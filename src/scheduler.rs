@@ -1,10 +1,10 @@
 //! # 调度器：采样、熔断、定时开关机、抢占式保活、日报
 //!
-//! 每次 Cron（`*/5 * * * *`）走一遍 [`Scheduler::run_account_cron`]：
+//! 每次 Cron（`*/5 * * * *`）为启用账号派发消息，各自运行 [`Scheduler::run_account_cron`]：
 //!
 //! ```text
-//! 1. 清理过期锁 / 旧任务 / 旧日志（每天一次）
-//! 2. 逐个启用账号：CDT 流量 + 余额 + 该账号的 ECS 实例 → 写快照 → 采样历史
+//! 1. 清理与日报到期时派发独立维护消息，成功后去重，失败可重试
+//! 2. 单账号：CDT 流量 + ECS 实例（余额每 30 分钟）→ 写快照 → 采样历史
 //! 3. 阈值判定：合计流量 ≥ traffic_limit_gb
 //!      └─ 首次超限 → 标记账期 + 通知 [+ 停机（stop_and_notify）]
 //! 4. 定时关机（含 10 分钟短窗口补偿）
@@ -71,6 +71,8 @@ pub const INSTANCE_LOCK_TTL_MINUTES: i64 = 30;
 /// 前端过渡态每 1 分钟轮询一次（对齐上游），锁留 45 秒让同一次轮询里的
 /// 多个请求（多标签页）只触发一次采集，下一分钟又能正常采。
 pub const TRANSITION_REFRESH_TTL_MS: i64 = 45_000;
+/// 余额不参与自动化决策，巡检每 30 分钟更新；手动刷新始终实时查询。
+const BALANCE_REFRESH_INTERVAL_MS: i64 = 30 * 60_000;
 /// 定时关机后保活的避让期（分钟）。
 ///
 /// 只需覆盖「刚关机的那一轮 Cron」：Cron 5 分钟一次，留 10 分钟让快照
@@ -89,13 +91,11 @@ pub const KEEP_ALIVE_STOP_GRACE_MINUTES: i64 = 10;
 /// 单账号一次刷新的结果。
 #[derive(Debug, Clone)]
 pub struct RefreshOutcome {
-    pub account_id: i64,
     pub account_name: String,
     /// 流量和实例均查询成功；余额失败作为警告返回。
     pub success: bool,
     /// 本轮成功读取实例状态；失败时旧快照仅供展示，不能确认定时动作完成。
     pub instances_fresh: bool,
-    pub total_bytes: i64,
     pub domestic_bytes: i64,
     pub overseas_bytes: i64,
     /// 本次刷新是否**新触发**了熔断。
@@ -107,11 +107,9 @@ pub struct RefreshOutcome {
 impl RefreshOutcome {
     fn failed(account: &AccountRow, error: String) -> Self {
         Self {
-            account_id: account.id,
             account_name: account.name.clone(),
             success: false,
             instances_fresh: false,
-            total_bytes: 0,
             domestic_bytes: 0,
             overseas_bytes: 0,
             threshold_fired: false,
@@ -130,7 +128,6 @@ pub struct CronReport {
     pub instances_started: usize,
     pub instances_stopped: usize,
     pub keep_alive_started: usize,
-    pub report_sent: bool,
     /// 采集、状态过渡或自动化动作尚未完成，允许队列重新核实。
     pub retry_needed: bool,
     /// 逐条明细（日志用）。
@@ -141,7 +138,7 @@ impl CronReport {
     /// 单行摘要。
     pub fn summary(&self) -> String {
         format!(
-            "账号 {}/{} 刷新成功，失败 {}，熔断 {}，停机 {}，开机 {}，保活 {}，日报 {}",
+            "账号 {}/{} 刷新成功，失败 {}，熔断 {}，停机 {}，开机 {}，保活 {}",
             self.accounts_refreshed,
             self.accounts_total,
             self.accounts_failed,
@@ -149,21 +146,8 @@ impl CronReport {
             self.instances_stopped,
             self.instances_started,
             self.keep_alive_started,
-            if self.report_sent {
-                "已推送"
-            } else {
-                "未触发"
-            }
         )
     }
-}
-
-/// 一个实例的动作结果。
-#[derive(Debug, Clone)]
-pub struct InstanceActionResult {
-    pub instance_id: String,
-    pub ok: bool,
-    pub detail: String,
 }
 
 // ===========================================================================
@@ -172,7 +156,6 @@ pub struct InstanceActionResult {
 
 /// 调度器。持有一次执行期间需要的全部上下文。
 pub struct Scheduler {
-    env: worker::Env,
     db: Db,
     crypto: Crypto,
     now: i64,
@@ -189,7 +172,6 @@ impl Scheduler {
         let db = Db::new(env);
         let timezone = db.get_timezone().await?;
         Ok(Self {
-            env: env.clone(),
             db,
             crypto,
             now: now_ms(),
@@ -202,26 +184,6 @@ impl Scheduler {
         let mut scheduler = Self::new(env).await?;
         scheduler.now = now;
         Ok(scheduler)
-    }
-
-    pub fn db(&self) -> &Db {
-        &self.db
-    }
-
-    pub fn crypto(&self) -> &Crypto {
-        &self.crypto
-    }
-
-    pub fn now(&self) -> i64 {
-        self.now
-    }
-
-    pub fn timezone(&self) -> &str {
-        &self.timezone
-    }
-
-    pub fn env(&self) -> &worker::Env {
-        &self.env
     }
 
     // -----------------------------------------------------------------------
@@ -373,16 +335,17 @@ impl Scheduler {
                 self.db
                     .account_at_version(account.id, account.config_version)
                     .await?;
-                self.refresh_account_inner(account).await
+                self.refresh_account_inner(account, true).await
             })
             .await;
         self.refresh_outcome(account, result).await
     }
 
     async fn refresh_locked(&self, account: &AccountRow) -> RefreshOutcome {
-        let result = crate::runtime::timeout(20_000, Box::pin(self.refresh_account_inner(account)))
-            .await
-            .unwrap_or_else(|e| Err(worker::Error::RustError(e.into())));
+        let result =
+            crate::runtime::timeout(20_000, Box::pin(self.refresh_account_inner(account, false)))
+                .await
+                .unwrap_or_else(|e| Err(worker::Error::RustError(e.into())));
         self.refresh_outcome(account, result).await
     }
 
@@ -404,7 +367,56 @@ impl Scheduler {
         }
     }
 
-    async fn refresh_account_inner(&self, account: &AccountRow) -> worker::Result<RefreshOutcome> {
+    /// 页面补采只查询实例，不读取余额、流量，不执行自动化或写采样历史。
+    pub async fn refresh_instance(&self, account: &AccountRow) -> worker::Result<()> {
+        self.db
+            .with_account_lock(account.id, 20_000, async {
+                let current = self
+                    .db
+                    .account_at_version(account.id, account.config_version)
+                    .await?;
+                if current.is_enabled() {
+                    self.refresh_instance_locked(&current).await?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn refresh_instance_locked(&self, account: &AccountRow) -> worker::Result<InstanceInfo> {
+        let client = AliyunClient::from_account(account, self.account_secret(account)?);
+        let mut instance = client
+            .describe_instance(
+                &account.region_id,
+                account.instance_id_opt().unwrap_or_default(),
+            )
+            .await
+            .map_err(|err| worker::Error::RustError(err.query_failure("实例查询")))?
+            .ok_or_else(|| {
+                worker::Error::RustError("云端找不到配置的实例，请核实地域和实例 ID".into())
+            })?;
+        if let Some(previous) = self
+            .db
+            .snapshot_instances(account.id)
+            .await?
+            .into_iter()
+            .find(|i| i.instance_id == instance.instance_id)
+        {
+            instance.keep_alive = previous.keep_alive;
+            // 此处不补查副网卡；地址的分配与移除由完整采集核实。
+            instance.public_ipv6 = instance.public_ipv6.or(previous.public_ipv6);
+        }
+        self.db
+            .save_live_instance(account.id, &instance, now_ms())
+            .await?;
+        Ok(instance)
+    }
+
+    async fn refresh_account_inner(
+        &self,
+        account: &AccountRow,
+        force_balance: bool,
+    ) -> worker::Result<RefreshOutcome> {
         let secret = self.account_secret(account)?;
         let client = AliyunClient::from_account(account, secret);
         if account.cloud_account_id.is_none() {
@@ -413,11 +425,30 @@ impl Scheduler {
                 Err(err) => log_error!("账号 {} 身份核实失败：{}", account.id, err.short()),
             }
         }
-        let sync =
-            crate::aliyun::sync_account(&client, &account.region_id, account.instance_id_opt())
-                .await;
-
         let previous = self.db.get_snapshot(account.id).await?;
+        let query_balance = force_balance
+            || previous.as_ref().is_none_or(|snapshot| {
+                snapshot
+                    .balance_updated_at
+                    .is_none_or(|at| self.now.saturating_sub(at) >= BALANCE_REFRESH_INTERVAL_MS)
+            });
+        let mut sync = crate::aliyun::sync_account(
+            &client,
+            &account.region_id,
+            account.instance_id_opt(),
+            query_balance,
+        )
+        .await;
+        // 跳过查询不代表上次的余额异常已恢复；保留提示直到下次实际查询。
+        if !query_balance && let Some(snapshot) = &previous {
+            let errors: Vec<String> =
+                serde_json::from_str(&snapshot.sync_errors_json).unwrap_or_default();
+            sync.warnings.extend(
+                errors
+                    .into_iter()
+                    .filter(|error| error.starts_with("余额查询")),
+            );
+        }
         let billing_month = crate::models::billing_month(self.now, &self.timezone);
 
         // 逐实例保活开关由用户在界面设置，采集结果里没有这项信息，
@@ -496,7 +527,6 @@ impl Scheduler {
 
         // 账号落在哪个额度池由地域决定：中国内地 20 GB、其余（含香港）200 GB。
         // CDT 接口按地域分类汇总，这里取账号所属那一类的累计值。
-        let total_bytes = domestic_bytes + overseas_bytes;
         let pool = account.quota_pool();
         let used_gb = bytes_to_gb(match pool {
             QuotaPool::Domestic => domestic_bytes,
@@ -581,12 +611,10 @@ impl Scheduler {
         }
 
         Ok(RefreshOutcome {
-            account_id: account.id,
             account_name: account.name.clone(),
             // 流量与实例是自动化决策所需数据，失败时不能用旧快照冒充刷新成功。
             success: traffic_fresh && instances_fresh,
             instances_fresh,
-            total_bytes,
             domestic_bytes,
             overseas_bytes,
             threshold_fired,
@@ -594,96 +622,100 @@ impl Scheduler {
         })
     }
 
-    /// 刷新全部启用账号。
-    pub async fn refresh_all(&self) -> Vec<RefreshOutcome> {
-        let accounts = match self.db.list_accounts(true).await {
-            Ok(accounts) => accounts,
-            Err(err) => {
-                log_error!("读取账号失败：{err}");
-                return Vec::new();
-            }
-        };
-
-        let mut outcomes = Vec::with_capacity(accounts.len());
-        for account in &accounts {
-            outcomes.push(self.refresh_account(account).await);
-        }
-        outcomes
-    }
-
     // -----------------------------------------------------------------------
     // 日报
     // -----------------------------------------------------------------------
 
-    /// 命中时间窗口就推送日报；返回是否推送。
-    pub async fn maybe_daily_report(&self, report: &mut CronReport) -> worker::Result<bool> {
-        let mut config: DailyReportConfig =
-            self.db.get_json_setting(setting_key::DAILY_REPORT).await?;
-        if !config.enabled {
-            return Ok(false);
-        }
-        let Some(target) = parse_hhmm(&config.time) else {
-            return Ok(false);
-        };
+    fn report_due(&self, config: &DailyReportConfig) -> bool {
         let tz = if config.timezone.trim().is_empty() {
-            self.timezone.clone()
+            &self.timezone
         } else {
-            config.timezone.clone()
+            &config.timezone
         };
-        let today = local_date(self.now, &tz);
-        if config.last_sent_date.as_deref() == Some(today.as_str()) {
-            return Ok(false);
-        }
-        if !within_window(
-            local_minutes_of_day(self.now, &tz),
-            target,
-            REPORT_WINDOW_MINUTES,
-        ) {
-            return Ok(false);
-        }
+        config.enabled
+            && config.last_sent_date.as_deref() != Some(local_date(self.now, tz).as_str())
+            && parse_hhmm(&config.time).is_some_and(|target| {
+                within_window(
+                    local_minutes_of_day(self.now, tz),
+                    target,
+                    REPORT_WINDOW_MINUTES,
+                )
+            })
+    }
 
+    /// 仅当清理到期或日报命中发送窗口时，才需要维护消息。
+    pub async fn maintenance_due(&self) -> worker::Result<bool> {
+        if !self.db.lock_active("housekeeping", self.now).await? {
+            return Ok(true);
+        }
+        let config = self.db.get_json_setting(setting_key::DAILY_REPORT).await?;
+        Ok(self.report_due(&config))
+    }
+
+    async fn maybe_daily_report(&self) -> worker::Result<()> {
+        let config: DailyReportConfig = self.db.get_json_setting(setting_key::DAILY_REPORT).await?;
+        if !self.report_due(&config) {
+            return Ok(());
+        }
+        let tz = if config.timezone.trim().is_empty() {
+            &self.timezone
+        } else {
+            &config.timezone
+        };
+        let today = local_date(self.now, tz);
         let lock_name = format!("daily-report:{today}");
-        let owner = random_hex(8).map_err(|e| worker::Error::RustError(e.to_string()))?;
+        let owner = random_hex(8)?;
         if !self
             .db
-            .acquire_lock(&lock_name, &owner, now_ms(), 30 * 60 * 1000)
+            .acquire_lock(&lock_name, &owner, now_ms(), 120_000)
             .await?
         {
-            return Ok(false);
+            return Ok(());
         }
-
-        let message = self.build_daily_report(&tz).await?;
-        let outcome = self.notify(message).await;
-
-        // 只在真的送达后才标记「今天已推送」，否则下次 Cron 会重试。
-        // 之前无条件标记，一次通知失败就会让当天的日报永久丢失。
-        if !outcome.any_success() {
-            let reason = outcome.failures().join("；");
-            let _ = self.db.release_lock(&lock_name, &owner).await;
-            report
-                .notes
-                .push(format!("日报推送失败，稍后重试：{reason}"));
-            return Ok(false);
-        }
-
-        config.last_sent_date = Some(today.clone());
-        self.db
-            .set_json_setting(setting_key::DAILY_REPORT, &config, now_ms())
-            .await?;
-        self.db
-            .add_log(
-                None,
-                "daily_report",
-                None,
-                &format!("日报已推送（{today}）"),
-                now_ms(),
-            )
-            .await?;
-        let _ = self.db.release_lock(&lock_name, &owner).await;
-
-        report.report_sent = true;
-        report.notes.push(format!("日报已推送（{today}）"));
-        Ok(true)
+        let result = crate::runtime::timeout(85_000, async {
+            // 等待锁期间另一条消息可能已送达，持锁后再次核实。
+            let mut current: DailyReportConfig =
+                self.db.get_json_setting(setting_key::DAILY_REPORT).await?;
+            if !self.report_due(&current) {
+                return Ok(());
+            }
+            // 配置已变化时由下一轮按新配置派发，不用旧时区发送。
+            if current.time != config.time || current.timezone != config.timezone {
+                return Ok(());
+            }
+            let message = self.build_daily_report(tz).await?;
+            let outcome = self.notify(message).await;
+            if !outcome.any_success() {
+                let reason = if outcome.results.is_empty() {
+                    "未配置可用通知渠道".to_string()
+                } else {
+                    outcome.failures().join("；")
+                };
+                return Err(worker::Error::RustError(format!(
+                    "日报推送失败，稍后重试：{reason}"
+                )));
+            }
+            current.last_sent_date = Some(today.clone());
+            self.db
+                .set_json_setting(setting_key::DAILY_REPORT, &current, now_ms())
+                .await?;
+            self.db
+                .add_log(
+                    None,
+                    "daily_report",
+                    None,
+                    &format!("日报已推送（{today}）"),
+                    now_ms(),
+                )
+                .await?;
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|err| Err(worker::Error::RustError(err.into())));
+        let released = self.db.release_lock(&lock_name, &owner).await;
+        result?;
+        released?;
+        Ok(())
     }
 
     /// 手工触发一次日报（`POST /api/v1/reports/daily`）。
@@ -826,7 +858,7 @@ impl Scheduler {
         instance_id: &str,
         start: bool,
         config_version: i64,
-    ) -> worker::Result<InstanceActionResult> {
+    ) -> worker::Result<String> {
         self.db
             .with_account_lock(account_id, 20_000, async {
                 let account = self
@@ -844,7 +876,7 @@ impl Scheduler {
         account: &AccountRow,
         instance_id: &str,
         start: bool,
-    ) -> worker::Result<InstanceActionResult> {
+    ) -> worker::Result<String> {
         let account_id = account.id;
 
         if account.instance_id_opt() != Some(instance_id) {
@@ -857,34 +889,14 @@ impl Scheduler {
         }
         let client = AliyunClient::from_account(account, self.account_secret(account)?);
         let region_id = &account.region_id;
-        let mut instance = client
-            .describe_instance(region_id, instance_id)
-            .await?
-            .filter(|i| i.instance_id == instance_id)
-            .ok_or_else(|| {
-                worker::Error::RustError("云端找不到配置的实例，请核实地域和实例 ID".into())
-            })?;
-        instance.keep_alive = self
-            .db
-            .snapshot_instances(account_id)
-            .await?
-            .iter()
-            .find(|i| i.instance_id == instance_id)
-            .is_some_and(|i| i.keep_alive);
-        self.db
-            .save_live_instance(account_id, &instance, now_ms())
-            .await?;
+        let instance = self.refresh_instance_locked(account).await?;
         if (start && instance.is_running()) || (!start && instance.is_stopped()) {
-            return Ok(InstanceActionResult {
-                instance_id: instance_id.into(),
-                ok: true,
-                detail: if start {
-                    "已核实实例正在运行，无需开机"
-                } else {
-                    "已核实实例已停止，无需关机"
-                }
-                .into(),
-            });
+            return Ok(if start {
+                "已核实实例正在运行，无需开机"
+            } else {
+                "已核实实例已停止，无需关机"
+            }
+            .into());
         }
         if !(instance.is_running() || instance.is_stopped()) {
             return Err(worker::Error::RustError(
@@ -914,11 +926,7 @@ impl Scheduler {
                 self.db
                     .add_log(Some(account_id), action, Some(instance_id), &text, now_ms())
                     .await?;
-                InstanceActionResult {
-                    instance_id: instance_id.to_string(),
-                    ok: true,
-                    detail: text,
-                }
+                text
             }
             Err(err) => {
                 let text = err.short();
@@ -945,9 +953,8 @@ impl Scheduler {
         // 动作后立即刷新，保证前端轮询结束时看到的是真实状态；
         // 若阿里云尚未落到终态（刚发出指令常如此），把快照置为过渡态，
         // 让前端显示「正在启动…」，并在每分钟轮询时补采核实终态。
-        let refresh = self.refresh_locked(account).await;
-        if !refresh.success {
-            log_warn!("动作后刷新失败：{}", refresh.warnings.join("；"));
+        if let Err(err) = self.refresh_instance_locked(account).await {
+            log_warn!("动作后刷新失败：{err}");
         }
         self.set_transitional_status(account_id, instance_id, start)
             .await?;
@@ -1071,6 +1078,9 @@ impl Scheduler {
 
     /// 一个队列消息只巡检一个账号，独享该次 Worker 的 D1 调用额度。
     pub async fn run_account_cron(&self, account: &AccountRow) -> CronReport {
+        if !account.is_enabled() {
+            return CronReport::default();
+        }
         match self
             .db
             .with_account_lock(account.id, 85_000, async {
@@ -1160,10 +1170,17 @@ impl Scheduler {
     }
 
     pub async fn maintenance(&self) -> worker::Result<()> {
-        let mut report = CronReport::default();
-        self.housekeeping(&mut report).await;
-        self.maybe_daily_report(&mut report).await?;
-        Ok(())
+        // 清理失败也继续尝试日报，两者的失败均交给队列重试。
+        let cleanup = self.housekeeping().await;
+        let report = self.maybe_daily_report().await;
+        for error in [cleanup.as_ref().err(), report.as_ref().err()]
+            .into_iter()
+            .flatten()
+        {
+            log_error!("维护失败：{error}");
+        }
+        cleanup?;
+        report
     }
 
     /// 在 Cron 派发端运行，队列积压时仍可发现采集停滞。
@@ -1179,18 +1196,14 @@ impl Scheduler {
         let mut details = Vec::new();
         for account in accounts {
             let snapshot = snapshots.get(&account.id);
-            // 刚更换身份导致快照清空时，从配置更新时间开始给采集留出窗口。
-            let baseline = if snapshot.is_none() {
-                account.updated_at
-            } else {
-                account.created_at
-            };
+            // 刚更换身份时快照可能为空，也可能仅补采过实例；
+            // 尚未采集的来源从配置更新时间开始计时，给首次采集留出窗口。
             let traffic_at = snapshot
                 .and_then(|s| s.traffic_updated_at)
-                .unwrap_or(baseline);
+                .unwrap_or(account.updated_at);
             let instances_at = snapshot
                 .and_then(|s| s.instances_updated_at)
-                .unwrap_or(baseline);
+                .unwrap_or(account.updated_at);
             let age = self.now.saturating_sub(traffic_at.min(instances_at));
             if age >= 15 * 60_000 {
                 details.push(format!(
@@ -1223,72 +1236,42 @@ impl Scheduler {
         Ok(())
     }
 
-    /// 清理过期数据：每天只跑一次（锁保证）。
-    async fn housekeeping(&self, report: &mut CronReport) {
+    /// 成功清理后冷却一天；失败释放短期租约，队列和下一轮 Cron 都可重试。
+    async fn housekeeping(&self) -> worker::Result<()> {
         let now = now_ms();
-        let owner = match random_hex(8) {
-            Ok(owner) => owner,
-            Err(_) => return,
-        };
-        match self
+        let owner = random_hex(8)?;
+        if !self
             .db
-            .acquire_lock("housekeeping", &owner, now, 20 * 60 * 60 * 1000)
-            .await
+            .acquire_lock("housekeeping", &owner, now, 120_000)
+            .await?
         {
-            Ok(true) => {}
-            _ => return,
+            return Ok(());
         }
-
-        let _ = self.db.purge_login_attempts(now).await;
-        if let Err(err) = self.db.purge_locks(now).await {
-            report.notes.push(format!("清理过期锁失败：{err}"));
+        let result = crate::runtime::timeout(85_000, async {
+            self.db.purge_login_attempts(now).await?;
+            self.db.purge_locks(now).await?;
+            self.db.purge_sessions(now).await?;
+            let day = 24 * 60 * 60 * 1000i64;
+            self.db
+                .purge_history(now - HISTORY_RETENTION_DAYS * day)
+                .await?;
+            self.db.purge_logs(now - LOG_RETENTION_DAYS * day).await?;
+            self.db.purge_jobs(now - JOB_RETENTION_DAYS * day).await?;
+            self.db
+                .complete_task("housekeeping", &owner, now_ms() + day)
+                .await
+        })
+        .await
+        .unwrap_or_else(|err| Err(worker::Error::RustError(err.into())));
+        if result.is_err() {
+            let _ = self.db.release_lock("housekeeping", &owner).await;
         }
-        if let Err(err) = self.db.purge_sessions(now).await {
-            report.notes.push(format!("清理过期会话失败：{err}"));
-        }
-        let day = 24 * 60 * 60 * 1000i64;
-        if let Err(err) = self
-            .db
-            .purge_history(now - HISTORY_RETENTION_DAYS * day)
-            .await
-        {
-            report.notes.push(format!("清理历史失败：{err}"));
-        }
-        if let Err(err) = self.db.purge_logs(now - LOG_RETENTION_DAYS * day).await {
-            report.notes.push(format!("清理日志失败：{err}"));
-        }
-        if let Err(err) = self.db.purge_jobs(now - JOB_RETENTION_DAYS * day).await {
-            report.notes.push(format!("清理任务失败：{err}"));
-        }
+        result
     }
 
     // -----------------------------------------------------------------------
     // 供路由层复用的查询
     // -----------------------------------------------------------------------
-
-    /// 首页数据：账号 + 快照 → 概览。
-    pub async fn overview(&self) -> worker::Result<Vec<AccountOverview>> {
-        let accounts = self.db.list_accounts(false).await?;
-        let snapshots: HashMap<i64, SnapshotRow> = self
-            .db
-            .list_snapshots()
-            .await?
-            .into_iter()
-            .map(|snapshot| (snapshot.account_id, snapshot))
-            .collect();
-
-        Ok(accounts
-            .iter()
-            .map(|account| {
-                build_overview(
-                    account,
-                    snapshots.get(&account.id),
-                    &self.timezone,
-                    self.now,
-                )
-            })
-            .collect())
-    }
 
     /// 流量历史：小时点与天点各取最近一批。
     pub async fn traffic_history(
@@ -1582,13 +1565,12 @@ mod tests {
             instances_started: 2,
             instances_stopped: 1,
             keep_alive_started: 1,
-            report_sent: false,
             retry_needed: false,
             notes: Vec::new(),
         };
         let summary = report.summary();
         assert!(summary.contains("账号 2/3"));
-        assert!(summary.contains("日报 未触发"));
+        assert!(summary.contains("失败 1"));
     }
 
     #[test]

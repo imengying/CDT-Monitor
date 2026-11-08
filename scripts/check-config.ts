@@ -6,6 +6,9 @@ const crate = Bun.TOML.parse(readFileSync('Cargo.toml', 'utf8')) as any
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
 const webPkg = JSON.parse(readFileSync('web/package.json', 'utf8'))
 const nodeVersion = readFileSync('.node-version', 'utf8').trim()
+// Miniflare 4 使用与 Wrangler 匹配的 workerd，以支持项目的兼容日期。
+// 项目直接指定正式版，工具的间接依赖跟随官方发布。
+const dependencies = { ...pkg.devDependencies, ...pkg.overrides, ...webPkg.dependencies, ...webPkg.devDependencies }
 const date = config.compatibility_date
 const validDate = typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)
   && Number.isFinite(Date.parse(date)) && new Date(date).toISOString().slice(0, 10) === date
@@ -13,6 +16,7 @@ const validDate = typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)
 const checks: [string, boolean][] = [
   ['Node 26 构建版本一致', /^26\.\d+\.\d+$/.test(nodeVersion) && pkg.engines.node === `>=${nodeVersion} <27` && webPkg.engines.node === pkg.engines.node],
   ['Node 类型定义使用 26', /^\^26\./.test(webPkg.devDependencies['@types/node'])],
+  ['直接依赖及覆盖版本使用正式版', Object.values(dependencies).every(version => typeof version === 'string' && /^[~^]?\d+\.\d+\.\d+$/.test(version))],
   ['静态资源绑定', config.assets?.binding === 'ASSETS'],
   ['静态资源目录', config.assets?.directory === './web/dist'],
   ['API 优先进入 Worker', config.assets?.run_worker_first?.includes('/api/*') === true],

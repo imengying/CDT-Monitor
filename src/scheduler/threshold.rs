@@ -11,6 +11,10 @@ impl Scheduler {
         used_gb: f64,
         pool: QuotaPool,
     ) -> worker::Result<bool> {
+        // 手动刷新停用账号仍可读取数据，但不能顺带执行自动熔断。
+        if !account.is_enabled() {
+            return Ok(false);
+        }
         let billing_month = crate::models::billing_month(self.now, &self.timezone);
         let lock_name = format!("threshold:{}:{}", account.id, billing_month);
         let owner = random_hex(8).map_err(|e| worker::Error::RustError(e.to_string()))?;

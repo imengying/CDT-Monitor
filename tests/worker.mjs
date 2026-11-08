@@ -2,9 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile, readdir, mkdtemp, rm } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import * as miniflare from 'miniflare'
-const { Miniflare } = miniflare
-const compatibleOptions = miniflare.convertV4MiniflareOptions ?? (options => options)
+import { Miniflare } from 'miniflare'
 
 // 全部凭据均为测试夹具；所有出站请求在此拦截，绝不访问云账号。
 const state = { instanceId: 'i-review', stoppedIds: [], trafficCalls: 0, traffic: 190, trafficFailed: false, balanceFailed: false, instancesFailed: false, stopFailed: true, startFailed: false, notifyFailed: true, notifications: 0, stallTraffic: false, stallBody: false, status: 'Running', stops: 0, starts: 0, requests: 0 }
@@ -16,9 +14,12 @@ state.networkCalls = 0
 state.networkFailed = false
 state.stallNetwork = false
 state.networkPages = null
+state.balanceCalls = 0
+state.instanceCalls = 0
 let trafficGate = null
+let instanceGate = null
 const testDirectory = await mkdtemp(resolve(tmpdir(), 'cdt-worker-test-'))
-const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirectory, workers: [{ name: 'monitor',
+const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor',
   modules: [
     { type: 'ESModule', path: resolve('tests/budget-worker.mjs') },
     { type: 'ESModule', path: resolve('build/index.js') },
@@ -52,8 +53,12 @@ const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirect
         if (state.stallTraffic) return new Promise(() => {})
         if (state.stallBody) return new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{')); } }), { headers: { 'content-type': 'application/json' } })
         return state.trafficFailed ? fail() : Response.json({ TrafficDetails: [{ BusinessRegionId: 'cn-hongkong', Traffic: state.traffic * 1024 ** 3 }] })
-      case 'QueryAccountBalance': return state.balanceFailed ? fail() : Response.json({ Data: { AvailableAmount: '42.00', Currency: 'USD' } })
+      case 'QueryAccountBalance':
+        state.balanceCalls++
+        return state.balanceFailed ? fail() : Response.json({ Data: { AvailableAmount: '42.00', Currency: 'USD' } })
       case 'DescribeInstances': {
+        state.instanceCalls++
+        if (instanceGate) await instanceGate
         if (state.instancesFailed) return fail()
         // 官方接口仅在请求扩展属性时返回主网卡 IPv6，避免只测解析器而漏测请求。
         const ipv6Sets = !state.hideInstanceIpv6 && url.searchParams.get('AdditionalAttributes.1') === 'NETWORK_PRIMARY_ENI_IP' && state.ipv6
@@ -88,7 +93,7 @@ const mf = new Miniflare(compatibleOptions({ resourcePersistencePath: testDirect
       default: throw new Error(`Unexpected outbound request: ${url.origin}${url.pathname}`)
     }
   },
-}] }))
+}] })
 let cookie = ''
 async function request(path, method = 'GET', body, ip = '192.0.2.1') {
   return mf.dispatchFetch(`https://monitor.test/api/v1/${path}`, {
@@ -135,6 +140,7 @@ async function cronAccount(worker, accountId, retry = false) {
 
 try {
   const db = await mf.getD1Database('DB')
+  const worker = await mf.getWorker('monitor')
   for (const filename of (await readdir('migrations')).filter(f => f.endsWith('.sql')).sort()) {
     if (filename === 'init_003_reliability.sql') {
       await db.batch([
@@ -297,6 +303,46 @@ try {
   state.balanceFailed = false
   console.log('✓ 部分失败返回详情，保留各来源成功时间')
 
+  const disabled = await api('accounts', 'POST', { ...config, enabled: false })
+  const beforeDisabled = state.requests
+  await api('overview?refresh=transitional')
+  await cronAccount(worker, disabled.id)
+  await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
+    body: { Refresh: { account_id: disabled.id, requested_at: Date.now() } },
+  }])
+  assert.equal(state.requests, beforeDisabled, 'disabled accounts must not reach cloud APIs through automatic refresh')
+  assert.equal(await db.prepare('SELECT * FROM account_snapshots WHERE account_id = ?').bind(disabled.id).first(), null)
+  const disabledStops = state.stops
+  state.traffic = 190
+  state.status = 'Running'
+  await runJob(`accounts/${disabled.id}/refresh`)
+  assert.equal(state.stops, disabledStops, 'explicit sampling of a disabled account must not execute threshold actions')
+  assert.equal((await db.prepare('SELECT threshold_triggered_month FROM account_snapshots WHERE account_id = ?').bind(disabled.id).first()).threshold_triggered_month, null)
+  await api(`accounts/${disabled.id}`, 'DELETE')
+  state.traffic = 1
+  state.status = 'Stopped'
+  console.log('✓ 停用账号不自动补采，已排队消息也跳过，手动采集不触发熔断停机')
+
+  await refresh()
+  const balanceCalls = state.balanceCalls
+  const balanceAt = (await snapshot()).balance_updated_at
+  await cronAccount(worker, id)
+  await cronAccount(worker, id)
+  assert.equal(state.balanceCalls, balanceCalls)
+  assert.equal((await snapshot()).balance_updated_at, balanceAt)
+  await db.prepare('UPDATE account_snapshots SET balance_updated_at = ? WHERE account_id = ?').bind(Date.now() - 31 * 60_000, id).run()
+  state.balanceFailed = true
+  await cronAccount(worker, id)
+  assert.equal(state.balanceCalls, balanceCalls + 1)
+  assert.ok((await snapshot()).balance_updated_at < balanceAt)
+  state.balanceFailed = false
+  await cronAccount(worker, id)
+  assert.equal(state.balanceCalls, balanceCalls + 2, 'failed balance query must remain due')
+  assert.ok((await snapshot()).balance_updated_at > balanceAt)
+  await refresh()
+  assert.equal(state.balanceCalls, balanceCalls + 3, 'manual refresh always queries balance')
+  console.log('✓ 巡检余额每 30 分钟更新，失败保持待重试，手动刷新立即查询')
+
   for (const ipv6 of ['2001:db8:1234:5678::1', '2001:db8:1234:5678::2', null]) {
     state.ipv6 = ipv6
     const callsBefore = state.networkCalls
@@ -326,6 +372,12 @@ try {
   }
   await refresh()
   assert.equal(JSON.parse((await snapshot()).instances_json)[0].public_ipv6, '2001:db8::7', 'find IPv6 on secondary ENI on next page')
+  const statusNetworkCalls = state.networkCalls
+  await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
+    body: { Refresh: { account_id: id, requested_at: Date.now() } },
+  }])
+  assert.equal(state.networkCalls, statusNetworkCalls, 'status refresh must not query secondary ENIs again')
+  assert.equal(JSON.parse((await snapshot()).instances_json)[0].public_ipv6, '2001:db8::7', 'status refresh preserves known secondary IPv6')
   state.networkPages = { '': {} }
   const malformedNetwork = await refresh()
   assert.match(malformedNetwork.result_msg, /IPv6 补充查询失败.*NetworkInterfaceSets.NetworkInterfaceSet/)
@@ -376,7 +428,6 @@ try {
   await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: true, schedule_mode: 'advanced', schedule_stop_cron: '* * * * *' })
   await api(`accounts/${id}/instances/i-review/keep-alive`, 'PUT', { enabled: true })
   state.status = 'Running'
-  const worker = await mf.getWorker('monitor')
   await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: Date.now() })
   await eventually(async () => (await db.prepare('SELECT last_schedule_stop_at AS at FROM accounts WHERE id = ?').bind(id).first()).at, 'scheduled stop')
   assert.equal(state.status, 'Stopped')
@@ -543,27 +594,61 @@ try {
   await db.prepare('UPDATE accounts SET enabled = 0 WHERE id != ?').bind(id).run()
   console.log('✓ 11 个账号通过真实 Cron 分发完成采样，每次执行不超过 50 次 D1 调用')
 
-  // 阻塞云端采集，概览仍应立即返回；多账号补采各自消费独立 D1 额度。
+  await eventually(async () => !(await db.prepare("SELECT name FROM locks WHERE name LIKE 'account-operation:%'").first()), 'cron releases account operations')
+  // 阻塞实例查询，概览仍应立即返回；只补采启用账号的实例状态。
   await db.prepare("DELETE FROM locks WHERE name = 'overview-refresh'").run()
   await db.prepare("UPDATE account_snapshots SET instances_json = '[]'").run()
   let releaseTraffic
-  trafficGate = new Promise(resolve => { releaseTraffic = resolve })
+  let releaseInstance
+  instanceGate = new Promise(resolve => { releaseInstance = resolve })
+  const beforeStatus = await snapshot()
+  const statusHistory = await history()
+  const statusTrafficCalls = state.trafficCalls
+  const statusBalanceCalls = state.balanceCalls
+  const statusInstanceCalls = state.instanceCalls
+  const statusStops = state.stops
   const beforeOverview = Date.now()
   try {
     const pendingOverview = await api('overview?refresh=transitional')
     assert.equal(pendingOverview.accounts.length, 12)
     assert.ok(Date.now() - beforeOverview < 3000, 'overview must not await cloud sampling')
     await api('overview?refresh=transitional') // 多标签页重复请求由全局防抖合并。
+    await eventually(() => state.instanceCalls > statusInstanceCalls, 'queued refresh reaches instance API')
   } finally {
-    releaseTraffic()
-    trafficGate = null
+    releaseInstance()
+    instanceGate = null
   }
-  await eventually(async () => {
-    const { count } = await db.prepare('SELECT COUNT(*) AS count FROM account_snapshots WHERE instances_json != ? AND traffic_updated_at >= ?').bind('[]', beforeOverview).first()
-    return count === 12
-  }, 'all overview refreshes finish in separate queue consumers')
-  assert.equal((await api('overview')).accounts.every(account => account.instances[0].status === 'Running'), true)
-  console.log('✓ 12 个账号补采在队列中完成，慢云接口不阻塞概览且不突破 D1 预算')
+  await eventually(async () => (await snapshot()).instances_updated_at >= beforeOverview, 'queued instance refresh finishes')
+  await eventually(async () => !(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`account-operation:${id}`).first()), 'instance refresh releases account')
+  assert.equal(state.instanceCalls, statusInstanceCalls + 1)
+  assert.equal(state.trafficCalls, statusTrafficCalls)
+  assert.equal(state.balanceCalls, statusBalanceCalls)
+  assert.equal(state.stops, statusStops)
+  assert.deepEqual(await history(), statusHistory)
+  assert.equal((await snapshot()).traffic_updated_at, beforeStatus.traffic_updated_at)
+  assert.equal((await snapshot()).balance_updated_at, beforeStatus.balance_updated_at)
+  assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM account_snapshots WHERE account_id != ? AND instances_json != '[]'").bind(id).first()).count, 0)
+  assert.equal((await api('overview')).accounts.find(account => account.id === id).instances[0].status, 'Running')
+  console.log('✓ 页面补采只查询启用账号的实例，慢查询不阻塞概览，不重复查流量、余额或写历史')
+
+  await db.prepare('CREATE TABLE history_updates (bucket TEXT)').run()
+  for (const bucket of ['hourly', 'daily']) {
+    await db.prepare(`CREATE TRIGGER track_${bucket}_update AFTER UPDATE ON traffic_${bucket} BEGIN INSERT INTO history_updates VALUES ('${bucket}'); END`).run()
+  }
+  await refresh()
+  assert.equal((await db.prepare('SELECT COUNT(*) AS count FROM history_updates').first()).count, 0)
+  state.traffic = 2
+  await refresh()
+  assert.deepEqual((await db.prepare('SELECT bucket FROM history_updates ORDER BY bucket').all()).results, [{ bucket: 'daily' }, { bucket: 'hourly' }])
+  for (const bucket of ['hourly', 'daily']) {
+    await db.prepare(`DROP TRIGGER track_${bucket}_update`).run()
+    await db.prepare(`UPDATE traffic_${bucket} SET recorded_at = recorded_at - 86400000 WHERE account_id = ?`).bind(id).run()
+  }
+  await db.prepare('DROP TABLE history_updates').run()
+  await refresh()
+  assert.equal((await history()).at(-1).traffic, 2, 'a new bucket must be inserted even if traffic is unchanged')
+  assert.equal((await db.prepare('SELECT COUNT(*) AS count FROM traffic_daily WHERE account_id = ?').bind(id).first()).count, 2)
+  console.log('✓ 相同采样值不重复更新历史，新小时和新日期仍建立采样点')
 
 
   const beforeAtomic = await snapshot()
@@ -700,9 +785,14 @@ try {
   assert.equal((await api('jobs/unrelated-stale')).status, 'failed')
   console.log('✓ 高频轮询每分钟最多更新一次会话，只回收所查询任务')
 
-  // 刚替换的存量账号尚无快照，应有完整的首次采集窗口。
+  // 刚替换的存量账号仅补采了实例，也应有完整的首次流量采集窗口。
   await db.prepare('DELETE FROM account_snapshots WHERE account_id = ?').bind(id).run()
   await db.prepare('UPDATE accounts SET created_at = ?, updated_at = ? WHERE id = ?').bind(Date.now() - 60 * 60_000, Date.now(), id).run()
+  await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
+    body: { Refresh: { account_id: id, requested_at: Date.now() } },
+  }])
+  assert.equal((await snapshot()).traffic_updated_at, null)
+  assert.ok((await snapshot()).instances_updated_at)
   trafficGate = new Promise(resolve => { releaseTraffic = resolve })
   try {
     await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: Date.now() })
@@ -732,6 +822,54 @@ try {
   await eventually(async () => !(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`account-operation:${id}`).first()), 'account operation finishes')
   await api('settings/telegram', 'PUT', { enabled: false })
   console.log('✓ 采集停滞告警在派发端执行，队列未完成仍可告警，并在送达后去重')
+
+  async function maintenance(retry = false) {
+    const result = await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1, body: 'Maintenance' }])
+    assert.equal(result.outcome, 'ok', JSON.stringify(result))
+    assert.equal(result.retryMessages.length, retry ? 1 : 0, JSON.stringify(result))
+  }
+  await db.prepare("DELETE FROM locks WHERE name = 'housekeeping'").run()
+  await db.prepare("INSERT INTO action_logs (action_type, detail, created_at) VALUES ('fixture_expired', 'expired', 1)").run()
+  await db.prepare("CREATE TRIGGER fail_cleanup BEFORE DELETE ON action_logs WHEN OLD.action_type = 'fixture_expired' BEGIN SELECT RAISE(ABORT, 'fixture cleanup failure'); END").run()
+  await maintenance(true)
+  assert.equal(await db.prepare("SELECT * FROM locks WHERE name = 'housekeeping'").first(), null, 'failed cleanup must release its lease')
+  assert.ok(await db.prepare("SELECT id FROM action_logs WHERE action_type = 'fixture_expired'").first())
+  await db.prepare('DROP TRIGGER fail_cleanup').run()
+  await maintenance()
+  assert.equal(await db.prepare("SELECT id FROM action_logs WHERE action_type = 'fixture_expired'").first(), null)
+  const cleanupLock = await db.prepare("SELECT * FROM locks WHERE name = 'housekeeping'").first()
+  assert.equal(cleanupLock.owner, 'completed')
+  assert.ok(cleanupLock.expires_at > Date.now() + 23 * 3600_000)
+  await db.prepare("INSERT INTO action_logs (action_type, detail, created_at) VALUES ('fixture_cooldown', 'expired', 1)").run()
+  await maintenance()
+  assert.ok(await db.prepare("SELECT id FROM action_logs WHERE action_type = 'fixture_cooldown'").first(), 'successful cleanup must enter cooldown')
+  console.log('✓ 清理失败释放租约并重试，成功后才进入一天冷却期')
+
+  const reportTime = new Date(Date.now() + 8 * 3600_000).toISOString().slice(11, 16)
+  await api('settings/daily-report', 'PUT', { enabled: true, time: reportTime, timezone: 'UTC+8' })
+  await api('settings/telegram', 'PUT', { enabled: true })
+  const reportNotifications = state.notifications
+  const reportBalance = (await snapshot()).balance_amount
+  await db.prepare("UPDATE account_snapshots SET balance_amount = 'fixture invalid balance' WHERE account_id = ?").bind(id).run()
+  await maintenance(true)
+  assert.equal(state.notifications, reportNotifications)
+  assert.equal(await db.prepare("SELECT * FROM locks WHERE name LIKE 'daily-report:%'").first(), null, 'report generation failure must release its lease')
+  await db.prepare('UPDATE account_snapshots SET balance_amount = ? WHERE account_id = ?').bind(reportBalance, id).run()
+  state.notifyFailed = true
+  await maintenance(true)
+  assert.equal(state.notifications, reportNotifications + 1)
+  assert.equal(await db.prepare("SELECT * FROM locks WHERE name LIKE 'daily-report:%'").first(), null, 'notification failure must release its lease')
+  const reportConfig = async () => JSON.parse((await db.prepare("SELECT value FROM settings WHERE key = 'daily_report'").first()).value)
+  assert.equal((await reportConfig()).last_sent_date, null)
+  state.notifyFailed = false
+  await maintenance()
+  assert.equal(state.notifications, reportNotifications + 2)
+  assert.ok((await reportConfig()).last_sent_date)
+  await maintenance()
+  assert.equal(state.notifications, reportNotifications + 2, 'delivered daily report must not repeat')
+  await api('settings/daily-report', 'PUT', { enabled: false, time: reportTime, timezone: 'UTC+8' })
+  await api('settings/telegram', 'PUT', { enabled: false })
+  console.log('✓ 日报生成或推送失败均释放租约，恢复后重试发送，送达后去重')
 
   state.stallTraffic = true
   let began = Date.now()

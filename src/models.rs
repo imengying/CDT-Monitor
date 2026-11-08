@@ -22,7 +22,6 @@ pub const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// 系统设置表的固定 key。
 pub mod setting_key {
-    pub const SCHEMA_VERSION: &str = "schema_version";
     pub const TIMEZONE: &str = "timezone";
     pub const DAILY_REPORT: &str = "daily_report";
     pub const TELEGRAM: &str = "telegram";
@@ -148,36 +147,6 @@ pub fn local_minutes_of_day(ms: i64, tz: &str) -> u32 {
     dt.hour() * 60 + dt.minute()
 }
 
-/// 账期起止时间（毫秒，左闭右开），按本地时区对齐到 1 号 00:00。
-///
-/// 用于 CDT 查询的 `StartTime` / `EndTime` 兜底参数：某些接口要求
-/// ISO8601 区间而不是账期字符串。
-pub fn month_bounds_ms(ms: i64, tz: &str) -> (i64, i64) {
-    let dt = local_datetime(ms, tz);
-    let offset_ms = utc_offset_minutes(tz) as i64 * 60_000;
-    let (year, month) = (dt.year(), dt.month());
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    let start_local = chrono::NaiveDate::from_ymd_opt(year, month, 1)
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|naive| naive.and_utc().timestamp_millis())
-        .unwrap_or(0);
-    let end_local = chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|naive| naive.and_utc().timestamp_millis())
-        .unwrap_or(start_local);
-    (start_local - offset_ms, end_local - offset_ms)
-}
-
-/// 本地时间的 `HH:MM` 文本。
-pub fn local_hhmm(ms: i64, tz: &str) -> String {
-    let dt = local_datetime(ms, tz);
-    format!("{:02}:{:02}", dt.hour(), dt.minute())
-}
-
 /// 解析 `HH:MM` 为当日分钟数；非法输入返回 `None`。
 pub fn parse_hhmm(value: &str) -> Option<u32> {
     let trimmed = value.trim();
@@ -206,14 +175,6 @@ pub fn within_window(now_minutes: u32, target_minutes: u32, window: u32) -> bool
 // ===========================================================================
 // 单位换算
 // ===========================================================================
-
-/// GB -> 字节。
-pub fn gb_to_bytes(gb: f64) -> i64 {
-    if gb <= 0.0 {
-        return 0;
-    }
-    (gb * GIB).round() as i64
-}
 
 /// 字节 -> GB。
 pub fn bytes_to_gb(bytes: i64) -> f64 {
@@ -344,17 +305,6 @@ pub fn human_amount(amount: f64, currency: Option<&str>) -> String {
     format!("{symbol} {amount:.2}")
 }
 
-/// 脱敏 AccessKey ID：`LTAI5t****abcd`。
-pub fn mask_secret(value: &str) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= 8 {
-        return "****".to_string();
-    }
-    let head: String = chars.iter().take(4).collect();
-    let tail: String = chars.iter().skip(chars.len() - 4).collect();
-    format!("{head}****{tail}")
-}
-
 // ===========================================================================
 // 枚举
 // ===========================================================================
@@ -467,16 +417,6 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            JobStatus::Pending => "pending",
-            JobStatus::Running => "running",
-            JobStatus::Success => "success",
-            JobStatus::Failed => "failed",
-            JobStatus::Unknown => "unknown",
-        }
-    }
-
     pub fn from_db(value: &str) -> Self {
         match value {
             "pending" => JobStatus::Pending,
@@ -549,14 +489,6 @@ impl PushLevel {
             PushLevel::Active => "active",
             PushLevel::TimeSensitive => "timeSensitive",
             PushLevel::Critical => "critical",
-        }
-    }
-
-    pub fn from_db(value: &str) -> Self {
-        match value {
-            "timeSensitive" => PushLevel::TimeSensitive,
-            "critical" => PushLevel::Critical,
-            _ => PushLevel::Active,
         }
     }
 }
@@ -751,10 +683,6 @@ impl SnapshotRow {
         serde_json::from_str(&self.instances_json).unwrap_or_default()
     }
 
-    pub fn total_bytes(&self) -> i64 {
-        self.cdt_domestic_bytes.max(0) + self.cdt_overseas_bytes.max(0)
-    }
-
     /// 本月是否已经触发过流量熔断。
     pub fn threshold_triggered(&self, month: &str) -> bool {
         match self.threshold_triggered_month.as_deref() {
@@ -882,7 +810,6 @@ pub struct JobRow {
     pub finished_at: Option<i64>,
     pub result_msg: Option<String>,
     pub payload_json: Option<String>,
-    pub started_at: Option<i64>,
 }
 
 impl JobRow {
@@ -1072,7 +999,7 @@ pub struct AdvancedConfig {
 }
 
 fn default_log_level() -> String {
-    "error".to_string()
+    crate::logging::Level::Error.as_str().to_string()
 }
 
 fn default_job_lock_ttl() -> i64 {
@@ -1122,7 +1049,7 @@ fn default_report_time() -> String {
 }
 
 fn default_report_timezone() -> String {
-    "UTC+8".to_string()
+    DEFAULT_TIMEZONE.to_string()
 }
 
 impl Default for DailyReportConfig {
@@ -1622,19 +1549,6 @@ pub struct CronPreviewRequest {
     pub count: Option<usize>,
 }
 
-/// 实例动作请求（可选指定地域；缺省时从快照推断）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct InstanceActionRequest {
-    #[serde(default)]
-    pub region_id: Option<String>,
-}
-
-/// 逐实例抢占式保活开关。
-#[derive(Debug, Clone, Deserialize)]
-pub struct KeepAliveRequest {
-    pub enabled: bool,
-}
-
 // ===========================================================================
 // 组合工具
 // ===========================================================================
@@ -1868,48 +1782,11 @@ mod tests {
     }
 
     #[test]
-    fn month_bounds_align_to_local_first_day() {
-        // 2026-10-26T15:46:40Z = 2026-10-26 23:46 (UTC+8)
-        let now = 1_793_029_600_000;
-        let (start, end) = month_bounds_ms(now, "UTC+8");
-        // 本地 2026-10-01 00:00 == 2026-09-30T16:00Z
-        assert_eq!(
-            local_datetime(start, "UTC+8")
-                .format("%Y-%m-%d %H:%M")
-                .to_string(),
-            "2026-10-01 00:00"
-        );
-        assert_eq!(
-            local_datetime(end, "UTC+8")
-                .format("%Y-%m-%d %H:%M")
-                .to_string(),
-            "2026-11-01 00:00"
-        );
-        assert!(start < now && now < end);
-    }
-
-    #[test]
-    fn month_bounds_december_rolls_year() {
-        let now = 1_798_000_000_000; // 2026-12-23 前后
-        let (start, end) = month_bounds_ms(now, "UTC+8");
-        assert_eq!(
-            local_datetime(start, "UTC+8").format("%Y-%m").to_string(),
-            "2026-12"
-        );
-        assert_eq!(
-            local_datetime(end, "UTC+8").format("%Y-%m").to_string(),
-            "2027-01"
-        );
-    }
-
-    #[test]
-    fn local_date_and_hhmm() {
+    fn local_date_uses_timezone() {
         // 2026-10-26T15:46:40Z = 2026-10-26 23:46 (UTC+8)
         let ms = 1_793_029_600_000;
         assert_eq!(local_date(ms, "UTC+8"), "2026-10-26");
-        assert_eq!(local_hhmm(ms, "UTC+8"), "23:46");
         assert_eq!(local_date(ms, "UTC"), "2026-10-26");
-        assert_eq!(local_hhmm(ms, "UTC"), "15:46");
         assert_eq!(local_minutes_of_day(ms, "UTC+8"), 23 * 60 + 46);
         assert_eq!(local_minutes_of_day(ms, "UTC"), 15 * 60 + 46);
     }
@@ -1929,12 +1806,6 @@ mod tests {
         assert_eq!(percent_of(10.0, 20.0), 50.0);
         assert_eq!(percent_of(0.0, 20.0), 0.0);
         assert_eq!(percent_of(10.0, 0.0), 0.0);
-    }
-
-    #[test]
-    fn mask() {
-        assert_eq!(mask_secret("LTAI5tAbCdEfGhIj"), "LTAI****GhIj");
-        assert_eq!(mask_secret("short"), "****");
     }
 
     // -----------------------------------------------------------------------

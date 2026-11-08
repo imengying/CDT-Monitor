@@ -22,7 +22,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -189,10 +189,10 @@ fn to_array(bytes: Vec<u8>) -> [u8; 32] {
 // 随机数
 // ===========================================================================
 
-/// 使用 Workers 运行时的 CSPRNG（`getrandom` 的 `js` 后端）填充缓冲区。
+/// 使用 Workers 运行时的 CSPRNG（`getrandom` 的 `wasm_js` 后端）填充缓冲区。
 pub fn random_bytes(len: usize) -> Result<Vec<u8>, CryptoError> {
     let mut buf = vec![0u8; len];
-    getrandom::getrandom(&mut buf).map_err(|e| CryptoError::RngFailed(format!("{e}")))?;
+    getrandom::fill(&mut buf).map_err(|e| CryptoError::RngFailed(format!("{e}")))?;
     Ok(buf)
 }
 
@@ -236,7 +236,7 @@ impl std::fmt::Debug for Crypto {
 
 impl Crypto {
     pub fn new(key: MasterKey) -> Self {
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_bytes()));
+        let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
         Self { key, cipher }
     }
 
@@ -247,10 +247,11 @@ impl Crypto {
     /// 加密任意文本 -> `Base64(Nonce ‖ Ciphertext)`。
     pub fn encrypt(&self, plaintext: &str) -> Result<String, CryptoError> {
         let nonce_bytes = random_bytes(NONCE_LEN)?;
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::try_from(nonce_bytes.as_slice())
+            .map_err(|e| CryptoError::EncryptFailed(e.to_string()))?;
         let ciphertext = self
             .cipher
-            .encrypt(nonce, plaintext.as_bytes())
+            .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|e| CryptoError::EncryptFailed(format!("{e}")))?;
         let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
@@ -271,8 +272,9 @@ impl Crypto {
             )));
         }
         let (nonce_bytes, ciphertext) = raw.split_at(NONCE_LEN);
-        let nonce = XNonce::from_slice(nonce_bytes);
-        let plaintext = self.cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        let nonce =
+            XNonce::try_from(nonce_bytes).map_err(|e| CryptoError::DecryptFailed(e.to_string()))?;
+        let plaintext = self.cipher.decrypt(&nonce, ciphertext).map_err(|_| {
             CryptoError::DecryptFailed("认证标签校验失败（MASTER_KEY 可能已更换）".to_string())
         })?;
         String::from_utf8(plaintext)
@@ -336,7 +338,7 @@ impl<'a> SessionToken<'a> {
 
     /// 计算 HMAC-SHA256 签名。
     fn sign(&self, message: &[u8]) -> [u8; 32] {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(self.key.as_bytes())
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(self.key.as_bytes())
             .expect("HMAC 接受任意长度密钥");
         mac.update(message);
         mac.finalize().into_bytes().into()
@@ -398,11 +400,6 @@ impl<'a> SessionToken<'a> {
             sid: payload.sid,
         }
     }
-
-    /// 便捷判断：Token 是否有效。
-    pub fn is_valid(&self, token: &str, now_ms: i64) -> bool {
-        matches!(self.verify(token, now_ms), TokenState::Valid { .. })
-    }
 }
 
 // ===========================================================================
@@ -445,6 +442,26 @@ mod tests {
     fn test_key() -> MasterKey {
         MasterKey::parse("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
             .expect("测试密钥合法")
+    }
+
+    #[test]
+    fn decrypts_ciphertext_and_verifies_session_from_previous_dependencies() {
+        // 由升级前的 chacha20poly1305 0.10.1 / hmac 0.12.1 / base64 0.22.1
+        // 和固定测试密钥生成，确保更新依赖后存量凭据与会话继续有效。
+        let key = test_key();
+        let ciphertext = "azA4ZkuCWCRdf7rXSBVstV/nsTZI3ZlrOxxnJNSFyBkE/g99h0GU9GpIV0e3ou2mWDUBYZrfb9RdwPn/qMTn12Ed";
+        assert_eq!(
+            Crypto::new(key.clone()).decrypt(ciphertext).unwrap(),
+            "fixture-secret-中文-🔐"
+        );
+        let token = "v1.eyJ2IjoxLCJpYXQiOjE3MDAwMDAwMDAwMDAsImV4cCI6MTcwMDAwMDA2MDAwMCwianRpIjoiOTBkOTI3MGVjMTUwMTk5ZSIsInNpZCI6ImZpeHR1cmUtc2Vzc2lvbiJ9.fs1S0KzGLWFji6gAQPLs82zB_rEgq-lbGF8oH0h6fzo";
+        assert_eq!(
+            SessionToken::new(&key).verify(token, 1_700_000_001_000),
+            TokenState::Valid {
+                expires_at: 1_700_000_060_000,
+                sid: "fixture-session".into(),
+            }
+        );
     }
 
     #[test]
@@ -494,7 +511,6 @@ mod tests {
         let issuer = SessionToken::new(&key);
         let now = 1_700_000_000_000i64;
         let token = issuer.issue(now, 60_000, "sid-1").expect("签发成功");
-        assert!(issuer.is_valid(&token, now + 1_000));
         assert_eq!(
             issuer.verify(&token, now + 1_000),
             TokenState::Valid {
@@ -542,7 +558,10 @@ mod tests {
         let token = SessionToken::new(&test_key())
             .issue(1_700_000_000_000, 60_000, "sid-1")
             .expect("签发");
-        assert!(!SessionToken::new(&other).is_valid(&token, 1_700_000_000_001));
+        assert!(!matches!(
+            SessionToken::new(&other).verify(&token, 1_700_000_000_001),
+            TokenState::Valid { .. }
+        ));
     }
 
     #[test]

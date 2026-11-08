@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha1::Sha1;
 use worker::{Delay, Headers, Method, Request, RequestInit};
@@ -151,7 +151,7 @@ impl AliyunError {
     }
 
     /// 采集查询超时无需提示核实操作结果；启停操作继续使用原始错误说明。
-    fn query_failure(&self, query: &str) -> String {
+    pub(crate) fn query_failure(&self, query: &str) -> String {
         match self {
             Self::Network(message) if message == crate::runtime::TIMEOUT_MESSAGE => {
                 format!("{query}失败，网络连接超时，稍后重试")
@@ -238,7 +238,7 @@ pub fn string_to_sign(method: &str, canonical_query: &str) -> String {
 pub fn sign(secret: &str, string_to_sign: &str) -> String {
     let key = format!("{secret}&");
     let mut mac =
-        <HmacSha1 as Mac>::new_from_slice(key.as_bytes()).expect("HMAC-SHA1 接受任意长度密钥");
+        <HmacSha1 as KeyInit>::new_from_slice(key.as_bytes()).expect("HMAC-SHA1 接受任意长度密钥");
     mac.update(string_to_sign.as_bytes());
     STANDARD.encode(mac.finalize().into_bytes())
 }
@@ -300,10 +300,6 @@ impl AliyunClient {
             account.site(),
             Endpoints::for_site(account.site()),
         )
-    }
-
-    pub fn site(&self) -> SiteType {
-        self.site
     }
 
     /// 使用所属主账号 ID 识别身份，RAM 用户和 AccessKey 轮换不会改变它。
@@ -706,17 +702,6 @@ impl CdtTraffic {
         self.domestic_bytes.max(0) + self.overseas_bytes.max(0)
     }
 
-    /// 取某个额度池的累计流量。
-    ///
-    /// 一个账号只落在一个池里（由地域决定），所以这里返回的是**整个池**的
-    /// 用量，不是单个实例的 —— CDT 接口按地域汇总，拿不到实例粒度。
-    pub fn pool_bytes(&self, pool: QuotaPool) -> i64 {
-        match pool {
-            QuotaPool::Domestic => self.domestic_bytes.max(0),
-            QuotaPool::Overseas => self.overseas_bytes.max(0),
-        }
-    }
-
     /// 解析 `ListCdtInternetTraffic` 的响应。
     ///
     /// `TrafficDetails` 既可能是数组，也可能是 `{"Item": [...]}` 形式；
@@ -1068,6 +1053,7 @@ pub async fn sync_account(
     client: &AliyunClient,
     region_id: &str,
     instance_filter: Option<&str>,
+    query_balance: bool,
 ) -> AccountSync {
     let mut out = AccountSync::default();
 
@@ -1075,7 +1061,13 @@ pub async fn sync_account(
     let (traffic, (balance, instance)) = crate::runtime::join2(
         client.query_cdt_traffic(),
         crate::runtime::join2(
-            client.query_balance(),
+            async {
+                if query_balance {
+                    Some(client.query_balance().await)
+                } else {
+                    None
+                }
+            },
             client.describe_instance(region_id, instance_id),
         ),
     )
@@ -1100,8 +1092,9 @@ pub async fn sync_account(
     }
 
     match balance {
-        Ok(balance) => out.balance = Some(balance),
-        Err(err) => out.warnings.push(err.query_failure("余额查询")),
+        Some(Ok(balance)) => out.balance = Some(balance),
+        Some(Err(err)) => out.warnings.push(err.query_failure("余额查询")),
+        None => {}
     }
 
     // 一个账号固定一台实例：按 ID 精确查询，命中则只保留这一台。
@@ -1245,7 +1238,7 @@ mod tests {
         assert_eq!(traffic.overseas_bytes, 20 * 1024 * 1024 * 1024);
         assert_eq!(traffic.domestic_bytes, 0);
         assert!(
-            traffic.total_bytes() > crate::models::gb_to_bytes(19.9),
+            traffic.total_bytes() > (19.9 * crate::models::GIB) as i64,
             "按字节解释应达到 20 GiB，实际 {}",
             traffic.total_bytes()
         );
@@ -1337,10 +1330,6 @@ mod tests {
         let traffic = CdtTraffic::parse(&value, SiteType::China);
         assert_eq!(traffic.domestic_bytes, 100);
         assert_eq!(traffic.overseas_bytes, 900);
-
-        // pool_bytes 取该账号所在池的累计值
-        assert_eq!(traffic.pool_bytes(QuotaPool::Domestic), 100);
-        assert_eq!(traffic.pool_bytes(QuotaPool::Overseas), 900);
     }
 
     #[test]

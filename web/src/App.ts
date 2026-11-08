@@ -74,6 +74,7 @@ export class App {
   private menuOpen = false
 
   private pollTimer: number | null = null
+  private pollInFlight = false
   private lastPhase: AppState['phase'] | null = null
 
   constructor(root: HTMLElement) {
@@ -86,6 +87,12 @@ export class App {
     void bootstrap()
     this.schedulePoll()
 
+    document.addEventListener('visibilitychange', () => {
+      if (this.pollTimer !== null) window.clearTimeout(this.pollTimer)
+      this.pollTimer = null
+      if (!document.hidden) void this.runPoll()
+    })
+
     window.addEventListener('beforeunload', () => {
       if (this.pollTimer !== null) window.clearTimeout(this.pollTimer)
       clearToasts()
@@ -95,6 +102,8 @@ export class App {
   /** 请求结束后安排下一次轮询，避免慢请求重叠。 */
   private schedulePoll(): void {
     if (this.pollTimer !== null) window.clearTimeout(this.pollTimer)
+    this.pollTimer = null
+    if (document.hidden) return
 
     this.pollTimer = window.setTimeout(() => {
       this.pollTimer = null
@@ -103,12 +112,18 @@ export class App {
   }
 
   private async runPoll(): Promise<void> {
-    const state = store.get()
-    if (state.phase === 'ready' && !state.refreshingAll && !state.overviewLoading) {
-      // 由后端当前快照决定是否补采，也能发现其它页面或 Cron 发起的动作。
-      await loadOverview(true)
+    if (this.pollInFlight) return
+    this.pollInFlight = true
+    try {
+      const state = store.get()
+      if (!document.hidden && state.phase === 'ready' && !state.refreshingAll && !state.overviewLoading) {
+        // 由后端当前快照决定是否补采，也能发现其它页面或 Cron 发起的动作。
+        await loadOverview(true)
+      }
+    } finally {
+      this.pollInFlight = false
+      this.schedulePoll()
     }
-    this.schedulePoll()
   }
 
   // -------------------------------------------------------------------------

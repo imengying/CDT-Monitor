@@ -76,7 +76,6 @@ export type JobType =
   | 'unknown'
 export type PushLevel = 'active' | 'timeSensitive' | 'critical'
 export type NotifyChannel = 'telegram' | 'bark'
-export type HistoryBucket = 'hour' | 'day'
 
 export interface SessionResponse {
   authenticated: boolean
@@ -544,14 +543,6 @@ export const api = {
   },
 
   // ---------------------------------------------------------------- 任务
-  job(jobId: string): Promise<JobDto> {
-    return request<JobDto>(`/api/v1/jobs/${encodeURIComponent(jobId)}`)
-  },
-
-  jobs(limit = 20): Promise<JobDto[]> {
-    return request<JobDto[]>(`/api/v1/jobs?limit=${limit}`)
-  },
-
   /** 刷新全部账号（异步）。 */
   refreshAll(options: PollOptions = {}): Promise<JobDto> {
     return runJob('/api/v1/refresh', undefined, options)

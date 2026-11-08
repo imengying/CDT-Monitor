@@ -3,6 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 tool_version="0.8.7"
 source_sha256="1051c05ef088889a30ad3bad40c22a716ba8ca8d02a3fb01cef8c143ba952222"
 tool_root="$ROOT/.tools/worker-build"
@@ -36,6 +37,6 @@ if [ -d /usr/include/openssl ]; then
   export OPENSSL_LIB_DIR="${OPENSSL_LIB_DIR:-/usr/lib/x86_64-linux-gnu}"
 fi
 export CARGO_TARGET_DIR="$ROOT/target/worker-build"
-cargo +stable install --path "$tool_source/worker-build-$tool_version" --bin worker-build \
+cargo install --path "$tool_source/worker-build-$tool_version" --bin worker-build \
   --root "$tool_root" --locked --force
 printf '%s\n' "$stamp" > "$tool_root/lock-stamp"

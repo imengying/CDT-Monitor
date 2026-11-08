@@ -108,11 +108,6 @@ function appendChildren(parent: Element, children: Child[]): void {
   }
 }
 
-/** 清空元素。 */
-export function clear(node: Element): void {
-  node.replaceChildren()
-}
-
 /** 用新内容替换元素子节点。 */
 export function replaceChildren(node: Element, ...children: Child[]): void {
   node.replaceChildren()

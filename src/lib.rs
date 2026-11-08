@@ -33,19 +33,19 @@ use std::collections::HashMap;
 // `logging` 里定义的是 `#[macro_export]` 宏，声明在 `mod` 之前以便
 // 子模块（scheduler 等）直接 `log_info!` 而无需逐个 `use`。
 #[macro_use]
-pub mod logging;
-pub mod device;
-pub mod http;
+mod logging;
+mod device;
+mod http;
 
-pub mod aliyun;
-pub mod cron;
-pub mod crypto;
-pub mod db;
+mod aliyun;
+mod cron;
+mod crypto;
+mod db;
 mod jobs;
-pub mod models;
-pub mod notify;
-pub mod runtime;
-pub mod scheduler;
+mod models;
+mod notify;
+mod runtime;
+mod scheduler;
 mod tasks;
 use jobs::{JobTask, spawn_job};
 
@@ -699,6 +699,7 @@ async fn handle_overview(app: &AppCtx, req: &Request) -> worker::Result<Response
     if query_str(&params, "refresh") == Some("transitional") {
         let ids: Vec<_> = accounts
             .iter()
+            .filter(|account| account.is_enabled())
             .filter(|account| {
                 snapshots.get(&account.id).is_none_or(|snapshot| {
                     let instances = snapshot.instances();

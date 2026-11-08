@@ -21,8 +21,8 @@ use worker::wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement, Env, Result};
 
 use crate::models::{
-    AccountRow, ActionLog, AdvancedConfig, HistoryBucket, InstanceInfo, JobRow, JobStatus, JobType,
-    LogFilter, SessionRow, SnapshotRow, SnapshotUpdate, TrafficSample, setting_key,
+    AccountRow, ActionLog, AdvancedConfig, HistoryBucket, InstanceInfo, JobRow, JobType, LogFilter,
+    SessionRow, SnapshotRow, SnapshotUpdate, TrafficSample, setting_key,
 };
 
 pub const ACCOUNT_BUSY: &str = "账号正在执行操作，请稍后重试";
@@ -271,7 +271,7 @@ impl Db {
             .await?
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "UTC+8".to_string()))
+            .unwrap_or_else(|| crate::models::DEFAULT_TIMEZONE.to_string()))
     }
 
     // =======================================================================
@@ -524,7 +524,7 @@ impl Db {
         .await
     }
 
-    /// 手动动作前的实时实例查询只更新实例来源，保留流量、余额与熔断。
+    /// 实时实例查询只更新实例来源，保留流量、余额与熔断。
     pub async fn save_live_instance(
         &self,
         account_id: i64,
@@ -706,9 +706,9 @@ impl Db {
         let hour = now_ms / 3_600_000 * 3_600_000;
         let value = traffic_gb.max(0.0);
         Ok(vec![
-            self.stmt("INSERT INTO traffic_hourly (account_id, recorded_at, traffic) VALUES (?, ?, ?) ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic")?
+            self.stmt("INSERT INTO traffic_hourly (account_id, recorded_at, traffic) VALUES (?, ?, ?) ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic WHERE traffic_hourly.traffic != excluded.traffic")?
                 .bind(&[j_i64(account_id), j_i64(hour), j_f64(value)])?,
-            self.stmt("INSERT INTO traffic_daily (account_id, recorded_at, traffic) VALUES (?, ?, ?) ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic")?
+            self.stmt("INSERT INTO traffic_daily (account_id, recorded_at, traffic) VALUES (?, ?, ?) ON CONFLICT(account_id, recorded_at) DO UPDATE SET traffic = excluded.traffic WHERE traffic_daily.traffic != excluded.traffic")?
                 .bind(&[j_i64(account_id), j_i64(day_start_ms), j_f64(value)])?,
         ])
     }
@@ -1008,6 +1008,17 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// 是否仍处于执行租约或成功后的冷却期。
+    pub async fn lock_active(&self, name: &str, now: i64) -> Result<bool> {
+        Ok(self
+            .query_first::<serde_json::Value>(
+                "SELECT name FROM locks WHERE name = ? AND expires_at > ?",
+                &[j_text(name), j_i64(now)],
+            )
+            .await?
+            .is_some())
+    }
+
     /// 此消息是否已成功执行；完成标记与短期执行租约共用 locks 表。
     pub async fn task_completed(&self, name: &str) -> Result<bool> {
         Ok(self
@@ -1181,17 +1192,6 @@ impl Db {
     }
 }
 
-/// 任务状态的中文描述，日志里用。
-pub fn describe_job_status(status: JobStatus) -> &'static str {
-    match status {
-        JobStatus::Pending => "排队中",
-        JobStatus::Running => "执行中",
-        JobStatus::Success => "成功",
-        JobStatus::Failed => "失败",
-        JobStatus::Unknown => "未知",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,10 +1212,5 @@ mod tests {
     fn truncate_is_utf8_safe() {
         let out = truncate("中文日志内容", 2);
         assert!(out.starts_with("中文"));
-    }
-
-    #[test]
-    fn job_status_labels() {
-        assert_eq!(describe_job_status(JobStatus::Running), "执行中");
     }
 }

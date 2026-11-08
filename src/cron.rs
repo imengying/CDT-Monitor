@@ -10,7 +10,7 @@
 //! croner：先把真实时刻加上偏移得到本地时间，匹配完再减回去。这样
 //! 表达式里的 `0 0 * * *` 就是本地 00:00，与简单模式语义一致。
 
-use chrono::{NaiveDateTime, TimeZone, Utc};
+use chrono::{TimeZone, Utc};
 use croner::{Cron, Direction};
 use std::str::FromStr;
 
@@ -31,11 +31,6 @@ pub fn validate(expression: &str) -> Result<(), String> {
     }
     Cron::from_str(trimmed).map_err(|e| format!("表达式无法解析：{e}"))?;
     Ok(())
-}
-
-/// 表达式是否合法（不产生详细原因）。
-pub fn is_valid(expression: &str) -> bool {
-    validate(expression).is_ok()
 }
 
 /// 计算从 `now_ms` 起的下 `count` 次触发时刻（毫秒时间戳，按 `tz` 本地解释）。
@@ -93,12 +88,6 @@ pub fn describe(expression: &str) -> String {
 /// 校验时区字符串是否能用于偏移计算。
 pub fn validate_timezone(tz: &str) -> bool {
     crate::models::is_supported_timezone(tz)
-}
-
-// 让 NaiveDateTime 参与类型推断，避免未使用告警（croner 的泛型需要具体类型）。
-#[allow(dead_code)]
-fn _assert_naive_is_supported(dt: NaiveDateTime) -> Option<NaiveDateTime> {
-    Some(dt)
 }
 
 #[cfg(test)]

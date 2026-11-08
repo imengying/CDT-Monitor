@@ -215,18 +215,6 @@ impl Channels {
     pub fn is_empty(&self) -> bool {
         self.telegram.is_none() && self.bark.is_none()
     }
-
-    /// 已启用通道名（用于日志）。
-    pub fn names(&self) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        if self.telegram.is_some() {
-            out.push("telegram");
-        }
-        if self.bark.is_some() {
-            out.push("bark");
-        }
-        out
-    }
 }
 
 // ===========================================================================
@@ -723,12 +711,11 @@ mod tests {
     }
 
     #[test]
-    fn channels_names() {
+    fn channels_empty() {
         let channels = Channels {
             telegram: Some(telegram()),
             bark: None,
         };
-        assert_eq!(channels.names(), vec!["telegram"]);
         assert!(!channels.is_empty());
         assert!(Channels::default().is_empty());
     }

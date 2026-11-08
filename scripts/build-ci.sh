@@ -7,7 +7,7 @@
 #
 # 调用来源：
 #   1. Dashboard → Settings → Build → Build command
-#   2. 本地 bun run build / bun run dev；部署仅上传已构建产物。
+#   2. 本地 bun run build；部署仅上传已构建产物。
 #
 # 必需构建期变量（Settings → Build → Build variables）：
 #   BUN_VERSION   Bun 版本，例如 1.4.4
@@ -63,7 +63,7 @@ bun run scripts/check-config.ts
 if ! command -v cargo >/dev/null 2>&1; then
   log "安装 Rust（rustup, minimal profile）"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain stable
+    | sh -s -- -y --profile minimal --default-toolchain none
   # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
 fi

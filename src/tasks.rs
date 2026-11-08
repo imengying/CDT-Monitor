@@ -39,14 +39,18 @@ pub async fn dispatch_cron(env: &Env, scheduled_at: i64) -> Result<()> {
     for chunk in messages.chunks(100) {
         queue.send_batch(chunk.to_vec()).await?;
     }
-    // 日报读取最近已完成的快照；稍作延迟，让正常采集优先完成。
-    queue
-        .send(
-            worker::MessageBuilder::new(TaskMessage::Maintenance)
-                .delay_seconds(30)
-                .build(),
-        )
-        .await
+    // 清理或日报到期才派发；失败不记完成，下轮 Cron 仍能补偿。
+    if Scheduler::new(env).await?.maintenance_due().await? {
+        // 日报读取最近已完成的快照，稍作延迟让正常采集先完成。
+        queue
+            .send(
+                worker::MessageBuilder::new(TaskMessage::Maintenance)
+                    .delay_seconds(30)
+                    .build(),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 pub async fn consume(env: &Env, message: &TaskMessage) -> Result<()> {
@@ -138,17 +142,12 @@ async fn consume_account(env: &Env, id: i64, requested_at: i64, cron: bool) -> R
         let Some(account) = db.get_account(id).await? else {
             return Ok(());
         };
-        if cron && account.enabled == 0 {
+        if !account.is_enabled() {
             return Ok(());
         }
         let scheduler = Scheduler::new(env).await?;
         if !cron {
-            let outcome = scheduler.refresh_account(&account).await;
-            return if outcome.success {
-                Ok(())
-            } else {
-                Err(worker::Error::RustError(outcome.warnings.join("；")))
-            };
+            return scheduler.refresh_instance(&account).await;
         }
         let report = scheduler.run_account_cron(&account).await;
         let summary = report.summary();

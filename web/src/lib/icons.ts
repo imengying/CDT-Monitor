@@ -16,9 +16,7 @@ import {
   CalendarClock,
   Check,
   ChevronRight,
-  ClipboardCheck,
   Cloud,
-  Copy,
   KeyRound,
   Loader2,
   LogOut,
@@ -69,11 +67,7 @@ export const icons = {
   phone: Smartphone as IconNode,
   trash: Trash2 as IconNode,
   close: X as IconNode,
-  copy: Copy as IconNode,
-  copied: ClipboardCheck as IconNode,
   sun: Sun as IconNode,
   moon: Moon as IconNode,
   zap: Zap as IconNode,
 } as const
-
-export type IconName = keyof typeof icons
