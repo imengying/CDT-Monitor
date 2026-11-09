@@ -10,7 +10,7 @@
  * * 写操作完成后自动刷新受影响的数据（概览 / 图表 / 设置）。
  */
 
-import { ApiError, api, type NotifyChannel } from '@/api/client'
+import { ApiError, api, type NotifyPreview } from '@/api/client'
 import { store, toast } from '@/lib/store'
 
 /** 会话失效：清空数据并回到登录页。 */
@@ -153,10 +153,10 @@ export async function afterAccountChanged(): Promise<void> {
 }
 
 /** 测试通知渠道。 */
-export async function testNotification(channel: NotifyChannel): Promise<void> {
+export async function testNotification(input: NotifyPreview): Promise<void> {
   try {
-    await api.testNotify(channel)
-    toast(`测试通知已发送（${channel}）`, 'ok')
+    await api.testNotify(input)
+    toast(`测试通知已发送（${input.channel}）`, 'ok')
   } catch (error) {
     reportError(error, '测试通知失败')
   }
@@ -165,8 +165,9 @@ export async function testNotification(channel: NotifyChannel): Promise<void> {
 /** 立即推送日报。 */
 export async function pushDailyReport(): Promise<void> {
   try {
-    await api.pushDailyReport()
-    toast('日报已推送', 'ok')
+    const job = await api.pushDailyReport()
+    const delivery = job.result_msg?.split('\n')[0]
+    toast(delivery || '日报已推送', delivery?.includes('❌') ? 'warn' : 'ok')
   } catch (error) {
     reportError(error, '推送日报失败')
   }

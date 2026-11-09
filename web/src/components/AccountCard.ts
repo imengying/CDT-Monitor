@@ -363,16 +363,12 @@ export class AccountCard {
     const account = this.account
     const primary = account.instances[0]
     const status = primary?.status.toLowerCase() ?? ''
-    // Starting / Stopping 是阿里云的过渡态（StopInstance 返回后还要几十秒才真正
-    // 停下）。这时两个按钮都要显示、但置灰：否则过渡期内按钮全消失，用户以为
-    // 功能坏了，要等下一轮 Cron 采集回来才看得到开机按钮。
+    // 过渡态保留相应的操作按钮并置灰，直到后续采集确认终态。
     const starting = status === 'starting'
     const stopping = status === 'stopping'
     const running = status === 'running' || stopping
     const stopped = status === 'stopped' || starting
-    // 状态未知（首采未完成 / 采集失败）：两个按钮都给出来，让用户能直接
-    // 发起动作；阿里云会拒绝不符合当前状态的操作，错误会以 toast 提示。
-    // 不这样做的话，采集失败一次卡片就彻底失去控制入口。
+    // 状态未知时仍提供控制入口，后端会先核实云端状态；关机仍受保活开关限制。
     const unknown = !status
 
     const group = el('div', { class: 'control-group' })
@@ -416,7 +412,7 @@ export class AccountCard {
             label: stopping ? '正在停止…' : keepAlive ? '保活启用，不能关机' : '关机',
             icon: icons.power,
             tone: 'danger',
-            disabled: !unknown && (keepAlive || stopping),
+            disabled: keepAlive || stopping,
             onClick: () => void this.toggleInstance(primary, false),
           }),
         )
@@ -460,14 +456,16 @@ export class AccountCard {
       'aria-label': options.label,
       'data-tip': options.label,
       'data-action': options.key,
+      'data-disabled': String(Boolean(options.disabled)),
     }) as HTMLButtonElement
 
     if (!options.mini && options.tone) {
       button.classList.add(`icon-button--${options.tone}`)
     }
 
-    button.disabled = Boolean(options.disabled)
-    button.append(iconSvg(options.icon, options.mini ? 17 : 18))
+    const busy = this.busy.has(options.key)
+    button.disabled = Boolean(options.disabled) || busy
+    button.append(iconSvg(busy ? icons.spinner : options.icon, options.mini ? 17 : 18, busy ? 'spin' : ''))
     button.addEventListener('click', () => {
       if (button.disabled) return
       options.onClick()
@@ -490,7 +488,7 @@ export class AccountCard {
         replaceChildren(button, iconSvg(icons.spinner, button.classList.contains('mini-icon') ? 17 : 18, 'spin'))
         button.disabled = true
       } else {
-        button.disabled = false
+        button.disabled = button.dataset.disabled === 'true'
         replaceChildren(
           button,
           iconSvg(this.iconOf(key), button.classList.contains('mini-icon') ? 17 : 18),

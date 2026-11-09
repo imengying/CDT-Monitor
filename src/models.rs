@@ -731,7 +731,7 @@ pub struct InstanceInfo {
     /// 是否为抢占式实例。
     #[serde(default)]
     pub spot: bool,
-    /// 抢占式保活开关（逐实例），账号级 `spot_keep_alive` 为总闸。
+    /// 保活配置的展示值，由绑定该实例的账号 `spot_keep_alive` 派生。
     #[serde(default)]
     pub keep_alive: bool,
 }
@@ -754,7 +754,7 @@ impl InstanceInfo {
             .any(|s| self.status.eq_ignore_ascii_case(s))
     }
 
-    /// 抢占式实例的可保活判断：必须是抢占式 + 已打开逐实例开关 + 当前处于运行态。
+    /// 抢占式实例的可保活判断；调用方另行检查实例状态。
     pub fn keep_alive_active(&self, account_master_switch: bool) -> bool {
         self.spot && self.keep_alive && account_master_switch
     }
@@ -1037,7 +1037,8 @@ pub struct DailyReportConfig {
     /// `HH:MM`（本地时区），空表示不推送。
     #[serde(default = "default_report_time")]
     pub time: String,
-    #[serde(default = "default_report_timezone")]
+    /// 空值继承系统时区。
+    #[serde(default)]
     pub timezone: String,
     /// 最近一次推送日期 `YYYY-MM-DD`，用于幂等。
     #[serde(default)]
@@ -1048,16 +1049,12 @@ fn default_report_time() -> String {
     "09:00".to_string()
 }
 
-fn default_report_timezone() -> String {
-    DEFAULT_TIMEZONE.to_string()
-}
-
 impl Default for DailyReportConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             time: default_report_time(),
-            timezone: default_report_timezone(),
+            timezone: String::new(),
             last_sent_date: None,
         }
     }
@@ -1513,6 +1510,7 @@ pub struct TurnstileSettingsUpdate {
 pub struct DailyReportDto {
     pub enabled: bool,
     pub time: String,
+    #[serde(default)]
     pub timezone: String,
 }
 
@@ -1532,8 +1530,16 @@ pub struct SettingsDto {
 
 /// 通知渠道测试请求。
 #[derive(Debug, Clone, Deserialize)]
-pub struct NotifyTestRequest {
-    pub channel: NotifyChannel,
+#[serde(tag = "channel", rename_all = "snake_case")]
+pub enum NotifyTestRequest {
+    Telegram {
+        #[serde(default)]
+        preview: Option<TelegramSettingsUpdate>,
+    },
+    Bark {
+        #[serde(default)]
+        preview: Option<BarkSettingsUpdate>,
+    },
 }
 
 /// Cron 表达式预览请求（未来若干次触发）。
@@ -1597,7 +1603,7 @@ pub fn build_overview(
     // 以为功能坏了。上游把 `instance_status` 存在账号行上（新建为
     // `Unknown`），这里用同样的语义把实例 ID 补上，状态留空由前端显示
     // 「未知」。
-    let instances = if instances.is_empty() {
+    let mut instances = if instances.is_empty() {
         match account.instance_id_opt() {
             Some(id) => vec![InstanceInfo {
                 instance_id: id.to_string(),
@@ -1610,6 +1616,9 @@ pub fn build_overview(
     } else {
         instances
     };
+    for instance in &mut instances {
+        instance.keep_alive = account.is_spot_keep_alive();
+    }
 
     // 卡片与图表都按 GB 展示，统一在这里换算一次。
     let used_gb = bytes_to_gb(used_bytes);

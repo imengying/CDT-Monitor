@@ -338,6 +338,10 @@ export interface BarkUpdate {
   alert_level: PushLevel
 }
 
+export type NotifyPreview =
+  | { channel: 'telegram'; preview: TelegramUpdate }
+  | { channel: 'bark'; preview: BarkUpdate }
+
 // ---------------------------------------------------------------------------
 // 底层请求
 // ---------------------------------------------------------------------------
@@ -519,7 +523,7 @@ export const api = {
     return request<TrafficHistoryResponse>(`/api/v1/history?account_id=${accountId}`)
   },
 
-  logs(limit = 80, options: { accountId?: number; action?: string } = {}): Promise<ActionLog[]> {
+  logs(limit = 80, options: { accountId?: number; action?: string; q?: string } = {}): Promise<ActionLog[]> {
     const params = new URLSearchParams({ limit: String(limit) })
     if (options.accountId !== undefined) {
       params.set('account_id', String(options.accountId))
@@ -527,15 +531,17 @@ export const api = {
     if (options.action) {
       params.set('action', options.action)
     }
+    if (options.q?.trim()) params.set('q', options.q.trim())
     return request<ActionLog[]>(`/api/v1/logs?${params.toString()}`)
   },
 
   /** 按当前筛选条件清空日志；不传条件则全部清空。 */
-  clearLogs(options: { action?: string } = {}): Promise<{ removed: number }> {
+  clearLogs(options: { action?: string; q?: string } = {}): Promise<{ removed: number }> {
     const params = new URLSearchParams()
     if (options.action) {
       params.set('action', options.action)
     }
+    if (options.q?.trim()) params.set('q', options.q.trim())
     const query = params.toString()
     return request<{ removed: number }>(`/api/v1/logs${query ? `?${query}` : ''}`, {
       method: 'DELETE',
@@ -640,9 +646,9 @@ export const api = {
     })
   },
 
-  /** 测试通知渠道（异步，返回每个渠道的送达结果摘要）。 */
-  testNotify(channel?: NotifyChannel, options: PollOptions = {}): Promise<JobDto> {
-    return runJob('/api/v1/settings/notify-test', channel ? { channel } : {}, options)
+  /** 用当前表单发送测试，草稿不会保存。 */
+  testNotify(input: NotifyPreview): Promise<unknown> {
+    return request('/api/v1/settings/notify-test', { method: 'POST', body: input })
   },
 
   /** 立即推送日报（异步）。 */

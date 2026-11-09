@@ -395,6 +395,7 @@ impl Scheduler {
             .ok_or_else(|| {
                 worker::Error::RustError("云端找不到配置的实例，请核实地域和实例 ID".into())
             })?;
+        instance.keep_alive = account.is_spot_keep_alive();
         if let Some(previous) = self
             .db
             .snapshot_instances(account.id)
@@ -402,7 +403,6 @@ impl Scheduler {
             .into_iter()
             .find(|i| i.instance_id == instance.instance_id)
         {
-            instance.keep_alive = previous.keep_alive;
             // 此处不补查副网卡；地址的分配与移除由完整采集核实。
             instance.public_ipv6 = instance.public_ipv6.or(previous.public_ipv6);
         }
@@ -451,19 +451,6 @@ impl Scheduler {
         }
         let billing_month = crate::models::billing_month(self.now, &self.timezone);
 
-        // 逐实例保活开关由用户在界面设置，采集结果里没有这项信息，
-        // 因此按 instance_id 从旧快照继承。
-        let previous_keep_alive: HashMap<String, bool> = previous
-            .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .instances()
-                    .into_iter()
-                    .map(|instance| (instance.instance_id, instance.keep_alive))
-                    .collect()
-            })
-            .unwrap_or_default();
-
         let traffic_fresh = sync.traffic.is_some();
         let balance_fresh = sync.balance.is_some();
         let instances_fresh = !sync.instances_failed;
@@ -477,13 +464,6 @@ impl Scheduler {
                 .unwrap_or_default()
         };
         let mut instances = sync.instances;
-        for instance in &mut instances {
-            instance.keep_alive = previous_keep_alive
-                .get(&instance.instance_id)
-                .copied()
-                .unwrap_or(false);
-        }
-
         // 实例查询失败（而不是「这个地域没有实例」）时沿用旧快照，
         // 避免一次网络抖动就让卡片上的实例信息消失。
         if sync.instances_failed {
@@ -491,6 +471,10 @@ impl Scheduler {
                 .as_ref()
                 .map(|snapshot| snapshot.instances())
                 .unwrap_or_default();
+        }
+        // 一条账号配置只绑定一台实例，保活以页面可见的配置为准。
+        for instance in &mut instances {
+            instance.keep_alive = account.is_spot_keep_alive();
         }
 
         // CDT 查询失败时沿用上次快照的流量值，绝不写成 0（否则阈值会误判为安全）。
@@ -720,7 +704,13 @@ impl Scheduler {
 
     /// 手工触发一次日报（`POST /api/v1/reports/daily`）。
     pub async fn push_daily_report(&self) -> worker::Result<String> {
-        let message = self.build_daily_report(&self.timezone).await?;
+        let config: DailyReportConfig = self.db.get_json_setting(setting_key::DAILY_REPORT).await?;
+        let timezone = if config.timezone.trim().is_empty() {
+            &self.timezone
+        } else {
+            &config.timezone
+        };
+        let message = self.build_daily_report(timezone).await?;
         let preview = message.plain_text();
         let outcome = self.notify(message).await;
         let detail = if outcome.results.is_empty() {
@@ -731,6 +721,9 @@ impl Scheduler {
         self.db
             .add_log(None, "daily_report_manual", None, &detail, now_ms())
             .await?;
+        if !outcome.any_success() {
+            return Err(worker::Error::RustError(detail));
+        }
         Ok(format!("{detail}\n{preview}"))
     }
 
@@ -851,7 +844,7 @@ impl Scheduler {
 
     /// 手动开机 / 关机。返回可读的结果描述。
     ///
-    /// 开机受熔断闸门约束；成功后立即刷新账号快照，让界面状态同步。
+    /// 开机受熔断闸门约束，保活开启时禁止手动关机；成功后立即刷新账号快照。
     pub async fn instance_action(
         &self,
         account_id: i64,
@@ -881,6 +874,11 @@ impl Scheduler {
 
         if account.instance_id_opt() != Some(instance_id) {
             return Err(worker::Error::RustError("实例 ID 与账号配置不一致".into()));
+        }
+        if !start && account.is_spot_keep_alive() {
+            return Err(worker::Error::RustError(
+                "保活已启用，不能手动关机；请先关闭保活".into(),
+            ));
         }
         if start && self.threshold_blocked(account).await? {
             return Err(worker::Error::RustError(
@@ -1026,15 +1024,18 @@ impl Scheduler {
         enabled: bool,
     ) -> worker::Result<()> {
         // 先确认账号存在，避免对已删除账号的残留快照写入配置
-        if self.db.get_account(account_id).await?.is_none() {
+        let Some(account) = self.db.get_account(account_id).await? else {
             return Err(worker::Error::RustError(format!(
                 "账号 {account_id} 不存在"
             )));
+        };
+        if account.instance_id_opt() != Some(instance_id) {
+            return Err(worker::Error::RustError("实例 ID 与账号配置不一致".into()));
         }
 
-        let mut instances = self.db.snapshot_instances(account_id).await?;
+        let instances = self.db.snapshot_instances(account_id).await?;
         let Some(target) = instances
-            .iter_mut()
+            .iter()
             .find(|instance| instance.instance_id == instance_id)
         else {
             return Err(worker::Error::RustError(
@@ -1047,10 +1048,8 @@ impl Scheduler {
                 "只有抢占式实例可以开启保活".to_string(),
             ));
         }
-        target.keep_alive = enabled;
-
         self.db
-            .update_snapshot_instances(account_id, &instances, now_ms())
+            .set_account_keep_alive(account_id, enabled, now_ms())
             .await?;
         self.db
             .add_log(

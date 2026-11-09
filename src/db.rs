@@ -65,6 +65,30 @@ fn j_bool(value: bool) -> JsValue {
     JsValue::from_f64(if value { 1.0 } else { 0.0 })
 }
 
+/// 查询和删除共用相同的日志搜索范围，关键词中的通配符按字面匹配。
+fn log_filter_sql(filter: &LogFilter) -> (String, Vec<JsValue>) {
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+    if let Some(id) = filter.account_id {
+        clauses.push("l.account_id = ?");
+        params.push(j_i64(id));
+    }
+    if let Some(prefix) = filter.action_prefix.as_deref().filter(|v| !v.is_empty()) {
+        clauses.push("instr(l.action_type, ?) = 1");
+        params.push(j_text(prefix));
+    }
+    if let Some(keyword) = filter.keyword.as_deref().filter(|v| !v.is_empty()) {
+        clauses.push("instr(lower(l.action_type || ' ' || coalesce(a.name, '') || ' ' || coalesce(l.instance_id, '') || ' ' || l.detail), lower(?)) > 0");
+        params.push(j_text(keyword));
+    }
+    let sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+    (sql, params)
+}
+
 /// 错误信息入库前截断，避免把整段阿里云响应塞进 D1。
 fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
@@ -274,6 +298,19 @@ impl Db {
             .unwrap_or_else(|| crate::models::DEFAULT_TIMEZONE.to_string()))
     }
 
+    /// 旧日报配置曾复制全局时区；修改全局时区时恢复继承，保留显式不同的时区。
+    pub async fn set_timezone(&self, timezone: &str, now_ms: i64) -> Result<()> {
+        let previous = self.get_timezone().await?;
+        let db = self.conn()?;
+        db.batch(vec![
+            db.prepare("UPDATE settings SET value = json_set(value, '$.timezone', ''), updated_at = ? WHERE key = 'daily_report' AND json_valid(value) AND json_extract(value, '$.timezone') = ?")
+                .bind(&[j_i64(now_ms), j_text(&previous)])?,
+            db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('timezone', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+                .bind(&[j_text(timezone), j_i64(now_ms)])?,
+        ]).await?;
+        Ok(())
+    }
+
     // =======================================================================
     // accounts
     // =======================================================================
@@ -452,6 +489,16 @@ impl Db {
         }
         // 配置和关联状态一起提交，失败时全部回滚。
         db.batch(statements).await?;
+        Ok(())
+    }
+
+    /// 旧逐实例接口与账号表单共享保活配置，并使排队中的旧配置动作失效。
+    pub async fn set_account_keep_alive(&self, id: i64, enabled: bool, now_ms: i64) -> Result<()> {
+        self.exec(
+            "UPDATE accounts SET spot_keep_alive = ?, config_version = config_version + 1, updated_at = ? WHERE id = ?",
+            &[j_bool(enabled), j_i64(now_ms), j_i64(id)],
+        )
+        .await?;
         Ok(())
     }
 
@@ -902,28 +949,7 @@ impl Db {
     pub async fn list_logs(&self, filter: &LogFilter) -> Result<Vec<ActionLog>> {
         let limit = filter.limit.clamp(1, 500) as i64;
 
-        // 条件按需拼接，参数顺序与 SQL 占位符保持一致
-        let mut clauses: Vec<&str> = Vec::new();
-        let mut params: Vec<JsValue> = Vec::new();
-
-        if let Some(id) = filter.account_id {
-            clauses.push("l.account_id = ?");
-            params.push(j_i64(id));
-        }
-        if let Some(prefix) = filter.action_prefix.as_deref().filter(|v| !v.is_empty()) {
-            clauses.push("instr(l.action_type, ?) = 1");
-            params.push(j_text(prefix));
-        }
-        if let Some(keyword) = filter.keyword.as_deref().filter(|v| !v.is_empty()) {
-            clauses.push("instr(lower(l.detail), lower(?)) > 0");
-            params.push(j_text(keyword));
-        }
-
-        let where_sql = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", clauses.join(" AND "))
-        };
+        let (where_sql, mut params) = log_filter_sql(filter);
         params.push(j_i64(limit));
 
         let sql = format!(
@@ -949,28 +975,11 @@ impl Db {
     ///
     /// 条件与 [`Self::list_logs`] 保持一致：界面上看到什么，就能只清掉什么。
     pub async fn clear_logs(&self, filter: &LogFilter) -> Result<usize> {
-        let mut clauses: Vec<&str> = Vec::new();
-        let mut params: Vec<JsValue> = Vec::new();
-
-        if let Some(account_id) = filter.account_id {
-            clauses.push("account_id = ?");
-            params.push(j_i64(account_id));
-        }
-        if let Some(prefix) = filter.action_prefix.as_deref().filter(|v| !v.is_empty()) {
-            clauses.push("instr(action_type, ?) = 1");
-            params.push(j_text(prefix));
-        }
-        if let Some(keyword) = filter.keyword.as_deref().filter(|v| !v.is_empty()) {
-            clauses.push("instr(lower(detail), lower(?)) > 0");
-            params.push(j_text(keyword));
-        }
-
-        let sql = if clauses.is_empty() {
-            "DELETE FROM action_logs".to_string()
-        } else {
-            format!("DELETE FROM action_logs WHERE {}", clauses.join(" AND "))
-        };
-        self.exec(&sql, &params).await
+        let (where_sql, params) = log_filter_sql(filter);
+        self.exec(
+            &format!("DELETE FROM action_logs WHERE id IN (SELECT l.id FROM action_logs l LEFT JOIN accounts a ON a.id = l.account_id {where_sql})"),
+            &params,
+        ).await
     }
 
     // =======================================================================

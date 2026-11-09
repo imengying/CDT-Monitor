@@ -1186,16 +1186,14 @@ export class SettingsModal {
           'div',
           { class: 'notification-action-row' },
           this.asyncButton('发送测试', icons.send, 'telegram', () =>
-            testNotification('telegram'),
+            testNotification({ channel: 'telegram', preview: this.telegramPayload() }),
           ),
         ),
       ),
     )
   }
 
-  private async saveTelegram(): Promise<void> {
-    if (this.saving) return
-
+  private telegramPayload(): TelegramUpdate {
     const payload: TelegramUpdate = {
       enabled: this.telegramDraft.enabled,
       chat_id: this.telegramDraft.chatId.trim(),
@@ -1203,9 +1201,14 @@ export class SettingsModal {
     if (this.telegramDraft.token.trim()) {
       payload.token = this.telegramDraft.token.trim()
     }
+    return payload
+  }
+
+  private async saveTelegram(): Promise<void> {
+    if (this.saving) return
 
     await this.runSave(
-      () => api.updateTelegram(payload),
+      () => api.updateTelegram(this.telegramPayload()),
       'Telegram 配置已保存',
       '保存 Telegram 配置失败',
     )
@@ -1277,15 +1280,15 @@ export class SettingsModal {
         el(
           'div',
           { class: 'notification-action-row' },
-          this.asyncButton('发送测试', icons.send, 'bark', () => testNotification('bark')),
+          this.asyncButton('发送测试', icons.send, 'bark', () =>
+            testNotification({ channel: 'bark', preview: this.barkPayload() }),
+          ),
         ),
       ),
     )
   }
 
-  private async saveBark(): Promise<void> {
-    if (this.saving) return
-
+  private barkPayload(): BarkUpdate {
     const payload: BarkUpdate = {
       enabled: this.barkDraft.enabled,
       server_url: this.barkDraft.serverUrl.trim(),
@@ -1295,8 +1298,13 @@ export class SettingsModal {
     if (this.barkDraft.deviceKey.trim()) {
       payload.device_key = this.barkDraft.deviceKey.trim()
     }
+    return payload
+  }
 
-    await this.runSave(() => api.updateBark(payload), 'Bark 配置已保存', '保存 Bark 配置失败')
+  private async saveBark(): Promise<void> {
+    if (this.saving) return
+
+    await this.runSave(() => api.updateBark(this.barkPayload()), 'Bark 配置已保存', '保存 Bark 配置失败')
   }
 
   // -------------------------------------------------------------------------
@@ -1314,7 +1322,7 @@ export class SettingsModal {
           'div',
           { class: 'form-grid settings-form' },
           field(
-            '推送时间（按账号时区）',
+            `推送时间（${this.settings?.daily_report.timezone ?? this.settings?.timezone ?? 'UTC+8'}）`,
             this.line(this.reportDraft.time, (value) => {
               this.reportDraft.time = value
             }, { placeholder: '09:00' }),
@@ -1374,28 +1382,20 @@ export class SettingsModal {
     let filter: LogFilterKey = ''
     let keyword = ''
     let loading = false
+    let pendingLoad = false
     let confirming = false
 
     const confirmHost = el('div', { class: 'log-confirm-host' })
 
     const paintList = (): void => {
-      const needle = keyword.trim().toLowerCase()
-      const filtered = needle
-        ? logs.filter((log) =>
-            `${log.action_type} ${log.account_name ?? ''} ${log.instance_id ?? ''} ${log.detail}`
-              .toLowerCase()
-              .includes(needle),
-          )
-        : logs
-
-      if (filtered.length === 0) {
+      if (logs.length === 0) {
         replaceChildren(
           listHost,
-          subtleEmpty(logs.length === 0 ? '暂无日志' : '没有匹配的日志', icons.activity),
+          subtleEmpty(filter || keyword.trim() ? '没有匹配的日志' : '暂无日志', icons.activity),
         )
         return
       }
-      replaceChildren(listHost, ...filtered.map((log) => logRow(log)))
+      replaceChildren(listHost, ...logs.map((log) => logRow(log)))
     }
 
     const paintConfirm = (): void => {
@@ -1403,7 +1403,7 @@ export class SettingsModal {
         replaceChildren(confirmHost)
         return
       }
-      const scope = filter ? '当前筛选范围内的日志' : '全部日志'
+      const scope = filter || keyword.trim() ? '当前筛选范围内的日志' : '全部日志'
       replaceChildren(
         confirmHost,
         el(
@@ -1440,38 +1440,48 @@ export class SettingsModal {
     }
 
     const load = async (): Promise<void> => {
-      if (loading) return
+      if (loading) {
+        pendingLoad = true
+        return
+      }
+      pendingLoad = false
       loading = true
       errorBox.hidden = true
       if (logs.length === 0) replaceChildren(listHost, subtleEmpty('正在加载…', icons.spinner))
       try {
-        logs = await api.logs(200, { action: filter || undefined })
-        paintList()
+        const result = await api.logs(200, { action: filter || undefined, q: keyword })
+        if (!pendingLoad) {
+          logs = result
+          paintList()
+        }
       } catch (error) {
         errorBox.hidden = false
         errorBox.textContent = error instanceof ApiError ? error.message : '加载日志失败'
       } finally {
         loading = false
+        if (pendingLoad) void load()
       }
     }
 
     const clearLogs = async (): Promise<void> => {
       if (loading) return
       loading = true
+      let deleted = false
       confirming = false
       paintConfirm()
       errorBox.hidden = true
       try {
-        const { removed } = await api.clearLogs({ action: filter || undefined })
+        const { removed } = await api.clearLogs({ action: filter || undefined, q: keyword })
         toast(removed > 0 ? `已清空 ${removed} 条日志` : '没有可清空的日志', 'ok')
         logs = []
         paintList()
-        loading = false
-        await load()
+        deleted = true
       } catch (error) {
         errorBox.hidden = false
         errorBox.textContent = error instanceof ApiError ? error.message : '清空日志失败'
+      } finally {
         loading = false
+        if (deleted || pendingLoad) void load()
       }
     }
 
@@ -1484,6 +1494,8 @@ export class SettingsModal {
           items: LOG_FILTERS,
           onChange: (value) => {
             filter = value
+            confirming = false
+            paintConfirm()
             paintFilter()
             void load()
           },
@@ -1493,7 +1505,9 @@ export class SettingsModal {
 
     searchInput.addEventListener('input', () => {
       keyword = searchInput.value
-      paintList()
+      confirming = false
+      paintConfirm()
+      void load()
     })
 
     paintFilter()

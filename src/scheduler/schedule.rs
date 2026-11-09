@@ -185,6 +185,19 @@ impl Scheduler {
         {
             return Ok(());
         }
+        // 简单模式的开关机窗口重叠时，关机优先；即使本轮关机已去重，
+        // 也不能在下一条消息里补执行旧的开机计划，把刚停止的实例拉起。
+        if !account.schedule_is_advanced()
+            && account.schedule_stop_minutes().is_some_and(|stop| {
+                within_window(
+                    local_minutes_of_day(self.now, &self.timezone),
+                    stop,
+                    SCHEDULE_WINDOW_MINUTES,
+                )
+            })
+        {
+            return Ok(());
+        }
 
         // 优先级：熔断闸门高于定时开机
         if self.threshold_blocked(account).await? {
@@ -325,13 +338,13 @@ impl Scheduler {
     /// 比巡检间隔还短、抓不住。因此只能靠**前置条件**收窄误判，
     /// 与上游保持一致的四个闸门（任一不满足就跳过）：
     ///
-    /// 1. 账号级与实例级保活开关都开启；
+    /// 1. 该实例的保活配置已开启；
     /// 2. 当前处于「允许运行时段」（见 [`in_allowed_window`]）；
     /// 3. 未触发流量熔断；
-    /// 4. 今天还没执行过定时关机（定时关机优先于保活）。
+    /// 4. 未处于刚执行定时关机后的避让期（定时关机优先于保活）。
     ///
     /// 剩下的情形（暂停窗口外手动停机）仍会被拉起，这是接口能力的边界：
-    /// 手动停机前请先关掉该实例或账号的保活开关。
+    /// 在云控制台手动停机前请先关掉该实例的保活开关。
     pub(super) async fn maybe_keep_alive(
         &self,
         account: &AccountRow,

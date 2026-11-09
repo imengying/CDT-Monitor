@@ -8,6 +8,7 @@ import { Miniflare } from 'miniflare'
 const state = { instanceId: 'i-review', stoppedIds: [], trafficCalls: 0, traffic: 190, trafficFailed: false, balanceFailed: false, instancesFailed: false, stopFailed: true, startFailed: false, notifyFailed: true, notifications: 0, stallTraffic: false, stallBody: false, status: 'Running', stops: 0, starts: 0, requests: 0 }
 state.trafficResponses = []
 state.trafficAttempts = null
+state.spot = true
 state.ipv6 = null
 state.hideInstanceIpv6 = false
 state.networkCalls = 0
@@ -38,7 +39,12 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
     const fail = () => Response.json({ Code: 'Forbidden', Message: 'fixture failure' }, { status: 403 })
     if (url.origin === 'https://api.telegram.org') {
       state.notifications++
+      state.lastTelegram = { path: url.pathname, body: await request.text() }
       return state.notifyFailed ? fail() : Response.json({ ok: true })
+    }
+    if (url.hostname === 'bark-preview.test') {
+      state.lastBark = { url: request.url, body: await request.json() }
+      return state.barkFailed ? fail() : Response.json({ code: 200, message: 'success' })
     }
     switch (action) {
       case 'GetCallerIdentity': return url.searchParams.get('AccessKeyId') === 'invalid-key' ? fail() : Response.json({ AccountId: url.searchParams.get('AccessKeyId') === 'replacement-key' ? '2002' : '1001' })
@@ -63,7 +69,7 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
         // 官方接口仅在请求扩展属性时返回主网卡 IPv6，避免只测解析器而漏测请求。
         const ipv6Sets = !state.hideInstanceIpv6 && url.searchParams.get('AdditionalAttributes.1') === 'NETWORK_PRIMARY_ENI_IP' && state.ipv6
           ? [{ Ipv6Address: state.ipv6, Primary: true }] : []
-        return Response.json({ Instances: { Instance: [{ InstanceId: state.instanceId, RegionId: 'cn-hongkong', Status: state.status, SpotStrategy: 'SpotAsPriceGo',
+        return Response.json({ Instances: { Instance: [{ InstanceId: state.instanceId, RegionId: 'cn-hongkong', Status: state.status, SpotStrategy: state.spot ? 'SpotAsPriceGo' : 'NoSpot',
           NetworkInterfaces: { NetworkInterface: [{ Type: 'Primary', Ipv6Sets: { Ipv6Set: ipv6Sets } }] },
         }] } })
       }
@@ -185,6 +191,24 @@ try {
     assert.equal('session_ttl_ms' in stored, false)
   }
   console.log('✓ 新登录固定 7 天，旧会话有效期配置和旧客户端字段不再生效')
+  const storedReport = async () => JSON.parse((await db.prepare("SELECT value FROM settings WHERE key = 'daily_report'").first()).value)
+  await api('settings/daily-report', 'PUT', { enabled: false, time: '09:00' })
+  assert.equal((await storedReport()).timezone, '', 'omitting report timezone keeps global inheritance')
+  let settings = await api('settings/timezone', 'PUT', { timezone: 'UTC+9' })
+  assert.equal(settings.daily_report.timezone, 'UTC+9')
+  await api('settings/daily-report', 'PUT', { enabled: false, time: '09:00', timezone: 'UTC+9' })
+  settings = await api('settings/timezone', 'PUT', { timezone: 'UTC+8' })
+  assert.equal(settings.daily_report.timezone, 'UTC+8', 'legacy copied timezone follows the global setting')
+  assert.equal((await storedReport()).timezone, '')
+  await api('settings/daily-report', 'PUT', { enabled: false, time: '09:00', timezone: 'UTC+9' })
+  settings = await api('settings/timezone', 'PUT', { timezone: 'UTC+7' })
+  assert.equal(settings.daily_report.timezone, 'UTC+9', 'explicit different report timezone is preserved')
+  response = await request('settings/daily-report', 'PUT', { enabled: true, time: '09:00', timezone: 'bad/timezone' })
+  assert.equal(response.status, 400)
+  assert.equal((await storedReport()).timezone, 'UTC+9', 'invalid report settings leave saved configuration intact')
+  await api('settings/timezone', 'PUT', { timezone: 'UTC+8' })
+  await api('settings/daily-report', 'PUT', { enabled: false, time: '09:00' })
+  console.log('✓ 日报默认继承系统时区，兼容旧配置，保留独立时区并拒绝非法时区')
   const config = { name: 'Fixture', site_type: 'intl', access_key_id: 'fixture-access-key', access_key_secret: 'fixture-secret', region_id: 'cn-hongkong', instance_id: 'i-review', traffic_threshold_gb: 180, over_limit_action: 'stop_and_notify', stop_mode: 'StopCharging', enabled: true, spot_keep_alive: false }
   const account = await api('accounts', 'POST', config)
   const id = account.id
@@ -282,7 +306,52 @@ try {
   const overview = await api('overview')
   assert.equal(overview.accounts[0].traffic_current, false)
   assert.ok(overview.accounts[0].sync_errors.length)
+  const unsentReport = await runJob('reports/daily', 'failed')
+  assert.match(unsentReport.error_msg, /未配置任何通知渠道，日报未发送/)
+  await api('settings/telegram', 'PUT', { enabled: true })
+  state.notifyFailed = true
+  const failedReport = await runJob('reports/daily', 'failed')
+  assert.match(failedReport.error_msg, /telegram.*❌/i)
+  state.notifyFailed = false
   const staleReport = await runJob('reports/daily')
+  assert.match(staleReport.result_msg, /telegram.*✅/i)
+  await api('settings/telegram', 'PUT', { enabled: false })
+  console.log('✓ 手动日报无通知渠道或发送失败时任务失败，成功送达后才提示成功')
+  const beforePreviewSettings = (await db.prepare('SELECT * FROM settings ORDER BY key').all()).results
+  const beforePreviewJobs = (await db.prepare('SELECT COUNT(*) AS n FROM jobs').first()).n
+  const telegramDraft = { enabled: false, token: '123456:preview-only-token', chat_id: 'preview-only-chat' }
+  await api('settings/notify-test', 'POST', { channel: 'telegram', preview: telegramDraft })
+  assert.match(state.lastTelegram.path, /preview-only-token/)
+  assert.equal(new URLSearchParams(state.lastTelegram.body).get('chat_id'), 'preview-only-chat')
+  await api('settings/notify-test', 'POST', { channel: 'telegram', preview: { enabled: false, token: '', chat_id: '' } })
+  assert.match(state.lastTelegram.path, /fixture-token-for-tests/)
+  assert.equal(new URLSearchParams(state.lastTelegram.body).get('chat_id'), 'fixture-chat')
+  const barkDraft = { enabled: false, server_url: 'https://bark-preview.test/custom', device_key: 'preview-only-key', normal_level: 'timeSensitive', alert_level: 'critical' }
+  await api('settings/notify-test', 'POST', { channel: 'bark', preview: barkDraft })
+  assert.equal(state.lastBark.url, 'https://bark-preview.test/custom/push')
+  assert.equal(state.lastBark.body.device_key, 'preview-only-key')
+  assert.equal(state.lastBark.body.level, 'timeSensitive')
+  state.notifyFailed = true
+  response = await request('settings/notify-test', 'POST', { channel: 'telegram', preview: telegramDraft })
+  assert.equal(response.status, 502, 'preview reports delivery failures directly')
+  state.notifyFailed = false
+  response = await request('settings/notify-test', 'POST', { channel: 'telegram', preview: { ...telegramDraft, token: 'bad' } })
+  assert.equal(response.status, 400)
+  assert.deepEqual((await db.prepare('SELECT * FROM settings ORDER BY key').all()).results, beforePreviewSettings)
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM jobs').first()).n, beforePreviewJobs, 'preview must not persist draft credentials in jobs')
+  assert.equal((await api('logs?q=preview-only')).length, 0, 'preview credentials must not appear in logs')
+  await api('settings/bark', 'PUT', { ...barkDraft, enabled: false, device_key: 'stored-bark-key' })
+  await api('settings/notify-test', 'POST', { channel: 'bark', preview: { ...barkDraft, device_key: '' } })
+  assert.equal(state.lastBark.body.device_key, 'stored-bark-key')
+  await api('settings/bark', 'PUT', { ...barkDraft, enabled: true, device_key: '' })
+  await api('settings/telegram', 'PUT', { enabled: true })
+  state.barkFailed = true
+  const partiallySent = await runJob('reports/daily')
+  assert.match(partiallySent.result_msg, /telegram ✅.*bark ❌/)
+  state.barkFailed = false
+  await api('settings/bark', 'PUT', { ...barkDraft, enabled: false, device_key: '' })
+  await api('settings/telegram', 'PUT', { enabled: false })
+  console.log('✓ 通知测试使用未保存表单、空密钥复用已存配置，草稿不落库，日报部分送达保留失败详情')
   assert.match(staleReport.result_msg, /本月合计流量 0\.00 GB/)
   assert.match(staleReport.result_msg, /1 个账号本月流量待采集/)
   assert.match(staleReport.result_msg, /本月流量待采集（未计入合计）/)
@@ -426,7 +495,6 @@ try {
 
   await db.prepare('UPDATE accounts SET enabled = 0 WHERE id != ?').bind(id).run()
   await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: true, schedule_mode: 'advanced', schedule_stop_cron: '* * * * *' })
-  await api(`accounts/${id}/instances/i-review/keep-alive`, 'PUT', { enabled: true })
   state.status = 'Running'
   await worker.scheduled({ cron: '*/5 * * * *', scheduledTime: Date.now() })
   await eventually(async () => (await db.prepare('SELECT last_schedule_stop_at AS at FROM accounts WHERE id = ?').bind(id).first()).at, 'scheduled stop')
@@ -490,8 +558,18 @@ try {
   assert.equal((await api('logs?q=%25_')).length, 1, 'wildcards must be literal')
   await api(`logs?q=${encodeURIComponent(keyword)}`, 'DELETE')
   assert.equal((await api('logs?action=search_fixture')).length, 1, 'filtered deletion preserves unrelated logs')
-  console.log('✓ 长中文日志关键词与通配符按字面匹配，查询和删除条件一致')
+  for (const [field, query] of [['account_id', 'fixture'], ['instance_id', 'i-search-only'], ['action_type', 'search_fields']]) {
+    await db.prepare('INSERT INTO action_logs (account_id, action_type, instance_id, detail, created_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(field === 'account_id' ? id : null, 'search_fields', field === 'instance_id' ? query : null, 'old matching entry', 1).run()
+    const path = `logs?limit=1&action=search_fields&q=${encodeURIComponent(query)}`
+    assert.equal((await api(path)).length, 1, `search covers ${field} before applying the limit`)
+    const removed = await api(path, 'DELETE')
+    assert.equal(removed.removed, 1, `deletion uses the same ${field} predicate`)
+    assert.equal((await api('logs?action=search_fixture')).length, 1)
+  }
+  console.log('✓ 日志查询与删除共用关键词、类型和账号条件，支持名称/实例/类型/详情与字面通配符')
 
+  await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: false })
   const beforeDuplicate = state.starts
   const manual = await api(`accounts/${id}/instances/i-review/stop`, 'POST')
   await eventually(async () => (await db.prepare('SELECT status FROM jobs WHERE id = ?').bind(manual.job_id).first()).status === 'success', 'manual stop')
@@ -502,7 +580,6 @@ try {
   console.log('✓ 队列重复投递不重放已完成的开关机任务')
 
   // 同一消息失败 → 重投成功 → 再次重复投递，不依赖下一轮 Cron。
-  await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: false })
   const sameCycle = Date.now()
   const message = { id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
     body: { Cron: { account_id: id, scheduled_at: sameCycle } } }
@@ -560,7 +637,7 @@ try {
     state[failureFlag] = false
     await db.prepare('UPDATE accounts SET spot_keep_alive = ?, last_schedule_stop_at = NULL WHERE id = ?').bind(start ? 1 : 0, id).run()
     if (start) {
-      assert.equal(JSON.parse((await snapshot()).instances_json)[0].keep_alive, true)
+      assert.equal((await api('overview')).accounts.find(a => a.id === id).instances[0].keep_alive, true)
       await db.prepare('DELETE FROM locks WHERE name = ?').bind(`keepalive:${id}:i-review`).run()
     }
     delivery = await worker.queue('cdt-monitor-tasks', [{ ...scheduleMessage, attempts: 2 }])
@@ -579,6 +656,19 @@ try {
   console.log('✓ 定时启停遇到过渡态或未知状态保留重试，终态恢复后同消息补偿执行')
   console.log('✓ 定时启停成功立即显示过渡态、失败不误报、轮询收敛终态，开机与保活同轮不重复下发')
 
+  const overlapTime = new Date(Date.now() + 8 * 3600_000).toISOString().slice(11, 16)
+  await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: true,
+    schedule_mode: 'simple', schedule_start_time: overlapTime, schedule_stop_time: overlapTime })
+  const overlapStarts = state.starts
+  const overlapStops = state.stops
+  state.status = 'Running'
+  await cronAccount(worker, id)
+  assert.equal(state.stops, overlapStops + 1)
+  await cronAccount(worker, id)
+  assert.equal(state.status, 'Stopped')
+  assert.equal(state.starts, overlapStarts, 'overlapping simple schedules must not restart after the stop has been deduplicated')
+  state.status = 'Running'
+  console.log('✓ 简单模式开关机窗口重叠时关机优先，后续巡检不会补发冲突的开机指令')
 
   // 账号规模超过原单次 Cron 的免费额度；每个消费调用受 50 次 D1 上限检查。
   await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: false })
@@ -688,6 +778,56 @@ try {
   assert.equal(state.starts, manualStarts + 1)
   state.status = 'Running'
   console.log('✓ 手动启停核实云端状态；已达目标刷新快照，查询失败或过渡态不发指令')
+
+  await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: true })
+  const keepAliveInstances = (await snapshot()).instances_json
+  for (const instances of [keepAliveInstances, '[]']) {
+    await db.prepare('UPDATE account_snapshots SET instances_json = ? WHERE account_id = ?').bind(instances, id).run()
+    const beforeBlockedStop = state.requests
+    const blocked = await runJob(`accounts/${id}/instances/i-review/stop`, 'failed')
+    assert.match(blocked.error_msg, /保活已启用，不能手动关机/)
+    assert.equal(state.requests, beforeBlockedStop, 'keep alive rejects manual stop before contacting cloud APIs, including without a snapshot')
+  }
+  state.status = 'Stopped'
+  const keepAliveStarts = state.starts
+  await runJob(`accounts/${id}/instances/i-review/start`)
+  assert.equal(state.starts, keepAliveStarts + 1, 'keep alive still permits manual start')
+  await api(`accounts/${id}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: false })
+  const stopsAfterDisabling = state.stops
+  await runJob(`accounts/${id}/instances/i-review/stop`)
+  assert.equal(state.stops, stopsAfterDisabling + 1, 'disabling keep alive restores manual stop')
+  state.status = 'Running'
+  console.log('✓ 保活开启时直接调用关机接口也被拒绝，缺少快照不能绕过，开机与关闭保活后关机正常')
+
+  const freshKeepAlive = await api('accounts', 'POST', { ...config, name: 'Fresh keep alive', traffic_threshold_gb: 0, spot_keep_alive: true })
+  const freshId = freshKeepAlive.id
+  const freshView = async () => (await api('overview')).accounts.find(a => a.id === freshId)
+  assert.equal((await freshView()).instances[0].keep_alive, true, 'visible configuration applies before the first snapshot')
+  state.status = 'Stopped'
+  state.spot = false
+  const freshStarts = state.starts
+  await cronAccount(worker, freshId)
+  assert.equal(state.starts, freshStarts, 'keep alive must not start non-spot instances')
+  state.spot = true
+  await db.prepare('DELETE FROM account_snapshots WHERE account_id = ?').bind(freshId).run()
+  await cronAccount(worker, freshId)
+  assert.equal(state.starts, freshStarts + 1, 'first collection must honor the visible keep-alive switch without a hidden per-instance switch')
+  const freshVersion = (await db.prepare('SELECT config_version FROM accounts WHERE id = ?').bind(freshId).first()).config_version
+  await api(`accounts/${freshId}/instances/i-review/keep-alive`, 'PUT', { enabled: false })
+  const afterToggle = await freshView()
+  assert.equal(afterToggle.spot_keep_alive, false)
+  assert.equal(afterToggle.instances[0].keep_alive, false)
+  assert.equal((await db.prepare('SELECT config_version FROM accounts WHERE id = ?').bind(freshId).first()).config_version, freshVersion + 1)
+  state.status = 'Stopped'
+  await cronAccount(worker, freshId)
+  assert.equal(state.starts, freshStarts + 1, 'legacy endpoint disables the same setting used by the scheduler')
+  await api(`accounts/${freshId}`, 'PUT', { ...config, traffic_threshold_gb: 0, spot_keep_alive: true })
+  await db.prepare('DELETE FROM locks WHERE name = ?').bind(`keepalive:${freshId}:i-review`).run()
+  await cronAccount(worker, freshId)
+  assert.equal(state.starts, freshStarts + 2, 'enabling through account settings overrides the old false snapshot flag')
+  await api(`accounts/${freshId}`, 'DELETE')
+  state.status = 'Running'
+  console.log('✓ 首次采集即按页面开关保活，普通实例不启动，旧接口与账号设置保持一致且可重新启用')
 
   const replacement = await api('accounts', 'POST', { ...config, name: 'Identity test' })
   const replacementId = replacement.id

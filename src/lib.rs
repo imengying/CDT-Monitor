@@ -1193,6 +1193,105 @@ async fn handle_get_settings(app: &AppCtx) -> worker::Result<Response> {
     })
 }
 
+/// 用当前表单测试单个渠道；草稿凭据只在请求内使用，不写入设置或任务队列。
+async fn handle_notify_preview(
+    app: &AppCtx,
+    payload: NotifyTestRequest,
+) -> worker::Result<Response> {
+    let mut channels = crate::notify::Channels::default();
+    let channel = match payload {
+        NotifyTestRequest::Telegram {
+            preview: Some(draft),
+        } => {
+            let stored: TelegramConfig = app.db.get_json_setting(setting_key::TELEGRAM).await?;
+            let token = draft
+                .token
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    stored
+                        .token_enc
+                        .as_deref()
+                        .and_then(|enc| app.crypto.try_decrypt(enc))
+                });
+            let chat_id = draft
+                .chat_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or(stored.chat_id);
+            let (Some(token), Some(chat_id)) = (token, chat_id) else {
+                return error_response(400, "请填写 Bot Token 与 Chat ID 后再测试");
+            };
+            if !token.contains(':') || token.len() < 20 {
+                return error_response(400, "Bot Token 格式不正确（应形如 123456:AA...）");
+            }
+            channels.telegram = Some(crate::notify::TelegramChannel { token, chat_id });
+            NotifyChannel::Telegram
+        }
+        NotifyTestRequest::Bark {
+            preview: Some(draft),
+        } => {
+            let stored: BarkConfig = app.db.get_json_setting(setting_key::BARK).await?;
+            let device_key = draft
+                .device_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    stored
+                        .device_key_enc
+                        .as_deref()
+                        .and_then(|enc| app.crypto.try_decrypt(enc))
+                });
+            let Some(device_key) = device_key else {
+                return error_response(400, "请填写 Device Key 后再测试");
+            };
+            let server_url = draft.server_url.trim().trim_end_matches('/');
+            if server_url.is_empty() {
+                return error_response(400, "Bark Server URL 不能为空");
+            }
+            channels.bark = Some(crate::notify::BarkChannel {
+                server_url: server_url.to_string(),
+                device_key,
+                normal_level: draft.normal_level,
+                alert_level: draft.alert_level,
+            });
+            NotifyChannel::Bark
+        }
+        _ => return error_response(400, "缺少测试配置"),
+    };
+    let (name, action) = match channel {
+        NotifyChannel::Telegram => ("telegram", "notify_test_telegram"),
+        NotifyChannel::Bark => ("bark", "notify_test_bark"),
+    };
+    let outcome = crate::notify::send_test(&channels, Some(name)).await;
+    let delivered = outcome.any_success();
+    let _ = app
+        .db
+        .add_log(
+            None,
+            action,
+            None,
+            if delivered {
+                "当前配置测试通知已送达"
+            } else {
+                "当前配置测试通知发送失败"
+            },
+            now_ms(),
+        )
+        .await;
+    if delivered {
+        ok(&outcome)
+    } else {
+        error_response(502, outcome.summary())
+    }
+}
+
 /// `PUT /api/v1/settings/telegram`
 async fn handle_update_telegram(app: &AppCtx, mut req: Request) -> worker::Result<Response> {
     let payload: TelegramSettingsUpdate = match read_json(&mut req).await {
@@ -1415,11 +1514,12 @@ async fn handle_update_report(app: &AppCtx, mut req: Request) -> worker::Result<
     config.enabled = payload.enabled;
     config.time =
         crate::models::minutes_to_hhmm(crate::models::parse_hhmm(&payload.time).unwrap_or(540));
-    config.timezone = if payload.timezone.trim().is_empty() {
-        app.timezone.clone()
-    } else {
-        payload.timezone.trim().to_string()
-    };
+    let timezone = payload.timezone.trim();
+    if !timezone.is_empty() && !is_supported_timezone(timezone) {
+        return error_response(400, "时区取值不受支持");
+    }
+    // 空值保持继承全局时区，避免之后修改系统时区时日报仍按旧时区发送。
+    config.timezone = timezone.to_string();
 
     app.db
         .set_json_setting(setting_key::DAILY_REPORT, &config, now_ms())
@@ -1443,9 +1543,7 @@ async fn handle_update_timezone(app: &AppCtx, mut req: Request) -> worker::Resul
         return error_response(400, "时区取值不受支持");
     }
 
-    app.db
-        .set_setting(setting_key::TIMEZONE, raw, now_ms())
-        .await?;
+    app.db.set_timezone(raw, now_ms()).await?;
 
     handle_get_settings(app).await
 }
@@ -1625,11 +1723,16 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
                 Ok(payload) => payload,
                 Err(err) => return error_response(400, err),
             };
+            let channel = match &payload {
+                NotifyTestRequest::Telegram { preview: None } => NotifyChannel::Telegram,
+                NotifyTestRequest::Bark { preview: None } => NotifyChannel::Bark,
+                _ => return handle_notify_preview(&app, payload).await,
+            };
             spawn_job(
                 &ctx,
                 &app,
                 JobTask::NotifyTest {
-                    channel: Some(payload.channel),
+                    channel: Some(channel),
                 },
             )
             .await
