@@ -545,11 +545,11 @@ export class SettingsModal {
    * 底部悬浮栏。
    *
    * 实例页在编辑表单打开时显示「创建实例 / 保存修改」，
-   * 其余标签页用「保存更改」；日报页自带「立即推送」，不显示浮动栏。
+   * 其余有配置项的标签页用「保存更改」；日志页只有即时操作，不显示浮动栏。
    */
   private paintFooter(): void {
-    // 日报与日志页只有即时操作，没有需要提交的表单
-    if (this.activeTab === 'report' || this.activeTab === 'logs') {
+    // 日志页只有即时操作，没有需要提交的表单
+    if (this.activeTab === 'logs') {
       this.footer.hidden = true
       return
     }
