@@ -113,6 +113,13 @@ interface AccountForm {
   scheduleMode: ScheduleMode
   scheduleStartCron: string
   scheduleStopCron: string
+  dnsEnabled: boolean
+  dnsZoneId: string
+  dnsName: string
+  dnsToken: string
+  dnsTokenConfigured: boolean
+  dnsLeadMinutes: number
+  dnsError: string | null
   spotKeepAlive: boolean
   enabled: boolean
 }
@@ -135,6 +142,13 @@ function blankAccountForm(): AccountForm {
     scheduleMode: 'simple',
     scheduleStartCron: '',
     scheduleStopCron: '',
+    dnsEnabled: false,
+    dnsZoneId: '',
+    dnsName: '',
+    dnsToken: '',
+    dnsTokenConfigured: false,
+    dnsLeadMinutes: 30,
+    dnsError: null,
     spotKeepAlive: false,
     enabled: true,
   }
@@ -158,6 +172,13 @@ function formFromAccount(account: AccountDto): AccountForm {
     scheduleMode: account.schedule_mode === 'advanced' ? 'advanced' : 'simple',
     scheduleStartCron: account.schedule_start_cron ?? '',
     scheduleStopCron: account.schedule_stop_cron ?? '',
+    dnsEnabled: account.dns.enabled,
+    dnsZoneId: account.dns.zone_id,
+    dnsName: account.dns.name,
+    dnsToken: '',
+    dnsTokenConfigured: account.dns.token_configured,
+    dnsLeadMinutes: account.dns.lead_minutes,
+    dnsError: account.dns.last_error,
     spotKeepAlive: account.spot_keep_alive,
     enabled: account.enabled,
   }
@@ -404,6 +425,7 @@ export class SettingsModal {
       icon?: IconNode
       suffix?: string
       min?: string
+      max?: string
       step?: string
       required?: boolean
       /** 有值时默认掩码显示，聚焦后才展示明文，避免截图/录屏泄露。 */
@@ -416,6 +438,7 @@ export class SettingsModal {
       placeholder: options.placeholder,
       autocomplete: options.type === 'password' ? 'new-password' : 'off',
       min: options.min,
+      max: options.max,
       step: options.step,
     })
     if (options.required) input.required = true
@@ -453,7 +476,7 @@ export class SettingsModal {
   private numberLine(
     initial: number,
     onInput: (value: number) => void,
-    options: { min?: string; step?: string; suffix?: string } = {},
+    options: { min?: string; max?: string; step?: string; suffix?: string } = {},
   ): HTMLElement {
     return this.line(
       String(initial),
@@ -461,7 +484,7 @@ export class SettingsModal {
         const parsed = Number(raw)
         onInput(Number.isFinite(parsed) ? parsed : 0)
       },
-      { type: 'number', min: options.min ?? '0.1', step: options.step ?? '1', suffix: options.suffix },
+      { type: 'number', min: options.min ?? '0.1', max: options.max, step: options.step ?? '1', suffix: options.suffix },
     )
   }
 
@@ -900,6 +923,23 @@ export class SettingsModal {
             ),
           ]
         : [field('每日定时开机', scheduleStart), field('每日定时关机', scheduleStop)]),
+      el('div', { class: 'account-fields__full toggle-list' },
+        toggleRow({
+          title: 'Cloudflare DNS 联动',
+          icon: icons.cloud,
+          checked: form.dnsEnabled,
+          onChange: (checked) => { this.form.dnsEnabled = checked; this.renderContent() },
+        }),
+      ),
+      ...(form.dnsEnabled ? [
+        field('Cloudflare Zone ID', this.line(form.dnsZoneId, (value) => { this.form.dnsZoneId = value }, { placeholder: '域名概述中的 32 位 Zone ID' })),
+        field('完整域名', this.line(form.dnsName, (value) => { this.form.dnsName = value }, { placeholder: 'app.example.com' })),
+        field('Cloudflare API Token', this.line(form.dnsToken, (value) => { this.form.dnsToken = value }, { type: 'password', placeholder: form.dnsTokenConfigured ? '已配置，留空保持不变' : '指定 Zone 的 DNS 编辑权限' })),
+        field('提前摘除（分钟）', this.numberLine(form.dnsLeadMinutes, (value) => { this.form.dnsLeadMinutes = value }, { min: '0', max: '1440', step: '5', suffix: '分钟' })),
+        el('p', { class: 'field-hint account-fields__full', text: '仅管理一条 A 记录，TTL 固定 600 秒。提前时间为 5 分钟的倍数，0 表示关机时摘除。失败会告警，且不影响关机；定时摘除重试至实例停止，手动关机和熔断仅尝试一次。运行后自动恢复解析。' }),
+        el('p', { class: 'field-hint account-fields__full', text: '关闭联动或更换域名不会删除原域名记录；如需清理，请到 Cloudflare 操作。' }),
+        form.dnsError ? el('p', { class: 'field-hint account-fields__full', text: `最近 DNS 错误：${form.dnsError}` }) : null,
+      ] : []),
       el(
         'div',
         { class: 'account-fields__full toggle-list' },
@@ -975,6 +1015,13 @@ export class SettingsModal {
     }
 
     const payload: AccountInput = {
+      dns: {
+        enabled: form.dnsEnabled,
+        zone_id: form.dnsZoneId.trim(),
+        name: form.dnsName.trim(),
+        lead_minutes: form.dnsLeadMinutes,
+        ...(form.dnsToken.trim() ? { api_token: form.dnsToken.trim() } : {}),
+      },
       name: form.name.trim(),
       site_type: form.siteType,
       access_key_id: form.accessKeyId.trim(),

@@ -82,6 +82,13 @@ impl Scheduler {
                         details.push("已确认实例停止".into());
                     }
                     Ok(Some(instance)) if instance.is_running() => {
+                        self.dns_before_stop(
+                            account,
+                            &instance,
+                            &format!("threshold:{month}"),
+                            false,
+                        )
+                        .await;
                         match client
                             .stop_instance(id, &account.region_id, account.stop_mode())
                             .await

@@ -10,6 +10,8 @@ import { el } from '@/lib/dom'
 
 /** 动作类型 → 中文名。 */
 export const ACTION_LABELS: Record<string, string> = {
+  dns_synced: 'DNS 同步',
+  dns_failed: 'DNS 联动失败',
   threshold_triggered: '流量熔断',
   threshold_stop: '熔断停机',
   threshold_stop_failed: '熔断停机失败',
@@ -54,6 +56,7 @@ export const LOG_FILTERS = [
   ['spot', '保活'],
   ['manual', '手动'],
   ['notify', '通知'],
+  ['dns', 'DNS'],
 ] as const
 
 export type LogFilterKey = (typeof LOG_FILTERS)[number][0]

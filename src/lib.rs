@@ -41,6 +41,7 @@ mod aliyun;
 mod cron;
 mod crypto;
 mod db;
+mod dns;
 mod jobs;
 mod models;
 mod notify;
@@ -885,6 +886,16 @@ async fn handle_create_account(app: &AppCtx, mut req: Request) -> worker::Result
         Err(err) => return error_response(502, format!("无法核实云账号身份：{}", err.short())),
     };
 
+    let dns = match payload.dns.as_ref() {
+        Some(input) => match input.apply(&dns::DnsSettings::default(), &app.crypto, false) {
+            Ok(config) => config,
+            Err(message) => return error_response(400, message),
+        },
+        None => dns::DnsSettings::default(),
+    };
+    let dns_json =
+        serde_json::to_string(&dns).map_err(|e| worker::Error::RustError(e.to_string()))?;
+
     let id = app
         .db
         .create_account(
@@ -892,6 +903,7 @@ async fn handle_create_account(app: &AppCtx, mut req: Request) -> worker::Result
             payload.site_type.as_str(),
             payload.access_key_id.trim(),
             &cloud_id,
+            &dns_json,
             &encrypted,
             &payload.normalized_region(),
             payload.require_instance_id()?,
@@ -1047,10 +1059,41 @@ async fn update_account_locked(
         }
     }
 
+    let previous_dns = dns::DnsSettings::from_account(&existing);
+    let resource_changed = existing.cloud_account_id != cloud_id
+        || existing.region_id != payload.normalized_region()
+        || existing.instance_id_opt() != Some(payload.require_instance_id()?);
+    let dns = match payload.dns.as_ref() {
+        Some(input) => match input.apply(&previous_dns, &app.crypto, resource_changed) {
+            Ok(config) => config,
+            Err(message) => return error_response(400, message),
+        },
+        None => {
+            let mut config = previous_dns;
+            if resource_changed {
+                config.state.drain_at = None;
+                config.state.paused = false;
+                config.state.seen_stopped = false;
+                config.state.once_event = None;
+                config.state.attempt_slot = None;
+                config.state.pending_ip = config
+                    .state
+                    .pending_ip
+                    .take()
+                    .or(config.state.published_ip.take());
+                config.state.last_error = None;
+            }
+            config
+        }
+    };
+    let dns_json =
+        serde_json::to_string(&dns).map_err(|e| worker::Error::RustError(e.to_string()))?;
+
     app.db
         .update_account(
             account_id,
             &existing,
+            &dns_json,
             cloud_id.as_deref(),
             payload.name.trim(),
             payload.site_type.as_str(),

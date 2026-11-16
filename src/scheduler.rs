@@ -33,6 +33,7 @@ use std::collections::HashMap;
 
 use crate::aliyun::AliyunClient;
 use crate::crypto::{Crypto, random_hex};
+mod dns;
 mod schedule;
 mod threshold;
 use crate::db::Db;
@@ -574,6 +575,7 @@ impl Scheduler {
         });
         if can_release {
             self.db.clear_threshold(account.id).await?;
+            self.dns_release_threshold(account).await;
             self.db
                 .add_log(
                     Some(account.id),
@@ -590,6 +592,13 @@ impl Scheduler {
                 || already_triggered)
         {
             threshold_fired = self.handle_threshold(account, used_gb, pool).await?;
+        }
+
+        if instances_fresh && let Some(instance) = instances.first() {
+            let blocked = !can_release
+                && account.action() == OverLimitAction::StopAndNotify
+                && (already_triggered || threshold_fired);
+            self.dns_reconcile(account, instance, blocked).await;
         }
 
         for warning in &sync.warnings {
@@ -893,6 +902,12 @@ impl Scheduler {
         let client = AliyunClient::from_account(account, self.account_secret(account)?);
         let region_id = &account.region_id;
         let instance = self.refresh_instance_locked(account).await?;
+        if start {
+            self.dns_resume(account).await;
+        }
+        if start && instance.is_running() {
+            self.dns_reconcile(account, &instance, false).await;
+        }
         if (start && instance.is_running()) || (!start && instance.is_stopped()) {
             return Ok(if start {
                 "已核实实例正在运行，无需开机"
@@ -907,6 +922,10 @@ impl Scheduler {
             ));
         }
 
+        if !start {
+            self.dns_before_stop(account, &instance, &format!("manual:{}", now_ms()), false)
+                .await;
+        }
         let result = if start {
             client.start_instance(instance_id, region_id).await
         } else {
@@ -1387,6 +1406,7 @@ mod tests {
 
     fn account_with_schedule(start: Option<&str>, stop: Option<&str>) -> AccountRow {
         AccountRow {
+            dns_json: "{}".into(),
             cloud_account_id: None,
             config_version: 1,
             id: 1,
@@ -1578,6 +1598,27 @@ mod tests {
     }
 
     #[test]
+    fn dns_stop_time_handles_midnight_and_advanced_schedule() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-17T15:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut account = account_with_schedule(None, Some("00:10"));
+        let expected = now + 70 * 60_000;
+        assert_eq!(
+            crate::dns::next_stop(&account, "UTC+8", now),
+            Some(expected)
+        );
+        account.schedule_mode = Some("advanced".into());
+        account.schedule_stop_cron = Some("10 0 * * *".into());
+        assert_eq!(
+            crate::dns::next_stop(&account, "UTC+8", now),
+            Some(expected)
+        );
+        account.schedule_stop_cron = None;
+        assert_eq!(crate::dns::next_stop(&account, "UTC+8", now), None);
+    }
+
+    #[test]
     fn site_and_mode_defaults() {
         assert_eq!(SiteType::from_db("intl").label(), "国际站");
         assert_eq!(StopMode::from_db("KeepCharging").label(), "普通停机");
@@ -1595,6 +1636,7 @@ mod tests {
         stop: Option<&str>,
     ) -> AccountRow {
         AccountRow {
+            dns_json: "{}".into(),
             schedule_mode: mode.map(|s| s.to_string()),
             schedule_start_cron: start.map(|s| s.to_string()),
             schedule_stop_cron: stop.map(|s| s.to_string()),
