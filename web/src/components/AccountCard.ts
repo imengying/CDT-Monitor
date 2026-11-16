@@ -61,17 +61,13 @@ function fallbackCopy(text: string): boolean {
   }
 }
 
-/**
- * 缩短 IPv6 显示。
- *
- * 完整地址 39 字符会撑破卡片标题区，只留第一组与末位：
- * `2408:8207…9f3c`。悬停时通过 `data-tip` 展示完整值。
- */
-function shortenIpv6(value: string): string {
-  if (value.length <= 18) return value
-  const head = value.slice(0, 9)
-  const tail = value.slice(-4)
-  return `${head}…${tail}`
+/** IPv4 保留前两段；IPv6 保留前两组，其余隐藏。 */
+function maskAddress(value: string): string {
+  if (value.includes(':')) {
+    const [first, second] = value.split(':')
+    return `${first || '0'}:${second || '0'}:*`
+  }
+  return `${value.split('.').slice(0, 2).join('.')}.*.*`
 }
 
 /**
@@ -113,6 +109,7 @@ export class AccountCard {
   private root: HTMLElement
   private account: AccountOverview
   private signature = ''
+  private addressesVisible = false
 
   /** 正在执行中的操作键：`refresh` / `start` / `stop` / `keepalive`。 */
   private readonly busy = new Set<string>()
@@ -138,6 +135,15 @@ export class AccountCard {
    * 无条件重建会让正在聚焦的按钮丢焦点、重置滚动位置。
    */
   update(account: AccountOverview): void {
+    const previousInstance = this.account.instances[0]
+    const nextInstance = account.instances[0]
+    if (
+      previousInstance?.instance_id !== nextInstance?.instance_id
+      || previousInstance?.public_ip !== nextInstance?.public_ip
+      || previousInstance?.public_ipv6 !== nextInstance?.public_ipv6
+    ) {
+      this.addressesVisible = false
+    }
     const next = signatureOf(account)
     if (next === this.signature) {
       this.account = account
@@ -235,7 +241,7 @@ export class AccountCard {
   /**
    * 公网地址行（IPv4 / IPv6）。
    *
-   * 点地址本身即复制，不另放按钮——多一个图标反而挤。
+   * 默认遮盖地址，眼睛按钮切换完整显示；点地址仍复制完整值。
    * 实例停机后阿里云收回公网地址，此时显示「未分配」；
    * 快照还没采过（`snapshot_updated_at` 为空）时是「等待同步」。
    */
@@ -251,18 +257,43 @@ export class AccountCard {
       return el('span', { class: 'account-address account-address--empty', text })
     }
 
+    const values = addresses.map((address) =>
+      el('button', {
+        class: 'account-address__value',
+        type: 'button',
+        'aria-label': address.version === 'v6' ? '复制完整 IPv6 地址' : '复制完整 IPv4 地址',
+        'data-tip': '复制完整 IP',
+        on: { click: () => void this.copyAddress(address.value) },
+      }),
+    )
+    const toggle = el('button', {
+      class: 'account-address__toggle',
+      type: 'button',
+      on: {
+        click: () => {
+          this.addressesVisible = !this.addressesVisible
+          renderVisibility()
+        },
+      },
+    })
+    const renderVisibility = () => {
+      values.forEach((node, index) => {
+        const value = addresses[index]!.value
+        node.textContent = this.addressesVisible ? value : maskAddress(value)
+      })
+      const label = this.addressesVisible ? '隐藏完整 IP' : '查看完整 IP'
+      toggle.setAttribute('aria-label', label)
+      toggle.setAttribute('data-tip', label)
+      toggle.setAttribute('aria-pressed', String(this.addressesVisible))
+      replaceChildren(toggle, iconSvg(this.addressesVisible ? icons.eyeOff : icons.eye, 14))
+    }
+    renderVisibility()
+
     return el(
       'span',
       { class: 'account-address' },
-      ...addresses.map((address) =>
-        el('code', {
-          class: 'account-address__value',
-          text: address.version === 'v6' ? shortenIpv6(address.value) : address.value,
-          // 完整的 IPv6 很长，悬停时才展开
-          'data-tip': address.value,
-          on: { click: () => void this.copyAddress(address.value) },
-        }),
-      ),
+      el('span', { class: 'account-address__list' }, ...values),
+      toggle,
     )
   }
 
