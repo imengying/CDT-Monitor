@@ -24,8 +24,8 @@
 //! | ECS 查询/控制 | `ecs.aliyuncs.com` | 2014-05-26 | `DescribeInstances` / `StartInstance` / `StopInstance` |
 //! | 账户余额 | `business.aliyuncs.com` | 2017-12-14 | `QueryAccountBalance` |
 //!
-//! 国际站把域名换成 `*.ap-southeast-1.aliyuncs.com`（BSS 为
-//! `business.ap-southeast-1.aliyuncs.com`）。
+//! 国际站 CDT / BSS 使用新加坡端点；ECS 使用实例所属地域的端点
+//! `ecs.{region_id}.aliyuncs.com`，不能把国际站实例一律当作新加坡实例。
 //!
 //! ## 重试
 //!
@@ -165,7 +165,7 @@ impl AliyunError {
 // 端点
 // ===========================================================================
 
-/// 三种服务端点（可被环境变量覆盖）。
+/// 三种服务端点。
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub cdt: String,
@@ -174,8 +174,8 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
-    /// 按站点返回端点。
-    pub fn for_site(site: SiteType) -> Self {
+    /// 按站点和实例地域返回端点。国际站 ECS 必须使用目标地域的端点。
+    pub fn for_region(site: SiteType, region_id: &str) -> Self {
         match site {
             SiteType::China => Self {
                 cdt: "https://cdt.aliyuncs.com".to_string(),
@@ -184,7 +184,10 @@ impl Endpoints {
             },
             SiteType::Intl => Self {
                 cdt: "https://cdt.ap-southeast-1.aliyuncs.com".to_string(),
-                ecs: "https://ecs.ap-southeast-1.aliyuncs.com".to_string(),
+                ecs: format!(
+                    "https://ecs.{}.aliyuncs.com",
+                    region_id.trim().to_ascii_lowercase()
+                ),
                 bss: "https://business.ap-southeast-1.aliyuncs.com".to_string(),
             },
         }
@@ -298,7 +301,7 @@ impl AliyunClient {
             account.access_key_id.clone(),
             secret,
             account.site(),
-            Endpoints::for_site(account.site()),
+            Endpoints::for_region(account.site(), &account.region_id),
         )
     }
 
@@ -494,11 +497,7 @@ impl AliyunClient {
             )
             .await?;
 
-        let instances = extract_array(&value, &["Instances", "Instance"]);
-        Ok(instances
-            .iter()
-            .find(|item| item.get("InstanceId").and_then(Value::as_str) == Some(instance_id))
-            .map(|item| parse_instance(item, region_id)))
+        parse_described_instance(&value, region_id, instance_id)
     }
 
     /// 从 ECS 的弹性网卡列表补取 IPv6。查询失败时由调用方保留实例的其它字段，
@@ -795,16 +794,29 @@ fn json_to_i64(value: &Value) -> Option<i64> {
     value.as_str()?.trim().parse::<i64>().ok()
 }
 
-/// 取形如 `{"Instances": {"Instance": [...]}}` 的数组。
-fn extract_array(value: &Value, path: &[&str]) -> Vec<Value> {
-    let mut cursor = value;
-    for key in path {
-        match cursor.get(*key) {
-            Some(next) => cursor = next,
-            None => return Vec::new(),
-        }
-    }
-    cursor.as_array().cloned().unwrap_or_default()
+/// 仅真正的实例数组可以用于判断实例不存在；响应结构异常应单独报错。
+fn parse_described_instance(
+    value: &Value,
+    region_id: &str,
+    instance_id: &str,
+) -> Result<Option<InstanceInfo>, AliyunError> {
+    let instances = value
+        .get("Instances")
+        .and_then(|instances| instances.get("Instance"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AliyunError::Parse(format!(
+                "DescribeInstances 缺少有效的 Instances.Instance 数组（RequestId {}）",
+                value
+                    .get("RequestId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+            ))
+        })?;
+    Ok(instances
+        .iter()
+        .find(|item| item.get("InstanceId").and_then(Value::as_str) == Some(instance_id))
+        .map(|item| parse_instance(item, region_id)))
 }
 
 /// 从上到下取出第一个非空地址。
@@ -1640,13 +1652,65 @@ mod tests {
     }
 
     #[test]
-    fn endpoints_by_site() {
-        let china = Endpoints::for_site(SiteType::China);
-        assert_eq!(china.cdt, "https://cdt.aliyuncs.com");
-        assert_eq!(china.bss, "https://business.aliyuncs.com");
+    fn endpoints_by_site_and_region() {
+        for region in ["cn-hongkong", "ap-southeast-1", "ap-northeast-1"] {
+            let china = Endpoints::for_region(SiteType::China, region);
+            assert_eq!(china.ecs, "https://ecs.aliyuncs.com");
+            assert_eq!(china.cdt, "https://cdt.aliyuncs.com");
+            assert_eq!(china.bss, "https://business.aliyuncs.com");
 
-        let intl = Endpoints::for_site(SiteType::Intl);
-        assert_eq!(intl.ecs, "https://ecs.ap-southeast-1.aliyuncs.com");
-        assert_eq!(intl.bss, "https://business.ap-southeast-1.aliyuncs.com");
+            let intl = Endpoints::for_region(SiteType::Intl, region);
+            assert_eq!(intl.ecs, format!("https://ecs.{region}.aliyuncs.com"));
+            assert_eq!(intl.cdt, "https://cdt.ap-southeast-1.aliyuncs.com");
+            assert_eq!(intl.bss, "https://business.ap-southeast-1.aliyuncs.com");
+        }
+        assert_eq!(
+            Endpoints::for_region(SiteType::Intl, " CN-HONGKONG ").ecs,
+            "https://ecs.cn-hongkong.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn describe_instance_distinguishes_missing_instance_from_malformed_response() {
+        let empty = serde_json::json!({"Instances": {"Instance": []}});
+        assert!(
+            parse_described_instance(&empty, "cn-hongkong", "i-test")
+                .unwrap()
+                .is_none()
+        );
+
+        let found = serde_json::json!({"Instances": {"Instance": [
+            {"InstanceId": "i-other"}, {"InstanceId": "i-test", "Status": "Running"}
+        ]}});
+        let instance = parse_described_instance(&found, "cn-hongkong", "i-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(instance.instance_id, "i-test");
+        assert_eq!(instance.region_id, "cn-hongkong");
+        assert_eq!(instance.status, "Running");
+        assert!(
+            parse_described_instance(&found, "cn-hongkong", "i-missing")
+                .unwrap()
+                .is_none()
+        );
+
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"Instances": {}}),
+            serde_json::json!({"Instances": {"Instance": null}}),
+            serde_json::json!({"Instances": {"Instance": {"InstanceId": "i-test"}}}),
+        ] {
+            assert!(matches!(
+                parse_described_instance(&response, "cn-hongkong", "i-test"),
+                Err(AliyunError::Parse(_))
+            ));
+        }
+        let error = parse_described_instance(
+            &serde_json::json!({"RequestId": "request-test"}),
+            "cn-hongkong",
+            "i-test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("request-test"));
     }
 }

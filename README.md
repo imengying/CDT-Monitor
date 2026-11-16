@@ -505,6 +505,8 @@ Cron 派发端检查启用账号的流量和实例最近成功采集时间，超
 | ECS 控制 | `StartInstance` / `StopInstance`（含 `StoppedMode`） | 2014-05-26 |
 | 余额 | `QueryAccountBalance` | 2017-12-14 |
 
+中国站 ECS 沿用 `ecs.aliyuncs.com`；国际站 ECS 按实例地域使用 `ecs.{region_id}.aliyuncs.com`（例如香港为 `ecs.cn-hongkong.aliyuncs.com`），查询、网卡查询和启停共用该地域端点。国际站 CDT 与余额服务继续使用各自的新加坡端点。账号保存时通过 STS 核实凭据身份，实例是否存在由后续 ECS 查询核实；响应缺少有效的实例数组时单独报解析错误，不当作实例不存在。
+
 `ListCdtInternetTraffic` 返回的 `Traffic` 单位是 **Byte**（与计费项 Code `ECS_Out_Bytes` / `Eip_Out_Bytes` 的底层口径一致），控制台与账单才换算成 GB。`traffic_unit_is_bytes` 测试钉死这一点。
 
 #### 免费额度与阈值

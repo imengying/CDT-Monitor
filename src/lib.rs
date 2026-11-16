@@ -876,7 +876,7 @@ async fn handle_create_account(app: &AppCtx, mut req: Request) -> worker::Result
         payload.access_key_id.trim(),
         secret,
         payload.site_type,
-        aliyun::Endpoints::for_site(payload.site_type),
+        aliyun::Endpoints::for_region(payload.site_type, &payload.normalized_region()),
     )
     .caller_account_id()
     .await
@@ -1009,7 +1009,7 @@ async fn update_account_locked(
             &access_key_id,
             secret,
             payload.site_type,
-            aliyun::Endpoints::for_site(payload.site_type),
+            aliyun::Endpoints::for_region(payload.site_type, &payload.normalized_region()),
         )
         .caller_account_id()
         .await

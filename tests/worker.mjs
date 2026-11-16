@@ -36,6 +36,10 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
     state.requests++
     const url = new URL(request.url)
     const action = url.searchParams.get('Action')
+    if (['DescribeInstances', 'DescribeNetworkInterfaces', 'StartInstance', 'StopInstance'].includes(action)) {
+      assert.equal(url.searchParams.get('RegionId'), 'cn-hongkong')
+      assert.equal(url.hostname, 'ecs.cn-hongkong.aliyuncs.com', `${action} must use the Hong Kong ECS endpoint for the international account`)
+    }
     const fail = () => Response.json({ Code: 'Forbidden', Message: 'fixture failure' }, { status: 403 })
     if (url.origin === 'https://api.telegram.org') {
       state.notifications++

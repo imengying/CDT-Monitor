@@ -393,7 +393,12 @@ impl Scheduler {
             .await
             .map_err(|err| worker::Error::RustError(err.query_failure("实例查询")))?
             .ok_or_else(|| {
-                worker::Error::RustError("云端找不到配置的实例，请核实地域和实例 ID".into())
+                worker::Error::RustError(format!(
+                    "云端找不到配置的实例（{}，地域 {}，实例 {}），请核实地域、实例 ID 和 AccessKey 所属账号",
+                    account.site().label(),
+                    account.region_id,
+                    account.instance_id_opt().unwrap_or_default()
+                ))
             })?;
         instance.keep_alive = account.is_spot_keep_alive();
         if let Some(previous) = self
