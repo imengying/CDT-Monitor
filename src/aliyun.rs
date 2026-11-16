@@ -20,11 +20,11 @@
 //!
 //! | 用途 | 域名 | Version | Action |
 //! |---|---|---|---|
-//! | CDT 流量 | `cdt.aliyuncs.com` | 2021-08-13 | `ListCdtInternetTraffic`（失败回退 `GetCdtInternetTraffic`） |
+//! | CDT 流量 | `cdt.aliyuncs.com` | 2021-08-13 | `ListCdtInternetTraffic` |
 //! | ECS 查询/控制 | `ecs.aliyuncs.com` | 2014-05-26 | `DescribeInstances` / `StartInstance` / `StopInstance` |
 //! | 账户余额 | `business.aliyuncs.com` | 2017-12-14 | `QueryAccountBalance` |
 //!
-//! 国际站 CDT / BSS 使用新加坡端点；ECS 使用实例所属地域的端点
+//! CDT 两站共用全局端点，国际站 BSS 使用新加坡端点；ECS 使用实例所属地域的端点
 //! `ecs.{region_id}.aliyuncs.com`，不能把国际站实例一律当作新加坡实例。
 //!
 //! ## 重试
@@ -174,7 +174,7 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
-    /// 按站点和实例地域返回端点。国际站 ECS 必须使用目标地域的端点。
+    /// CDT 使用全局端点；仅国际站 ECS 按实例地域选择，BSS 使用新加坡端点。
     pub fn for_region(site: SiteType, region_id: &str) -> Self {
         match site {
             SiteType::China => Self {
@@ -183,7 +183,7 @@ impl Endpoints {
                 bss: "https://business.aliyuncs.com".to_string(),
             },
             SiteType::Intl => Self {
-                cdt: "https://cdt.ap-southeast-1.aliyuncs.com".to_string(),
+                cdt: "https://cdt.aliyuncs.com".to_string(),
                 ecs: format!(
                     "https://ecs.{}.aliyuncs.com",
                     region_id.trim().to_ascii_lowercase()
@@ -1661,7 +1661,7 @@ mod tests {
 
             let intl = Endpoints::for_region(SiteType::Intl, region);
             assert_eq!(intl.ecs, format!("https://ecs.{region}.aliyuncs.com"));
-            assert_eq!(intl.cdt, "https://cdt.ap-southeast-1.aliyuncs.com");
+            assert_eq!(intl.cdt, "https://cdt.aliyuncs.com");
             assert_eq!(intl.bss, "https://business.ap-southeast-1.aliyuncs.com");
         }
         assert_eq!(

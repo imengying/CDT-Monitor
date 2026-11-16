@@ -102,6 +102,7 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
     switch (action) {
       case 'GetCallerIdentity': return url.searchParams.get('AccessKeyId') === 'invalid-key' ? fail() : Response.json({ AccountId: url.searchParams.get('AccessKeyId') === 'replacement-key' ? '2002' : '1001' })
       case 'ListCdtInternetTraffic':
+        assert.equal(url.hostname, 'cdt.aliyuncs.com', 'international CDT traffic must use the global endpoint, independent of ECS region')
         state.trafficCalls++
         state.trafficAttempts?.push({ nonce: url.searchParams.get('SignatureNonce'), timestamp: url.searchParams.get('Timestamp'), signature: url.searchParams.get('Signature') })
         if (state.trafficResponses.length) {
