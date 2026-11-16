@@ -83,7 +83,7 @@ impl JobTask {
 /// 执行一个 Job：置 running → 跑任务 → 置 success/failed → 释放互斥锁。
 pub(crate) async fn execute_job(env: Env, job_id: String) -> worker::Result<()> {
     // 包含领取、初始化、外部调用和数据库收尾的总预算。
-    crate::runtime::timeout(28_000, async {
+    crate::runtime::timeout(58_000, async {
         execute_segment(env.clone(), job_id.clone()).await;
         if let Some(row) = Db::new(&env).get_job(&job_id).await? {
             match row.status.as_str() {
@@ -133,7 +133,7 @@ async fn execute_segment(env: Env, job_id: String) {
         }
     };
 
-    let result = crate::runtime::timeout((24_000 - (now_ms() - began)).max(1) as u64, async {
+    let result = crate::runtime::timeout((55_000 - (now_ms() - began)).max(1) as u64, async {
         match task {
             JobTask::RefreshAll => Err(worker::Error::RustError("批量任务尚未初始化".into())),
             JobTask::RefreshBatch {

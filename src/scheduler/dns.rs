@@ -351,7 +351,7 @@ impl Scheduler {
                     .await?;
             }
             if alert {
-                self.notify(
+                self.dns_alerts.borrow_mut().push(
                     Message::alert(
                         format!("{} DNS 联动失败", account.name),
                         format!(
@@ -360,8 +360,7 @@ impl Scheduler {
                         ),
                     )
                     .with_group("CDT-DNS"),
-                )
-                .await;
+                );
             }
         } else {
             self.db
@@ -376,6 +375,17 @@ impl Scheduler {
         }
         Ok(())
     }
+    /// 不派发新任务；本轮控制操作结束后发送，仍保持每个事件最多尝试一次。
+    pub(super) async fn flush_dns_alerts(&self) {
+        let messages = std::mem::take(&mut *self.dns_alerts.borrow_mut());
+        let _ = crate::runtime::timeout(5_000, async {
+            for message in messages {
+                self.notify(message).await;
+            }
+        })
+        .await;
+    }
+
     /// 显式开机允许撤销失败手动停机留下的暂停状态；实际添加仍等待 Running。
     pub(super) async fn dns_resume(&self, account: &AccountRow) {
         if !DnsSettings::from_account(account).enabled {

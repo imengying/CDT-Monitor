@@ -10,6 +10,7 @@ impl Scheduler {
         account: &AccountRow,
         used_gb: f64,
         pool: QuotaPool,
+        fresh_instance: Option<&InstanceInfo>,
     ) -> worker::Result<bool> {
         // 手动刷新停用账号仍可读取数据，但不能顺带执行自动熔断。
         if !account.is_enabled() {
@@ -27,7 +28,7 @@ impl Scheduler {
         }
 
         let result = self
-            .reconcile_threshold(account, used_gb, pool, &billing_month)
+            .reconcile_threshold(account, used_gb, pool, &billing_month, fresh_instance)
             .await;
         let _ = self.db.release_lock(&lock_name, &owner).await;
         result
@@ -39,6 +40,7 @@ impl Scheduler {
         used_gb: f64,
         pool: QuotaPool,
         month: &str,
+        fresh_instance: Option<&InstanceInfo>,
     ) -> worker::Result<bool> {
         let snapshot = self.db.get_snapshot(account.id).await?;
         let first = !snapshot
@@ -76,7 +78,12 @@ impl Scheduler {
             // 每轮核实真实状态，Starting/查询失败都留在 pending，下一轮继续处理。
             if let Some(id) = account.instance_id_opt() {
                 let client = AliyunClient::from_account(account, self.account_secret(account)?);
-                match client.describe_instance(&account.region_id, id).await {
+                // 账号操作租约内复用本轮新鲜结果，避免熔断重复查询 ECS。
+                let instance = match fresh_instance {
+                    Some(instance) => Ok(Some(instance.clone())),
+                    None => client.describe_instance(&account.region_id, id).await,
+                };
+                match instance {
                     Ok(Some(instance)) if instance.is_stopped() => {
                         status = "confirmed";
                         details.push("已确认实例停止".into());
