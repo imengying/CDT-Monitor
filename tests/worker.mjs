@@ -65,7 +65,7 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
       }
       const body = await request.json()
       assert.equal(body.type, 'A')
-      assert.equal(body.ttl, 600)
+      assert.equal(body.ttl, 300)
       assert.equal(body.proxied, false)
       assert.equal(body.name, 'dns-test.example.com')
       let record
@@ -1118,7 +1118,7 @@ try {
   await dnsRefresh()
   assert.equal(state.dnsRecords.length, 1)
   assert.equal(state.dnsRecords[0].content, state.publicIp)
-  console.log('✓ DNS 配置验证、凭据加密、TTL 600、稳定状态零请求与公网 IP 变化更新')
+  console.log('✓ DNS 配置验证、凭据加密、TTL 300、稳定状态零请求与公网 IP 变化更新')
 
   state.dnsRecords.push({ id: 'other-node', type: 'A', name: dnsInput.name, content: '192.0.2.99' })
   state.dnsDeleteFailed = true

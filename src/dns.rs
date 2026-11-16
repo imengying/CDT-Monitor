@@ -1,11 +1,11 @@
-//! Cloudflare DNS-only A 记录联动。稳定状态不请求 API，TTL 固定 600 秒。
+//! Cloudflare DNS-only A 记录联动。稳定状态不请求 API，TTL 固定 300 秒。
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use worker::{Headers, Method, Request, RequestInit, wasm_bindgen::JsValue};
 
 use crate::{crypto::Crypto, models::AccountRow};
 
-pub const TTL: u32 = 600;
+pub const TTL: u32 = 300;
 pub const TICK_MS: i64 = 5 * 60_000;
 fn default_lead() -> u32 {
     30

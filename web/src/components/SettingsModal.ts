@@ -936,7 +936,7 @@ export class SettingsModal {
         field('完整域名', this.line(form.dnsName, (value) => { this.form.dnsName = value }, { placeholder: 'app.example.com' })),
         field('Cloudflare API Token', this.line(form.dnsToken, (value) => { this.form.dnsToken = value }, { type: 'password', placeholder: form.dnsTokenConfigured ? '已配置，留空保持不变' : '指定 Zone 的 DNS 编辑权限' })),
         field('提前摘除（分钟）', this.numberLine(form.dnsLeadMinutes, (value) => { this.form.dnsLeadMinutes = value }, { min: '0', max: '1440', step: '5', suffix: '分钟' })),
-        el('p', { class: 'field-hint account-fields__full', text: '仅管理一条 A 记录，TTL 固定 600 秒。提前时间为 5 分钟的倍数，0 表示关机时摘除。失败会告警，且不影响关机；定时摘除重试至实例停止，手动关机和熔断仅尝试一次。运行后自动恢复解析。' }),
+        el('p', { class: 'field-hint account-fields__full', text: '仅管理一条 A 记录，TTL 固定 300 秒。提前时间为 5 分钟的倍数，0 表示关机时摘除。失败会告警，且不影响关机；定时摘除重试至实例停止，手动关机和熔断仅尝试一次。运行后自动恢复解析。' }),
         el('p', { class: 'field-hint account-fields__full', text: '关闭联动或更换域名不会删除原域名记录；如需清理，请到 Cloudflare 操作。' }),
         form.dnsError ? el('p', { class: 'field-hint account-fields__full', text: `最近 DNS 错误：${form.dnsError}` }) : null,
       ] : []),
