@@ -107,6 +107,8 @@ impl Scheduler {
             let secret = self.account_secret(account)?;
             let client = AliyunClient::from_account(account, secret);
             for instance in &running {
+                self.dns_before_stop(account, instance, &format!("schedule:{dedupe_key}"), true)
+                    .await;
                 match client
                     .stop_instance(
                         &instance.instance_id,

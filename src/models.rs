@@ -518,6 +518,8 @@ impl HistoryBucket {}
 /// `accounts` 表行。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccountRow {
+    #[serde(default)]
+    pub dns_json: String,
     pub id: i64,
     pub cloud_account_id: Option<String>,
     pub config_version: i64,
@@ -623,6 +625,7 @@ impl AccountRow {
     /// 界面展示用的账号 DTO（不含任何密文）。
     pub fn to_dto(&self) -> AccountDto {
         AccountDto {
+            dns: crate::dns::DnsSettings::from_account(self).dto(),
             id: self.id,
             name: self.name.clone(),
             site_type: self.site(),
@@ -1120,6 +1123,7 @@ pub struct AcceptedJob {
 /// 账号 DTO（设置面板用，绝不含密文）。
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountDto {
+    pub dns: crate::dns::DnsDto,
     pub id: i64,
     pub name: String,
     pub site_type: SiteType,
@@ -1154,6 +1158,8 @@ pub struct AccountDto {
 /// 账号新增 / 修改请求体。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountInput {
+    #[serde(default)]
+    pub dns: Option<crate::dns::DnsInput>,
     pub name: String,
     pub site_type: SiteType,
     /// 修改时留空表示沿用原值。
@@ -1695,6 +1701,7 @@ mod tests {
     #[test]
     fn account_input_requires_instance_id() {
         let base = AccountInput {
+            dns: None,
             name: "测试节点".to_string(),
             site_type: SiteType::China,
             access_key_id: "LTAI5tTestKey123".to_string(),
@@ -1897,6 +1904,7 @@ mod tests {
     #[test]
     fn overview_synthesizes_instance_without_snapshot() {
         let account = AccountRow {
+            dns_json: "{}".into(),
             cloud_account_id: None,
             config_version: 1,
             id: 1,
@@ -1941,6 +1949,7 @@ mod tests {
     #[test]
     fn overview_keeps_snapshot_instances() {
         let account = AccountRow {
+            dns_json: "{}".into(),
             cloud_account_id: None,
             config_version: 1,
             id: 2,

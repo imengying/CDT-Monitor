@@ -1254,22 +1254,51 @@ h3 {
   margin-top: 3px;
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 4px 8px;
+  gap: 4px;
   color: var(--muted);
   font-size: 11px;
   min-width: 0;
 }
 
+.account-address__list {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
 /* 地址本身即复制入口：等宽字体 + 手型光标，悬停时轻微提亮 */
 .account-address__value {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 11px;
   letter-spacing: 0.01em;
   border-radius: 4px;
   cursor: pointer;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
   transition: color var(--duration-fast) var(--ease-out);
+}
+
+.account-address__toggle {
+  display: grid;
+  place-items: center;
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.account-address__toggle:hover {
+  color: var(--ink);
+  background: var(--surface-track);
 }
 
 .account-address__value:hover {

@@ -17,6 +17,13 @@ state.stallNetwork = false
 state.networkPages = null
 state.balanceCalls = 0
 state.instanceCalls = 0
+state.publicIp = null
+state.dnsRecords = []
+state.dnsCalls = 0
+state.dnsDeletes = 0
+state.dnsDeleteFailed = false
+state.dnsWriteUnknown = false
+state.controlEvents = []
 let trafficGate = null
 let instanceGate = null
 const testDirectory = await mkdtemp(resolve(tmpdir(), 'cdt-worker-test-'))
@@ -35,11 +42,61 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
   outboundService: async request => {
     state.requests++
     const url = new URL(request.url)
+    if (url.hostname === 'api.cloudflare.com') {
+      state.dnsCalls++
+      assert.equal(request.headers.get('authorization'), 'Bearer fixture-dns-token')
+      assert.match(url.pathname, /^\/client\/v4\/zones\/a{32}\/dns_records/)
+      const recordId = url.pathname.split('/')[6]
+      const ok = result => Response.json({ success: true, result })
+      if (request.method === 'GET') {
+        assert.equal(url.searchParams.get('type'), 'A')
+        assert.equal(url.searchParams.get('name'), 'dns-test.example.com')
+        assert.ok(url.searchParams.get('content'), 'never scan a zone or all records for the hostname')
+        return ok(state.dnsRecords.filter(record => record.name === url.searchParams.get('name') && record.content === url.searchParams.get('content')))
+      }
+      if (request.method === 'DELETE') {
+        state.dnsDeletes++
+        state.controlEvents.push('dns-delete')
+        if (state.dnsDeleteDelay) await new Promise(resolve => setTimeout(resolve, state.dnsDeleteDelay))
+        if (state.dnsDeleteFailed) return Response.json({ success: false, errors: [{ code: 10000 }] }, { status: 403 })
+        const found = state.dnsRecords.findIndex(record => record.id === recordId)
+        if (found < 0) return Response.json({ success: false }, { status: 404 })
+        state.dnsRecords.splice(found, 1)
+        return ok({ id: recordId })
+      }
+      const body = await request.json()
+      assert.equal(body.type, 'A')
+      assert.equal(body.ttl, 300)
+      assert.equal(body.proxied, false)
+      assert.equal(body.name, 'dns-test.example.com')
+      let record
+      if (request.method === 'PATCH') {
+        record = state.dnsRecords.find(record => record.id === recordId)
+        if (!record) return Response.json({ success: false }, { status: 404 })
+        Object.assign(record, body)
+      } else {
+        assert.equal(request.method, 'POST')
+        record = { id: `record-${state.dnsCalls}`, ...body }
+        state.dnsRecords.push(record)
+      }
+      if (state.dnsWriteUnknown) {
+        state.dnsWriteUnknown = false
+        return Response.json({ success: false, errors: [{ code: 10001 }] }, { status: 500 })
+      }
+      return ok(record)
+    }
     const action = url.searchParams.get('Action')
+    if (['DescribeInstances', 'DescribeNetworkInterfaces', 'StartInstance', 'StopInstance'].includes(action)) {
+      assert.equal(url.searchParams.get('RegionId'), 'cn-hongkong')
+      assert.equal(url.hostname, 'ecs.cn-hongkong.aliyuncs.com', `${action} must use the Hong Kong ECS endpoint for the international account`)
+    }
     const fail = () => Response.json({ Code: 'Forbidden', Message: 'fixture failure' }, { status: 403 })
     if (url.origin === 'https://api.telegram.org') {
       state.notifications++
-      state.lastTelegram = { path: url.pathname, body: await request.text() }
+      const notifyBody = await request.text()
+      if (notifyBody.includes('DNS')) state.controlEvents.push('dns-alert')
+      if (state.notifyDelay) await new Promise(resolve => setTimeout(resolve, state.notifyDelay))
+      state.lastTelegram = { path: url.pathname, body: notifyBody }
       return state.notifyFailed ? fail() : Response.json({ ok: true })
     }
     if (url.hostname === 'bark-preview.test') {
@@ -49,6 +106,7 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
     switch (action) {
       case 'GetCallerIdentity': return url.searchParams.get('AccessKeyId') === 'invalid-key' ? fail() : Response.json({ AccountId: url.searchParams.get('AccessKeyId') === 'replacement-key' ? '2002' : '1001' })
       case 'ListCdtInternetTraffic':
+        assert.equal(url.hostname, 'cdt.aliyuncs.com', 'international CDT traffic must use the global endpoint, independent of ECS region')
         state.trafficCalls++
         state.trafficAttempts?.push({ nonce: url.searchParams.get('SignatureNonce'), timestamp: url.searchParams.get('Timestamp'), signature: url.searchParams.get('Signature') })
         if (state.trafficResponses.length) {
@@ -64,12 +122,17 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
         return state.balanceFailed ? fail() : Response.json({ Data: { AvailableAmount: '42.00', Currency: 'USD' } })
       case 'DescribeInstances': {
         state.instanceCalls++
+        if (state.slowDescribeAttempts > 0) {
+          state.slowDescribeAttempts--
+          await new Promise(resolve => setTimeout(resolve, 3800))
+          if (state.slowDescribeAttempts > 0) return Response.json({ Code: 'ServiceUnavailable' }, { status: 503 })
+        }
         if (instanceGate) await instanceGate
         if (state.instancesFailed) return fail()
         // 官方接口仅在请求扩展属性时返回主网卡 IPv6，避免只测解析器而漏测请求。
         const ipv6Sets = !state.hideInstanceIpv6 && url.searchParams.get('AdditionalAttributes.1') === 'NETWORK_PRIMARY_ENI_IP' && state.ipv6
           ? [{ Ipv6Address: state.ipv6, Primary: true }] : []
-        return Response.json({ Instances: { Instance: [{ InstanceId: state.instanceId, RegionId: 'cn-hongkong', Status: state.status, SpotStrategy: state.spot ? 'SpotAsPriceGo' : 'NoSpot',
+        return Response.json({ Instances: { Instance: [{ InstanceId: state.instanceId, RegionId: 'cn-hongkong', Status: state.status, PublicIpAddress: { IpAddress: state.publicIp ? [state.publicIp] : [] }, SpotStrategy: state.spot ? 'SpotAsPriceGo' : 'NoSpot',
           NetworkInterfaces: { NetworkInterface: [{ Type: 'Primary', Ipv6Sets: { Ipv6Set: ipv6Sets } }] },
         }] } })
       }
@@ -90,8 +153,14 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
         return Response.json({ NetworkInterfaceSets: { NetworkInterfaceSet: [{ Type: 'Primary', InstanceId: state.instanceId, Ipv6Sets: { Ipv6Set: ipv6Sets } }] } })
       }
       case 'StopInstance':
+        state.controlEvents.push('stop')
         state.stops++
         state.stoppedIds.push(url.searchParams.get('InstanceId'))
+        if (state.slowStopAttempts > 0) {
+          state.slowStopAttempts--
+          await new Promise(resolve => setTimeout(resolve, 3800))
+          if (state.slowStopAttempts > 0) return Response.json({ Code: 'ServiceUnavailable' }, { status: 503 })
+        }
         if (state.stopFailed) return fail()
         state.status = 'Stopped'
         return Response.json({ RequestId: 'fixture' })
@@ -115,7 +184,7 @@ async function api(path, method = 'GET', body) {
 }
 async function runJob(path, expected = 'success') {
   const accepted = await api(path, 'POST')
-  const deadline = Date.now() + 35_000
+  const deadline = Date.now() + 65_000
   while (Date.now() < deadline) {
     const job = await api(`jobs/${accepted.job_id}`)
     if (['success', 'failed'].includes(job.status)) {
@@ -251,7 +320,7 @@ try {
     { status: 200, body: '{}' },
   ]
   const emptyJob = await refresh('failed')
-  assert.match(emptyJob.error_msg, /连续 3 次返回空流量明细/)
+  assert.match(emptyJob.error_msg, /连续 3 次未取得有效流量明细/)
   assert.equal(state.trafficCalls - emptyCalls, 3)
   const afterEmpty = await snapshot()
   for (const field of ['billing_month', 'cdt_domestic_bytes', 'cdt_overseas_bytes', 'traffic_updated_at', 'threshold_triggered_month', 'threshold_limit_gb']) {
@@ -293,6 +362,35 @@ try {
   state.trafficFailed = false
   state.trafficAttempts = null
   console.log('✓ HTTP 429 与瞬态时间戳错误重新签名后重试，持续失败有上限，权限错误不重试')
+
+  state.trafficAttempts = []
+  state.trafficResponses = [{ status: 530, body: 'error code: 1016' }]
+  const dnsErrorJob = await refresh('failed')
+  assert.equal(state.trafficAttempts.length, 1, '1016 must not be retried immediately')
+  for (const value of ['1016', 'cdt.aliyuncs.com', 'ListCdtInternetTraffic', 'cn-hongkong', '尝试 1 次']) assert.ok(dnsErrorJob.error_msg.includes(value))
+  assert.match(dnsErrorJob.error_msg, /耗时 \d+ms/)
+  state.trafficResponses = [{ status: 403, body: JSON.stringify({ Code: 'Forbidden', Message: 'https://cdt.aliyuncs.com/?AccessKeyId=fixture-access-key&Signature=fixture-secret', RequestId: 'fixture-request-context' }) }]
+  const safeErrorJob = await refresh('failed')
+  assert.ok(safeErrorJob.error_msg.includes('fixture-request-context'))
+  for (const value of ['fixture-access-key', 'fixture-secret', 'Signature=', 'https://']) assert.equal(safeErrorJob.error_msg.includes(value), false)
+  state.trafficResponses = [{ status: 429, body: 'limit' }, { status: 200, body: '{"TrafficDetails":[]}' }, { status: 503, body: 'unavailable' }]
+  state.trafficAttempts = []
+  await refresh('failed')
+  assert.equal(state.trafficAttempts.length, 3, 'empty responses and transient errors share one total retry budget')
+  const instancesBeforeFailure = state.instanceCalls
+  state.trafficAttempts = []
+  state.trafficResponses = Array.from({ length: 3 }, () => ({ status: 503, body: 'unavailable' }))
+  await cronAccount(worker, id)
+  assert.equal(state.trafficAttempts.length, 3)
+  assert.equal(state.instanceCalls, instancesBeforeFailure + 1, 'exhausted cloud retries must not replay successful ECS collection')
+  state.trafficFailed = true
+  state.trafficAttempts = []
+  await cronAccount(worker, id)
+  assert.equal(state.trafficAttempts.length, 1, 'permission errors wait for the next Cron without queue replay')
+  state.trafficFailed = false
+  state.trafficAttempts = null
+  console.log('✓ 解析错误与权限失败不快速重试，云端失败不重投整轮采集，错误上下文保留定位信息且隐藏凭据')
+
 
   await api(`accounts/${id}`, 'PUT', config)
   await db.prepare("UPDATE account_snapshots SET billing_month = '2000-01', threshold_triggered_month = '2000-01', cdt_overseas_bytes = ?, traffic_updated_at = 1234 WHERE account_id = ?").bind(190 * 1024 ** 3, id).run()
@@ -512,7 +610,7 @@ try {
   state.status = 'Running'
   state.instancesFailed = true
   const previousStops = state.stops
-  await cronAccount(worker, id, true)
+  await cronAccount(worker, id)
   assert.equal((await db.prepare('SELECT last_schedule_stop_at AS at FROM accounts WHERE id = ?').bind(id).first()).at, null)
   assert.equal(state.stops, previousStops)
   state.instancesFailed = false
@@ -540,12 +638,12 @@ try {
   state.trafficFailed = true
   state.notifyFailed = true
   const beforeNotice = state.notifications
-  await cronAccount(worker, id, true)
+  await cronAccount(worker, id)
   assert.equal(state.notifications, beforeNotice + 1)
   state.notifyFailed = false
-  await cronAccount(worker, id, true)
+  await cronAccount(worker, id)
   assert.equal(state.notifications, beforeNotice + 2)
-  await cronAccount(worker, id, true)
+  await cronAccount(worker, id)
   assert.equal(state.notifications, beforeNotice + 2, 'successful alert is deduplicated')
   state.trafficFailed = false
   await api('settings/telegram', 'PUT', { enabled: false })
@@ -583,11 +681,11 @@ try {
   const sameCycle = Date.now()
   const message = { id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
     body: { Cron: { account_id: id, scheduled_at: sameCycle } } }
-  state.trafficFailed = true
+  await db.prepare(`CREATE TRIGGER fail_snapshot BEFORE UPDATE ON account_snapshots WHEN NEW.account_id = ${id} BEGIN SELECT RAISE(ABORT, 'fixture database failure'); END`).run()
   let delivery = await worker.queue('cdt-monitor-tasks', [message])
   assert.equal(delivery.retryMessages.length, 1)
   assert.equal(await db.prepare('SELECT * FROM locks WHERE name = ?').bind(`cron-account:${id}:${sameCycle}`).first(), null)
-  state.trafficFailed = false
+  await db.prepare('DROP TRIGGER fail_snapshot').run()
   const beforeRetry = state.requests
   delivery = await worker.queue('cdt-monitor-tasks', [{ ...message, attempts: 2 }])
   assert.equal(delivery.retryMessages.length, 0)
@@ -595,7 +693,7 @@ try {
   const completedRequests = state.requests
   await worker.queue('cdt-monitor-tasks', [{ ...message, attempts: 3 }])
   assert.equal(state.requests, completedRequests)
-  console.log('✓ 同一 Cron 消息失败可重投，成功后才去重')
+  console.log('✓ 数据库故障允许同一 Cron 消息重投，成功后才去重')
 
   const leaseCycle = sameCycle + 1
   const leaseKey = `cron-account:${id}:${leaseCycle}`
@@ -1014,16 +1112,186 @@ try {
   state.stallTraffic = true
   let began = Date.now()
   const stalled = await refresh('failed')
-  assert.equal(stalled.error_msg, '流量查询失败，网络连接超时，稍后重试')
+  assert.match(stalled.error_msg, /流量查询失败，网络连接超时，稍后重试.*cdt\.aliyuncs\.com/)
   assert.ok(Date.now() - began < 25_000, 'stalled headers must respect request budget')
   state.stallTraffic = false
   state.stallBody = true
   began = Date.now()
   const stalledBody = await refresh('failed')
-  assert.equal(stalledBody.error_msg, '流量查询失败，网络连接超时，稍后重试')
+  assert.match(stalledBody.error_msg, /流量查询失败，网络连接超时，稍后重试.*cdt\.aliyuncs\.com/)
   assert.ok(Date.now() - began < 25_000, 'stalled response body must respect request budget')
   state.stallBody = false
   console.log('✓ 请求头和响应体卡住时均能超时收尾')
+
+  // DNS 联动使用独立实例配置，全部 Cloudflare API 在上述夹具中拦截。
+  state.status = 'Running'
+  state.publicIp = '192.0.2.10'
+  state.traffic = 1
+  state.stopFailed = false
+  state.startFailed = false
+  state.notifyFailed = false
+  await api('settings/telegram', 'PUT', { enabled: true, token: '123456:fixture-token-for-tests', chat_id: 'fixture-chat' })
+  const dnsInput = { enabled: true, zone_id: 'a'.repeat(32), name: 'dns-test.example.com', api_token: 'fixture-dns-token', lead_minutes: 30 }
+  const dnsAccountInput = { ...config, name: 'DNS fixture', instance_id: state.instanceId, traffic_threshold_gb: 0, spot_keep_alive: false, dns: dnsInput }
+  const dnsAccount = await api('accounts', 'POST', dnsAccountInput)
+  const dnsId = dnsAccount.id
+  const dnsRefresh = () => runJob(`accounts/${dnsId}/refresh`)
+  const dnsStored = async () => JSON.parse((await db.prepare('SELECT dns_json FROM accounts WHERE id = ?').bind(dnsId).first()).dns_json)
+  const setDnsState = async patch => {
+    const stored = await dnsStored()
+    Object.assign(stored.state, patch)
+    await db.prepare('UPDATE accounts SET dns_json = ? WHERE id = ?').bind(JSON.stringify(stored), dnsId).run()
+  }
+  assert.equal(dnsAccount.dns.token_configured, true)
+  assert.equal(JSON.stringify(dnsAccount).includes('fixture-dns-token'), false)
+  assert.equal(JSON.stringify(await dnsStored()).includes('fixture-dns-token'), false, 'token must be encrypted in D1')
+  for (const dns of [{ ...dnsInput, lead_minutes: 7 }, { ...dnsInput, zone_id: 'invalid' }, { ...dnsInput, name: 'https://example.com' }]) {
+    assert.equal((await request(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns })).status, 400)
+  }
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.length, 1)
+  assert.equal(state.dnsRecords[0].content, state.publicIp)
+  const stableDnsCalls = state.dnsCalls
+  const stableDnsState = await dnsStored()
+  await dnsRefresh()
+  await cronAccount(worker, dnsId)
+  assert.equal(state.dnsCalls, stableDnsCalls, 'stable running state makes no DNS requests')
+  assert.deepEqual(await dnsStored(), stableDnsState, 'stable state does not rewrite DNS state')
+  state.publicIp = '192.0.2.11'
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.length, 1)
+  assert.equal(state.dnsRecords[0].content, state.publicIp)
+  console.log('✓ DNS 配置验证、凭据加密、TTL 300、稳定状态零请求与公网 IP 变化更新')
+
+  state.dnsRecords.push({ id: 'other-node', type: 'A', name: dnsInput.name, content: '192.0.2.99' })
+  state.dnsDeleteFailed = true
+  const manualAlerts = state.notifications
+  state.controlEvents = []
+  const manualDeletes = state.dnsDeletes
+  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/stop`)
+  assert.equal(state.status, 'Stopped', 'DNS failure must never block manual shutdown')
+  assert.deepEqual(state.controlEvents, ['dns-delete', 'stop', 'dns-alert'])
+  assert.equal(state.notifications, manualAlerts + 1)
+  await dnsRefresh()
+  await dnsRefresh()
+  assert.equal(state.dnsDeletes, manualDeletes + 1, 'stopped instance never retries failed manual DNS withdrawal')
+  assert.equal(state.notifications, manualAlerts + 1)
+  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
+  state.publicIp = '192.0.2.12'
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.filter(r => r.id !== 'other-node').length, 1, 'reuse leftover record after failed delete')
+  assert.equal(state.dnsRecords.find(r => r.id !== 'other-node').content, state.publicIp)
+  assert.equal(state.dnsRecords.find(r => r.id === 'other-node').content, '192.0.2.99')
+  console.log('✓ 手动关机先摘除，失败仅告警一次、不阻断关机、不重试，开机更新遗留记录且保留其他节点')
+
+  // 前置查询与停机均经历慢速重试，DNS 超时、通知卡住仍不能挤掉停机预算。
+  state.slowDescribeAttempts = 3
+  state.slowStopAttempts = 3
+  state.dnsDeleteDelay = 2500
+  state.notifyDelay = 6000
+  state.controlEvents = []
+  const slowStopBegan = Date.now()
+  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/stop`)
+  assert.equal(state.status, 'Stopped')
+  assert.deepEqual(state.controlEvents, ['dns-delete', 'stop', 'stop', 'stop', 'dns-alert'])
+  assert.ok(Date.now() - slowStopBegan < 55_000)
+  state.dnsDeleteDelay = 0
+  state.notifyDelay = 0
+  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
+  await dnsRefresh()
+  console.log('✓ 慢实例查询、DNS 超时、慢停机重试和卡住的通知均不会挤掉关机预算，告警在关机之后发送')
+
+  const scheduled = new Date(Date.now() + 20 * 60_000 + 8 * 3600_000)
+  const stopCron = `${scheduled.getUTCMinutes()} ${scheduled.getUTCHours()} * * *`
+  const scheduledConfig = { ...dnsAccountInput, schedule_mode: 'advanced', schedule_stop_cron: stopCron, dns: { ...dnsInput, api_token: '' } }
+  await api(`accounts/${dnsId}`, 'PUT', scheduledConfig)
+  const scheduledAlerts = state.notifications
+  const scheduledDeletes = state.dnsDeletes
+  await cronAccount(worker, dnsId)
+  assert.equal(state.status, 'Running')
+  assert.equal(state.dnsDeletes, scheduledDeletes + 1)
+  assert.equal(state.notifications, scheduledAlerts + 1)
+  // 下一次五分钟巡检：只推进 DNS 重试槽，不修改实际系统时间。
+  await setDnsState({ attempt_slot: null })
+  await cronAccount(worker, dnsId)
+  assert.equal(state.dnsDeletes, scheduledDeletes + 2)
+  assert.equal(state.notifications, scheduledAlerts + 1, 'same scheduled stop alerts only once')
+  state.dnsDeleteFailed = false
+  await setDnsState({ attempt_slot: null })
+  await cronAccount(worker, dnsId)
+  assert.deepEqual(state.dnsRecords.map(r => r.id), ['other-node'])
+  const drainedCalls = state.dnsCalls
+  await dnsRefresh()
+  assert.equal(state.dnsCalls, drainedCalls, 'running inside drain window must not republish or delete again')
+  // 取消定时关机，应恢复解析。
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { ...dnsInput, api_token: '' } })
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.length, 2)
+  assert.equal((await dnsStored()).state.drain_at, null)
+  console.log('✓ 定时提前摘除失败逐轮重试且告警去重，成功不重复请求，取消计划恢复解析')
+
+  // 真正执行定时关机后，即使删除失败也不继续重试。
+  state.dnsDeleteFailed = true
+  await api(`accounts/${dnsId}`, 'PUT', { ...scheduledConfig, schedule_stop_cron: '* * * * *' })
+  await cronAccount(worker, dnsId)
+  assert.equal(state.status, 'Stopped', 'scheduled shutdown proceeds despite DNS failure')
+  const stoppedScheduledDeletes = state.dnsDeletes
+  await cronAccount(worker, dnsId)
+  await dnsRefresh()
+  assert.equal(state.dnsDeletes, stoppedScheduledDeletes)
+  // 关闭计划并重新开机，遗留记录仍应复用。
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { ...dnsInput, api_token: '' } })
+  state.dnsDeleteFailed = false
+  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.length, 2)
+  console.log('✓ 定时摘除失败不影响到点关机，停止后不再尝试摘除，重新运行恢复登记')
+
+  // 创建请求在云端成功、返回失败：下轮查找已创建记录，不能重复 POST。
+  state.dnsRecords = state.dnsRecords.filter(r => r.id === 'other-node')
+  await setDnsState({ record_id: null, published_ip: null, pending_ip: null })
+  state.dnsWriteUnknown = true
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.length, 2)
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.length, 2)
+  assert.ok((await dnsStored()).state.record_id)
+  // 记录被人工删除后，IP 变化触发 PATCH 404，下一轮应重建。
+  state.dnsRecords = state.dnsRecords.filter(r => r.id === 'other-node')
+  state.publicIp = '192.0.2.13'
+  await dnsRefresh()
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.filter(r => r.id !== 'other-node').length, 1)
+  assert.equal(state.dnsRecords.find(r => r.id !== 'other-node').content, state.publicIp)
+  console.log('✓ DNS 创建结果未知时按目标 IP 核实，不重复创建，记录 ID 失效后可恢复')
+
+  // 重新启用可主动修复外部删除，稳定状态不需要轮询 DNS。
+  state.dnsRecords = state.dnsRecords.filter(r => r.id === 'other-node')
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { ...dnsInput, enabled: false, api_token: '' } })
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { ...dnsInput, api_token: '' } })
+  await dnsRefresh()
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.filter(r => r.id !== 'other-node').length, 1)
+  console.log('✓ 重新启用 DNS 联动会重新核实并修复记录')
+
+  // 熔断的关机指令会重试，但 DNS 摘除只尝试一次。
+  state.dnsDeleteFailed = true
+  state.stopFailed = true
+  const thresholdDeletes = state.dnsDeletes
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, traffic_threshold_gb: 0.5, dns: { ...dnsInput, api_token: '' } })
+  await dnsRefresh()
+  await dnsRefresh()
+  assert.equal(state.dnsDeletes, thresholdDeletes + 1)
+  assert.equal(state.status, 'Running')
+  state.stopFailed = false
+  await dnsRefresh()
+  assert.equal(state.status, 'Stopped')
+  await dnsRefresh()
+  assert.equal(state.dnsDeletes, thresholdDeletes + 1)
+  console.log('✓ 熔断只尝试一次 DNS 摘除，失败不阻断关机，后续熔断重试不重复摘除')
+  await api(`accounts/${dnsId}`, 'DELETE')
+  state.dnsDeleteFailed = false
+  state.publicIp = null
 
   const attempts = await Promise.all(Array.from({ length: 12 }, () => request('auth/login', 'POST', { username: 'review', password: 'wrong' }, '192.0.2.2')))
   assert.equal(attempts.filter(r => r.status === 401).length, 10)

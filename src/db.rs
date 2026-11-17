@@ -331,6 +331,18 @@ impl Db {
             .await
     }
 
+    /// 同步状态变化才写入，不改变账号配置版本和配置更新时间。
+    pub async fn save_dns(&self, id: i64, config: &crate::dns::DnsSettings) -> Result<()> {
+        let json =
+            serde_json::to_string(config).map_err(|e| worker::Error::RustError(e.to_string()))?;
+        self.exec(
+            "UPDATE accounts SET dns_json = ? WHERE id = ?",
+            &[j_text(&json), j_i64(id)],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// 插入账号，返回新 ID。
     #[allow(clippy::too_many_arguments)]
     pub async fn create_account(
@@ -339,6 +351,7 @@ impl Db {
         site_type: &str,
         access_key_id: &str,
         cloud_account_id: &str,
+        dns_json: &str,
         encrypted_secret: &str,
         region_id: &str,
         instance_id: &str,
@@ -356,7 +369,7 @@ impl Db {
     ) -> Result<i64> {
         self.insert(
             "INSERT INTO accounts (
-                name, site_type, access_key_id, cloud_account_id, encrypted_access_key_secret,
+                name, site_type, access_key_id, cloud_account_id, dns_json, encrypted_access_key_secret,
                 region_id, instance_id, traffic_threshold_gb,
                 over_limit_action, stop_mode,
                 schedule_start_time, schedule_stop_time, spot_keep_alive, enabled,
@@ -364,12 +377,13 @@ impl Db {
                 last_schedule_start_date, last_schedule_stop_date,
                 last_schedule_start_at, last_schedule_stop_at,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
             &[
                 j_text(name),
                 j_text(site_type),
                 j_text(access_key_id),
                 j_text(cloud_account_id),
+                j_text(dns_json),
                 j_text(encrypted_secret),
                 j_text(region_id),
                 j_text(instance_id),
@@ -396,6 +410,7 @@ impl Db {
         &self,
         id: i64,
         previous: &AccountRow,
+        dns_json: &str,
         cloud_account_id: Option<&str>,
         name: &str,
         site_type: &str,
@@ -418,7 +433,7 @@ impl Db {
         let sql = match encrypted_secret {
             Some(_) => {
                 "UPDATE accounts SET
-                    name = ?, site_type = ?, access_key_id = ?, encrypted_access_key_secret = ?,
+                    dns_json = ?, name = ?, site_type = ?, access_key_id = ?, encrypted_access_key_secret = ?,
                     region_id = ?, instance_id = ?, traffic_threshold_gb = ?,
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
@@ -428,7 +443,7 @@ impl Db {
             }
             None => {
                 "UPDATE accounts SET
-                    name = ?, site_type = ?, access_key_id = ?,
+                    dns_json = ?, name = ?, site_type = ?, access_key_id = ?,
                     region_id = ?, instance_id = ?, traffic_threshold_gb = ?,
                     over_limit_action = ?, stop_mode = ?,
                     schedule_start_time = ?, schedule_stop_time = ?, spot_keep_alive = ?,
@@ -438,7 +453,12 @@ impl Db {
             }
         };
 
-        let mut params = vec![j_text(name), j_text(site_type), j_text(access_key_id)];
+        let mut params = vec![
+            j_text(dns_json),
+            j_text(name),
+            j_text(site_type),
+            j_text(access_key_id),
+        ];
         if let Some(secret) = encrypted_secret {
             params.push(j_text(secret));
         }

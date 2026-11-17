@@ -203,7 +203,17 @@ export interface AcceptedJob {
   job_type: JobType
 }
 
+export interface DnsConfig {
+  enabled: boolean
+  zone_id: string
+  name: string
+  token_configured: boolean
+  lead_minutes: number
+  last_error: string | null
+}
+
 export interface AccountDto {
+  dns: DnsConfig
   id: number
   name: string
   site_type: SiteType
@@ -233,6 +243,7 @@ export interface AccountDto {
 }
 
 export interface AccountInput {
+  dns?: { enabled: boolean; zone_id: string; name: string; api_token?: string; lead_minutes: number }
   name: string
   site_type: SiteType
   /** 编辑时留空表示沿用原值 */

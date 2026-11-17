@@ -29,10 +29,11 @@
 //! 这段本地时间窗口内让路——否则保活会把刚被计划停机的实例重新拉起，
 //! 使定时策略失效。
 
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 use crate::aliyun::AliyunClient;
 use crate::crypto::{Crypto, random_hex};
+mod dns;
 mod schedule;
 mod threshold;
 use crate::db::Db;
@@ -96,6 +97,8 @@ pub struct RefreshOutcome {
     pub success: bool,
     /// 本轮成功读取实例状态；失败时旧快照仅供展示，不能确认定时动作完成。
     pub instances_fresh: bool,
+    /// 数据库或执行器故障允许队列重试；云接口已耗尽快速重试则等下一轮 Cron。
+    pub retry_needed: bool,
     pub domestic_bytes: i64,
     pub overseas_bytes: i64,
     /// 本次刷新是否**新触发**了熔断。
@@ -110,6 +113,7 @@ impl RefreshOutcome {
             account_name: account.name.clone(),
             success: false,
             instances_fresh: false,
+            retry_needed: true,
             domestic_bytes: 0,
             overseas_bytes: 0,
             threshold_fired: false,
@@ -160,6 +164,7 @@ pub struct Scheduler {
     crypto: Crypto,
     now: i64,
     timezone: String,
+    dns_alerts: RefCell<Vec<Message>>,
 }
 
 impl Scheduler {
@@ -176,6 +181,7 @@ impl Scheduler {
             crypto,
             now: now_ms(),
             timezone,
+            dns_alerts: RefCell::new(Vec::new()),
         })
     }
 
@@ -331,19 +337,21 @@ impl Scheduler {
     pub async fn refresh_account(&self, account: &AccountRow) -> RefreshOutcome {
         let result = self
             .db
-            .with_account_lock(account.id, 20_000, async {
+            .with_account_lock(account.id, 50_000, async {
                 self.db
                     .account_at_version(account.id, account.config_version)
                     .await?;
                 self.refresh_account_inner(account, true).await
             })
             .await;
-        self.refresh_outcome(account, result).await
+        let outcome = self.refresh_outcome(account, result).await;
+        self.flush_dns_alerts().await;
+        outcome
     }
 
     async fn refresh_locked(&self, account: &AccountRow) -> RefreshOutcome {
         let result =
-            crate::runtime::timeout(20_000, Box::pin(self.refresh_account_inner(account, false)))
+            crate::runtime::timeout(50_000, Box::pin(self.refresh_account_inner(account, false)))
                 .await
                 .unwrap_or_else(|e| Err(worker::Error::RustError(e.into())));
         self.refresh_outcome(account, result).await
@@ -393,7 +401,12 @@ impl Scheduler {
             .await
             .map_err(|err| worker::Error::RustError(err.query_failure("实例查询")))?
             .ok_or_else(|| {
-                worker::Error::RustError("云端找不到配置的实例，请核实地域和实例 ID".into())
+                worker::Error::RustError(format!(
+                    "云端找不到配置的实例（{}，地域 {}，实例 {}），请核实地域、实例 ID 和 AccessKey 所属账号",
+                    account.site().label(),
+                    account.region_id,
+                    account.instance_id_opt().unwrap_or_default()
+                ))
             })?;
         instance.keep_alive = account.is_spot_keep_alive();
         if let Some(previous) = self
@@ -569,6 +582,7 @@ impl Scheduler {
         });
         if can_release {
             self.db.clear_threshold(account.id).await?;
+            self.dns_release_threshold(account).await;
             self.db
                 .add_log(
                     Some(account.id),
@@ -584,7 +598,25 @@ impl Scheduler {
             && ((traffic_fresh && threshold_reached(used_gb, account.traffic_threshold_gb))
                 || already_triggered)
         {
-            threshold_fired = self.handle_threshold(account, used_gb, pool).await?;
+            threshold_fired = self
+                .handle_threshold(
+                    account,
+                    used_gb,
+                    pool,
+                    if instances_fresh {
+                        instances.first()
+                    } else {
+                        None
+                    },
+                )
+                .await?;
+        }
+
+        if instances_fresh && let Some(instance) = instances.first() {
+            let blocked = !can_release
+                && account.action() == OverLimitAction::StopAndNotify
+                && (already_triggered || threshold_fired);
+            self.dns_reconcile(account, instance, blocked).await;
         }
 
         for warning in &sync.warnings {
@@ -599,6 +631,7 @@ impl Scheduler {
             // 流量与实例是自动化决策所需数据，失败时不能用旧快照冒充刷新成功。
             success: traffic_fresh && instances_fresh,
             instances_fresh,
+            retry_needed: false,
             domestic_bytes,
             overseas_bytes,
             threshold_fired,
@@ -852,8 +885,9 @@ impl Scheduler {
         start: bool,
         config_version: i64,
     ) -> worker::Result<String> {
-        self.db
-            .with_account_lock(account_id, 20_000, async {
+        let result = self
+            .db
+            .with_account_lock(account_id, 45_000, async {
                 let account = self
                     .db
                     .account_at_version(account_id, config_version)
@@ -861,7 +895,10 @@ impl Scheduler {
                 self.instance_action_locked(&account, instance_id, start)
                     .await
             })
-            .await
+            .await;
+        // 先完成云端控制与状态落库，再发送 DNS 告警，通知不占关机预算。
+        self.flush_dns_alerts().await;
+        result
     }
 
     async fn instance_action_locked(
@@ -888,6 +925,12 @@ impl Scheduler {
         let client = AliyunClient::from_account(account, self.account_secret(account)?);
         let region_id = &account.region_id;
         let instance = self.refresh_instance_locked(account).await?;
+        if start {
+            self.dns_resume(account).await;
+        }
+        if start && instance.is_running() {
+            self.dns_reconcile(account, &instance, false).await;
+        }
         if (start && instance.is_running()) || (!start && instance.is_stopped()) {
             return Ok(if start {
                 "已核实实例正在运行，无需开机"
@@ -902,6 +945,10 @@ impl Scheduler {
             ));
         }
 
+        if !start {
+            self.dns_before_stop(account, &instance, &format!("manual:{}", now_ms()), false)
+                .await;
+        }
         let result = if start {
             client.start_instance(instance_id, region_id).await
         } else {
@@ -951,7 +998,10 @@ impl Scheduler {
         // 动作后立即刷新，保证前端轮询结束时看到的是真实状态；
         // 若阿里云尚未落到终态（刚发出指令常如此），把快照置为过渡态，
         // 让前端显示「正在启动…」，并在每分钟轮询时补采核实终态。
-        if let Err(err) = self.refresh_instance_locked(account).await {
+        if let Err(err) = crate::runtime::timeout(3_000, self.refresh_instance_locked(account))
+            .await
+            .and_then(|r| r.map_err(|_| "动作后状态查询失败"))
+        {
             log_warn!("动作后刷新失败：{err}");
         }
         self.set_transitional_status(account_id, instance_id, start)
@@ -1080,9 +1130,9 @@ impl Scheduler {
         if !account.is_enabled() {
             return CronReport::default();
         }
-        match self
+        let report = match self
             .db
-            .with_account_lock(account.id, 85_000, async {
+            .with_account_lock(account.id, 80_000, async {
                 self.db
                     .account_at_version(account.id, account.config_version)
                     .await?;
@@ -1100,7 +1150,9 @@ impl Scheduler {
                 notes: vec![err.to_string()],
                 ..CronReport::default()
             },
-        }
+        };
+        self.flush_dns_alerts().await;
+        report
     }
 
     async fn run_account_cron_locked(&self, account: &AccountRow) -> CronReport {
@@ -1113,7 +1165,7 @@ impl Scheduler {
             report.accounts_refreshed += 1;
         } else {
             report.accounts_failed += 1;
-            report.retry_needed = true;
+            report.retry_needed = outcome.retry_needed;
             report.notes.push(format!(
                 "{} 刷新失败：{}",
                 account.name,
@@ -1382,6 +1434,7 @@ mod tests {
 
     fn account_with_schedule(start: Option<&str>, stop: Option<&str>) -> AccountRow {
         AccountRow {
+            dns_json: "{}".into(),
             cloud_account_id: None,
             config_version: 1,
             id: 1,
@@ -1573,6 +1626,27 @@ mod tests {
     }
 
     #[test]
+    fn dns_stop_time_handles_midnight_and_advanced_schedule() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-17T15:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut account = account_with_schedule(None, Some("00:10"));
+        let expected = now + 70 * 60_000;
+        assert_eq!(
+            crate::dns::next_stop(&account, "UTC+8", now),
+            Some(expected)
+        );
+        account.schedule_mode = Some("advanced".into());
+        account.schedule_stop_cron = Some("10 0 * * *".into());
+        assert_eq!(
+            crate::dns::next_stop(&account, "UTC+8", now),
+            Some(expected)
+        );
+        account.schedule_stop_cron = None;
+        assert_eq!(crate::dns::next_stop(&account, "UTC+8", now), None);
+    }
+
+    #[test]
     fn site_and_mode_defaults() {
         assert_eq!(SiteType::from_db("intl").label(), "国际站");
         assert_eq!(StopMode::from_db("KeepCharging").label(), "普通停机");
@@ -1590,6 +1664,7 @@ mod tests {
         stop: Option<&str>,
     ) -> AccountRow {
         AccountRow {
+            dns_json: "{}".into(),
             schedule_mode: mode.map(|s| s.to_string()),
             schedule_start_cron: start.map(|s| s.to_string()),
             schedule_stop_cron: stop.map(|s| s.to_string()),

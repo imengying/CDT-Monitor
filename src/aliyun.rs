@@ -20,12 +20,12 @@
 //!
 //! | 用途 | 域名 | Version | Action |
 //! |---|---|---|---|
-//! | CDT 流量 | `cdt.aliyuncs.com` | 2021-08-13 | `ListCdtInternetTraffic`（失败回退 `GetCdtInternetTraffic`） |
+//! | CDT 流量 | `cdt.aliyuncs.com` | 2021-08-13 | `ListCdtInternetTraffic` |
 //! | ECS 查询/控制 | `ecs.aliyuncs.com` | 2014-05-26 | `DescribeInstances` / `StartInstance` / `StopInstance` |
 //! | 账户余额 | `business.aliyuncs.com` | 2017-12-14 | `QueryAccountBalance` |
 //!
-//! 国际站把域名换成 `*.ap-southeast-1.aliyuncs.com`（BSS 为
-//! `business.ap-southeast-1.aliyuncs.com`）。
+//! CDT 两站共用全局端点，国际站 BSS 使用新加坡端点；ECS 使用实例所属地域的端点
+//! `ecs.{region_id}.aliyuncs.com`，不能把国际站实例一律当作新加坡实例。
 //!
 //! ## 重试
 //!
@@ -56,6 +56,11 @@ type HmacSha1 = Hmac<Sha1>;
 /// 阿里云调用错误。
 #[derive(Debug, Clone)]
 pub enum AliyunError {
+    /// 只包含安全字段的请求上下文，不包含 URL 查询串或请求体。
+    Request {
+        context: RequestContext,
+        source: Box<AliyunError>,
+    },
     /// 阿里云返回了业务错误（HTTP 4xx/5xx 或响应体含 Code/Message）。
     Api {
         code: String,
@@ -71,9 +76,29 @@ pub enum AliyunError {
     Local(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    pub host: String,
+    pub action: String,
+    pub region: String,
+    pub elapsed_ms: i64,
+    pub attempts: usize,
+}
+impl std::fmt::Display for RequestContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let service = self.host.split('.').next().unwrap_or("unknown");
+        write!(
+            f,
+            "服务 {service}，域名 {}，Action {}，地域 {}，耗时 {}ms，尝试 {} 次",
+            self.host, self.action, self.region, self.elapsed_ms, self.attempts
+        )
+    }
+}
+
 impl std::fmt::Display for AliyunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            AliyunError::Request { context, source } => write!(f, "{source}（{context}）"),
             AliyunError::Api {
                 code,
                 message,
@@ -111,13 +136,18 @@ impl AliyunError {
     /// 是否为可重试的瞬态错误。
     pub fn is_retryable(&self) -> bool {
         match self {
-            AliyunError::Network(_) => true,
+            AliyunError::Request { source, .. } => source.is_retryable(),
+            AliyunError::Network(message) => !message.contains("DNS 解析失败"),
             AliyunError::Api {
                 code,
                 message,
                 http_status,
                 ..
             } => {
+                // Cloudflare 1016 是目标域名解析失败，快速重试无益，等待下一轮巡检。
+                if *http_status == 530 && message.contains("1016") {
+                    return false;
+                }
                 if *http_status == 429 || *http_status >= 500 {
                     return true;
                 }
@@ -131,7 +161,8 @@ impl AliyunError {
                     && (detail.contains("expired")
                         || detail.contains("notsupplied")
                         || detail.contains("missing"));
-                code.starts_with("throttling")
+                code == "emptytrafficdetails"
+                    || code.starts_with("throttling")
                     || code.contains("serviceunavailable")
                     || code.contains("internalerror")
                     || code.contains("timeout")
@@ -142,17 +173,24 @@ impl AliyunError {
         }
     }
 
+    fn root(&self) -> &Self {
+        match self {
+            Self::Request { source, .. } => source.root(),
+            other => other,
+        }
+    }
+
     /// 便于日志的短描述。
     pub fn short(&self) -> String {
-        match self {
-            AliyunError::Api { code, message, .. } => format!("{code}: {message}"),
-            other => other.to_string(),
-        }
+        self.to_string()
     }
 
     /// 采集查询超时无需提示核实操作结果；启停操作继续使用原始错误说明。
     pub(crate) fn query_failure(&self, query: &str) -> String {
         match self {
+            Self::Request { context, source } => {
+                format!("{}（{context}）", source.query_failure(query))
+            }
             Self::Network(message) if message == crate::runtime::TIMEOUT_MESSAGE => {
                 format!("{query}失败，网络连接超时，稍后重试")
             }
@@ -165,7 +203,57 @@ impl AliyunError {
 // 端点
 // ===========================================================================
 
-/// 三种服务端点（可被环境变量覆盖）。
+// 响应可能回显签名 URL、AK 或 Secret，错误日志不能直接信任上游文本。
+fn sanitize_error(mut error: AliyunError, credentials: &[&str]) -> AliyunError {
+    fn clean(value: &mut String, credentials: &[&str]) {
+        let lower = value.to_ascii_lowercase();
+        if [
+            "http://",
+            "https://",
+            "signature",
+            "accesskey",
+            "securitytoken",
+        ]
+        .iter()
+        .any(|key| lower.contains(key))
+            || credentials
+                .iter()
+                .any(|key| !key.is_empty() && value.contains(key))
+        {
+            *value = "上游错误详情包含请求或凭据信息，已隐藏".into();
+        } else {
+            *value = truncate_str(&value.replace(['\r', '\n', '\t'], " "), 300);
+        }
+    }
+    if let AliyunError::Api {
+        code,
+        message,
+        request_id,
+        ..
+    } = &mut error
+    {
+        clean(message, credentials);
+        for field in std::iter::once(code).chain(request_id.iter_mut()) {
+            if credentials
+                .iter()
+                .any(|key| !key.is_empty() && field.contains(key))
+                || field.len() > 128
+                || !field
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+            {
+                *field = "unavailable".into();
+            }
+        }
+    }
+    // 非 JSON 正文和本地错误可能携带未知内容，也必须过滤。
+    if let AliyunError::Parse(message) | AliyunError::Local(message) = &mut error {
+        clean(message, credentials);
+    }
+    error
+}
+
+/// 三种服务端点。
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub cdt: String,
@@ -174,8 +262,8 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
-    /// 按站点返回端点。
-    pub fn for_site(site: SiteType) -> Self {
+    /// CDT 使用全局端点；仅国际站 ECS 按实例地域选择，BSS 使用新加坡端点。
+    pub fn for_region(site: SiteType, region_id: &str) -> Self {
         match site {
             SiteType::China => Self {
                 cdt: "https://cdt.aliyuncs.com".to_string(),
@@ -183,8 +271,11 @@ impl Endpoints {
                 bss: "https://business.aliyuncs.com".to_string(),
             },
             SiteType::Intl => Self {
-                cdt: "https://cdt.ap-southeast-1.aliyuncs.com".to_string(),
-                ecs: "https://ecs.ap-southeast-1.aliyuncs.com".to_string(),
+                cdt: "https://cdt.aliyuncs.com".to_string(),
+                ecs: format!(
+                    "https://ecs.{}.aliyuncs.com",
+                    region_id.trim().to_ascii_lowercase()
+                ),
                 bss: "https://business.ap-southeast-1.aliyuncs.com".to_string(),
             },
         }
@@ -298,7 +389,7 @@ impl AliyunClient {
             account.access_key_id.clone(),
             secret,
             account.site(),
-            Endpoints::for_site(account.site()),
+            Endpoints::for_region(account.site(), &account.region_id),
         )
     }
 
@@ -333,13 +424,19 @@ impl AliyunClient {
     ) -> Result<Value, AliyunError> {
         const MAX_ATTEMPTS: usize = 3;
         let mut last_error: Option<AliyunError> = None;
+        let began = crate::models::now_ms();
+        let mut attempts = 0;
 
         for attempt in 0..MAX_ATTEMPTS {
+            attempts += 1;
             match self.call_once(endpoint, version, action, &extra).await {
                 Ok(value) => return Ok(value),
                 Err(err) => {
                     let retryable = err.is_retryable();
-                    last_error = Some(err);
+                    last_error = Some(sanitize_error(
+                        err,
+                        &[&self.access_key_id, &self.access_key_secret],
+                    ));
                     if !retryable || attempt + 1 >= MAX_ATTEMPTS {
                         break;
                     }
@@ -350,7 +447,27 @@ impl AliyunClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| AliyunError::Local("未知调用失败".to_string())))
+        let error = AliyunError::Request {
+            context: RequestContext {
+                host: url::Url::parse(endpoint)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_owned))
+                    .unwrap_or_default(),
+                action: action.into(),
+                region: extra
+                    .iter()
+                    .find(|(key, _)| *key == "RegionId")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| "全局".into()),
+                elapsed_ms: crate::models::now_ms().saturating_sub(began),
+                attempts,
+            },
+            source: Box::new(
+                last_error.unwrap_or_else(|| AliyunError::Local("未知调用失败".to_string())),
+            ),
+        };
+        log_error!("云接口调用失败：{error}");
+        Err(error)
     }
 
     /// 单次 RPC 调用（签名 + fetch + 解析）。
@@ -406,11 +523,39 @@ impl AliyunClient {
         let request = Request::new_with_init(&url, &init)
             .map_err(|e| AliyunError::Local(format!("构造请求失败：{e}")))?;
 
-        let (status, body) = crate::runtime::fetch_text(request, 4_000)
-            .await
-            .map_err(AliyunError::Network)?;
+        let (status, body) =
+            crate::runtime::fetch_text(request, 4_000)
+                .await
+                .map_err(|message| {
+                    let lower = message.to_ascii_lowercase();
+                    let safe = if message == crate::runtime::TIMEOUT_MESSAGE {
+                        message
+                    } else if lower.contains("dns")
+                        || lower.contains("nxdomain")
+                        || lower.contains("resolve")
+                    {
+                        "DNS 解析失败".into()
+                    } else if lower.contains("tls") || lower.contains("certificate") {
+                        "TLS 连接失败".into()
+                    } else {
+                        "网络连接失败".into()
+                    };
+                    AliyunError::Network(safe)
+                })?;
 
-        parse_rpc_response(status, &body, action)
+        let value = parse_rpc_response(status, &body, action)?;
+        if action == "ListCdtInternetTraffic" && !CdtTraffic::has_details(&value) {
+            return Err(AliyunError::Api {
+                code: "EmptyTrafficDetails".into(),
+                message: "ListCdtInternetTraffic 连续 3 次未取得有效流量明细，请稍后重试".into(),
+                request_id: value
+                    .get("RequestId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                http_status: status,
+            });
+        }
+        Ok(value)
     }
 
     // -----------------------------------------------------------------------
@@ -422,35 +567,17 @@ impl AliyunClient {
     /// 调用 `ListCdtInternetTraffic`，空明细重试耗尽后返回错误，
     /// 防止把尚未返回的计量数据当作零流量覆盖已有快照。
     pub async fn query_cdt_traffic(&self) -> Result<CdtTraffic, AliyunError> {
-        // 参数与上游一致：RegionId 固定 cn-hongkong，不传时间范围。
-        // 该 Action 返回当前计费周期内的累计值。
-        //
-        // 空 TrafficDetails 会重试：CDT 的计量数据有分钟级延迟，
-        // 首次调用可能在数据落库前返回空数组，稍后重试即可拿到。
-        const MAX_ATTEMPTS: usize = 3;
-
-        for attempt in 0..MAX_ATTEMPTS {
-            let value = self
-                .call(
-                    &self.endpoints.cdt,
-                    "2021-08-13",
-                    "ListCdtInternetTraffic",
-                    vec![("RegionId", "cn-hongkong".to_string())],
-                )
-                .await?;
-
-            if CdtTraffic::has_details(&value) {
-                return Ok(CdtTraffic::parse(&value, self.site));
-            }
-
-            if attempt + 1 < MAX_ATTEMPTS {
-                Delay::from(Duration::from_millis(300 * 2u64.pow(attempt as u32))).await;
-            }
-        }
-
-        Err(AliyunError::Parse(
-            "ListCdtInternetTraffic 连续 3 次返回空流量明细，请稍后重试".to_string(),
-        ))
+        // 空明细与限流/网络失败共用一次重试预算，最多 3 次请求，避免嵌套放大。
+        // RegionId 与上游一致；该全局接口返回当前计费周期内的累计值。
+        let value = self
+            .call(
+                &self.endpoints.cdt,
+                "2021-08-13",
+                "ListCdtInternetTraffic",
+                vec![("RegionId", "cn-hongkong".into())],
+            )
+            .await?;
+        Ok(CdtTraffic::parse(&value, self.site))
     }
 
     // -----------------------------------------------------------------------
@@ -494,11 +621,7 @@ impl AliyunClient {
             )
             .await?;
 
-        let instances = extract_array(&value, &["Instances", "Instance"]);
-        Ok(instances
-            .iter()
-            .find(|item| item.get("InstanceId").and_then(Value::as_str) == Some(instance_id))
-            .map(|item| parse_instance(item, region_id)))
+        parse_described_instance(&value, region_id, instance_id)
     }
 
     /// 从 ECS 的弹性网卡列表补取 IPv6。查询失败时由调用方保留实例的其它字段，
@@ -795,16 +918,29 @@ fn json_to_i64(value: &Value) -> Option<i64> {
     value.as_str()?.trim().parse::<i64>().ok()
 }
 
-/// 取形如 `{"Instances": {"Instance": [...]}}` 的数组。
-fn extract_array(value: &Value, path: &[&str]) -> Vec<Value> {
-    let mut cursor = value;
-    for key in path {
-        match cursor.get(*key) {
-            Some(next) => cursor = next,
-            None => return Vec::new(),
-        }
-    }
-    cursor.as_array().cloned().unwrap_or_default()
+/// 仅真正的实例数组可以用于判断实例不存在；响应结构异常应单独报错。
+fn parse_described_instance(
+    value: &Value,
+    region_id: &str,
+    instance_id: &str,
+) -> Result<Option<InstanceInfo>, AliyunError> {
+    let instances = value
+        .get("Instances")
+        .and_then(|instances| instances.get("Instance"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AliyunError::Parse(format!(
+                "DescribeInstances 缺少有效的 Instances.Instance 数组（RequestId {}）",
+                value
+                    .get("RequestId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+            ))
+        })?;
+    Ok(instances
+        .iter()
+        .find(|item| item.get("InstanceId").and_then(Value::as_str) == Some(instance_id))
+        .map(|item| parse_instance(item, region_id)))
 }
 
 /// 从上到下取出第一个非空地址。
@@ -945,14 +1081,15 @@ fn parse_rpc_response(status: u16, body: &str, action: &str) -> Result<Value, Al
 
     let parsed: Value = serde_json::from_str(trimmed).map_err(|err| {
         if (200..300).contains(&status) {
-            AliyunError::Parse(format!(
-                "{action} 响应不是 JSON（{err}）：{}",
-                truncate_str(trimmed, 200)
-            ))
+            AliyunError::Parse(format!("{action} 响应不是 JSON（{err}）"))
         } else {
             AliyunError::Api {
                 code: format!("HTTP{status}"),
-                message: truncate_str(trimmed, 200),
+                message: if status == 530 && trimmed.contains("1016") {
+                    "Cloudflare error code: 1016（DNS 解析失败）".into()
+                } else {
+                    format!("{action} 返回非 JSON 错误响应")
+                },
                 request_id: None,
                 http_status: status,
             }
@@ -1111,7 +1248,7 @@ pub async fn sync_account(
             )),
             Ok(Some(mut instance)) => {
                 if instance.public_ipv6.is_none() {
-                    // IPv6 只用于展示：补查及分页总共最多 3 秒，不占满 20 秒采集
+                    // IPv6 只用于展示：补查及分页总共最多 3 秒，不占满采集
                     // 预算，也不把这条查询加入手动启停前的状态核实路径。
                     let ipv6 = crate::runtime::timeout(
                         3_000,
@@ -1122,7 +1259,7 @@ pub async fn sync_account(
                         Ok(Ok(address)) => instance.public_ipv6 = address,
                         Ok(Err(err)) => {
                             let permission_hint = if matches!(
-                                err,
+                                err.root(),
                                 AliyunError::Api {
                                     http_status: 401 | 403,
                                     ..
@@ -1640,13 +1777,139 @@ mod tests {
     }
 
     #[test]
-    fn endpoints_by_site() {
-        let china = Endpoints::for_site(SiteType::China);
-        assert_eq!(china.cdt, "https://cdt.aliyuncs.com");
-        assert_eq!(china.bss, "https://business.aliyuncs.com");
+    fn resolution_failures_wait_for_next_cron() {
+        let error =
+            parse_rpc_response(530, "error code: 1016", "ListCdtInternetTraffic").unwrap_err();
+        assert!(!error.is_retryable());
+        assert!(!AliyunError::Network("DNS 解析失败".into()).is_retryable());
+        assert!(AliyunError::Network("TLS 连接失败".into()).is_retryable());
+    }
 
-        let intl = Endpoints::for_site(SiteType::Intl);
-        assert_eq!(intl.ecs, "https://ecs.ap-southeast-1.aliyuncs.com");
-        assert_eq!(intl.bss, "https://business.ap-southeast-1.aliyuncs.com");
+    #[test]
+    fn request_context_preserves_diagnostics_without_credentials() {
+        let source = sanitize_error(
+            AliyunError::Api {
+                code: "SignatureDoesNotMatch".into(),
+                message: "https://cdt.aliyuncs.com/?AccessKeyId=fixture-key&Signature=secret"
+                    .into(),
+                request_id: Some("request-123".into()),
+                http_status: 403,
+            },
+            &["fixture-key", "secret"],
+        );
+        let error = AliyunError::Request {
+            context: RequestContext {
+                host: "cdt.aliyuncs.com".into(),
+                action: "ListCdtInternetTraffic".into(),
+                region: "cn-hongkong".into(),
+                elapsed_ms: 123,
+                attempts: 1,
+            },
+            source: Box::new(source),
+        };
+        let text = error.short();
+        for expected in [
+            "SignatureDoesNotMatch",
+            "HTTP 403",
+            "request-123",
+            "cdt.aliyuncs.com",
+            "ListCdtInternetTraffic",
+            "cn-hongkong",
+            "123ms",
+            "尝试 1 次",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        for secret in [
+            "fixture-key",
+            "secret",
+            "https://",
+            "AccessKeyId",
+            "Signature=",
+        ] {
+            assert!(!text.contains(secret));
+        }
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn contextual_query_timeout_keeps_read_only_wording() {
+        let error = AliyunError::Request {
+            context: RequestContext {
+                host: "ecs.cn-hongkong.aliyuncs.com".into(),
+                action: "DescribeInstances".into(),
+                region: "cn-hongkong".into(),
+                elapsed_ms: 12800,
+                attempts: 3,
+            },
+            source: Box::new(AliyunError::Network(crate::runtime::TIMEOUT_MESSAGE.into())),
+        };
+        let text = error.query_failure("实例查询");
+        assert!(text.contains("实例查询失败，网络连接超时"));
+        assert!(text.contains("ecs.cn-hongkong.aliyuncs.com"));
+        assert!(!text.contains("执行结果可能"));
+    }
+
+    #[test]
+    fn endpoints_by_site_and_region() {
+        for region in ["cn-hongkong", "ap-southeast-1", "ap-northeast-1"] {
+            let china = Endpoints::for_region(SiteType::China, region);
+            assert_eq!(china.ecs, "https://ecs.aliyuncs.com");
+            assert_eq!(china.cdt, "https://cdt.aliyuncs.com");
+            assert_eq!(china.bss, "https://business.aliyuncs.com");
+
+            let intl = Endpoints::for_region(SiteType::Intl, region);
+            assert_eq!(intl.ecs, format!("https://ecs.{region}.aliyuncs.com"));
+            assert_eq!(intl.cdt, "https://cdt.aliyuncs.com");
+            assert_eq!(intl.bss, "https://business.ap-southeast-1.aliyuncs.com");
+        }
+        assert_eq!(
+            Endpoints::for_region(SiteType::Intl, " CN-HONGKONG ").ecs,
+            "https://ecs.cn-hongkong.aliyuncs.com"
+        );
+    }
+
+    #[test]
+    fn describe_instance_distinguishes_missing_instance_from_malformed_response() {
+        let empty = serde_json::json!({"Instances": {"Instance": []}});
+        assert!(
+            parse_described_instance(&empty, "cn-hongkong", "i-test")
+                .unwrap()
+                .is_none()
+        );
+
+        let found = serde_json::json!({"Instances": {"Instance": [
+            {"InstanceId": "i-other"}, {"InstanceId": "i-test", "Status": "Running"}
+        ]}});
+        let instance = parse_described_instance(&found, "cn-hongkong", "i-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(instance.instance_id, "i-test");
+        assert_eq!(instance.region_id, "cn-hongkong");
+        assert_eq!(instance.status, "Running");
+        assert!(
+            parse_described_instance(&found, "cn-hongkong", "i-missing")
+                .unwrap()
+                .is_none()
+        );
+
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"Instances": {}}),
+            serde_json::json!({"Instances": {"Instance": null}}),
+            serde_json::json!({"Instances": {"Instance": {"InstanceId": "i-test"}}}),
+        ] {
+            assert!(matches!(
+                parse_described_instance(&response, "cn-hongkong", "i-test"),
+                Err(AliyunError::Parse(_))
+            ));
+        }
+        let error = parse_described_instance(
+            &serde_json::json!({"RequestId": "request-test"}),
+            "cn-hongkong",
+            "i-test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("request-test"));
     }
 }
