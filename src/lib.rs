@@ -716,15 +716,17 @@ async fn handle_overview(app: &AppCtx, req: &Request) -> worker::Result<Response
         }
     }
 
+    let month = crate::models::billing_month(app.now, &app.timezone);
     let overviews = accounts
         .iter()
-        .map(|account| build_overview(account, snapshots.get(&account.id), &app.timezone, app.now))
+        .map(|account| build_overview(account, snapshots.get(&account.id), &month))
         .collect::<Vec<_>>();
 
     ok(&crate::models::OverviewResponse {
         accounts: overviews,
         timezone: app.timezone.clone(),
-        billing_month: crate::models::billing_month(app.now, &app.timezone),
+        total_traffic_gb: crate::models::monthly_traffic_gb(&accounts, &snapshots, &month),
+        billing_month: month,
     })
 }
 
@@ -886,13 +888,14 @@ async fn handle_create_account(app: &AppCtx, mut req: Request) -> worker::Result
         Err(err) => return error_response(502, format!("无法核实云账号身份：{}", err.short())),
     };
 
-    let dns = match payload.dns.as_ref() {
-        Some(input) => match input.apply(&dns::DnsSettings::default(), &app.crypto, false) {
-            Ok(config) => config,
-            Err(message) => return error_response(400, message),
-        },
-        None => dns::DnsSettings::default(),
-    };
+    let dns = payload
+        .dns
+        .as_ref()
+        .map(|input| input.apply(&dns::DnsSettings::default()))
+        .unwrap_or_default();
+    if dns.enabled && !app.db.get_ddns_config().await?.configured() {
+        return error_response(400, "请先在控制台设置的 DDNS 中配置域名和凭据");
+    }
     let dns_json =
         serde_json::to_string(&dns).map_err(|e| worker::Error::RustError(e.to_string()))?;
 
@@ -1060,32 +1063,24 @@ async fn update_account_locked(
     }
 
     let previous_dns = dns::DnsSettings::from_account(&existing);
-    let resource_changed = existing.cloud_account_id != cloud_id
+    let was_enabled = previous_dns.enabled;
+    let mut dns = payload
+        .dns
+        .as_ref()
+        .map(|input| input.apply(&previous_dns))
+        .unwrap_or(previous_dns);
+    // 配置缺失不能阻止修改实例其他字段或关闭负载均衡。
+    if !was_enabled && dns.enabled && !app.db.get_ddns_config().await?.configured() {
+        return error_response(400, "请先在控制台设置的 DDNS 中配置域名和凭据");
+    }
+    if existing.cloud_account_id != cloud_id
         || existing.region_id != payload.normalized_region()
-        || existing.instance_id_opt() != Some(payload.require_instance_id()?);
-    let dns = match payload.dns.as_ref() {
-        Some(input) => match input.apply(&previous_dns, &app.crypto, resource_changed) {
-            Ok(config) => config,
-            Err(message) => return error_response(400, message),
-        },
-        None => {
-            let mut config = previous_dns;
-            if resource_changed {
-                config.state.drain_at = None;
-                config.state.paused = false;
-                config.state.seen_stopped = false;
-                config.state.once_event = None;
-                config.state.attempt_slot = None;
-                config.state.pending_ip = config
-                    .state
-                    .pending_ip
-                    .take()
-                    .or(config.state.published_ip.take());
-                config.state.last_error = None;
-            }
-            config
-        }
-    };
+        || existing.instance_id_opt() != Some(payload.require_instance_id()?)
+    {
+        // 保留旧 IP 和记录归属，下一次同步先清理旧地址。
+        dns.state.last_error = None;
+        dns.state.alert = None;
+    }
     let dns_json =
         serde_json::to_string(&dns).map_err(|e| worker::Error::RustError(e.to_string()))?;
 
@@ -1171,18 +1166,15 @@ async fn handle_get_settings(app: &AppCtx) -> worker::Result<Response> {
     let report: DailyReportConfig = app.db.get_json_setting(setting_key::DAILY_REPORT).await?;
     let timezone = app.db.get_timezone().await?;
 
-    let accounts = app
-        .db
-        .list_accounts(false)
-        .await?
-        .iter()
-        .map(|account| account.to_dto())
-        .collect();
+    let rows = app.db.list_accounts(false).await?;
+    let ddns = app.db.get_ddns_config().await?;
+    let accounts = rows.iter().map(|account| account.to_dto()).collect();
 
     let advanced = app.db.get_advanced_config().await.unwrap_or_default();
     let turnstile = app.turnstile_config().await;
 
     ok(&SettingsDto {
+        ddns: ddns.dto(),
         timezone: timezone.clone(),
         timezone_options: crate::models::timezone_options(),
         advanced: AdvancedSettingsDto::from(&advanced),
@@ -1234,6 +1226,26 @@ async fn handle_get_settings(app: &AppCtx) -> worker::Result<Response> {
         },
         accounts,
     })
+}
+
+/// `PUT /api/v1/settings/ddns`：全局域名和凭据，实例只保留开关及同步状态。
+async fn handle_update_ddns(app: &AppCtx, mut req: Request) -> worker::Result<Response> {
+    let payload: dns::DdnsInput = match read_json(&mut req).await {
+        Ok(payload) => payload,
+        Err(err) => return error_response(400, err),
+    };
+    let previous = app.db.get_ddns_config().await?;
+    let config = match payload.apply(&previous, &app.crypto) {
+        Ok(config) => config,
+        Err(err) => return error_response(400, err),
+    };
+    app.db
+        .set_json_setting(setting_key::DDNS, &config, now_ms())
+        .await?;
+    app.db
+        .add_log(None, "settings_ddns", None, "DDNS 设置已更新", now_ms())
+        .await?;
+    handle_get_settings(app).await
 }
 
 /// 用当前表单测试单个渠道；草稿凭据只在请求内使用，不写入设置或任务队列。
@@ -1545,28 +1557,22 @@ async fn handle_update_advanced(app: &AppCtx, mut req: Request) -> worker::Resul
 
 /// `PUT /api/v1/settings/daily-report`
 async fn handle_update_report(app: &AppCtx, mut req: Request) -> worker::Result<Response> {
-    let payload: DailyReportDto = match read_json(&mut req).await {
+    let mut payload: DailyReportDto = match read_json(&mut req).await {
         Ok(payload) => payload,
         Err(err) => return error_response(400, err),
     };
-    if crate::models::parse_hhmm(&payload.time).is_none() {
+    let Some(minutes) = crate::models::parse_hhmm(&payload.time) else {
         return error_response(400, "日报时间格式应为 HH:MM");
-    }
-
-    let mut config: DailyReportConfig = app.db.get_json_setting(setting_key::DAILY_REPORT).await?;
-    config.enabled = payload.enabled;
-    config.time =
-        crate::models::minutes_to_hhmm(crate::models::parse_hhmm(&payload.time).unwrap_or(540));
+    };
+    payload.time = crate::models::minutes_to_hhmm(minutes);
     let timezone = payload.timezone.trim();
     if !timezone.is_empty() && !is_supported_timezone(timezone) {
         return error_response(400, "时区取值不受支持");
     }
     // 空值保持继承全局时区，避免之后修改系统时区时日报仍按旧时区发送。
-    config.timezone = timezone.to_string();
+    payload.timezone = timezone.to_string();
 
-    app.db
-        .set_json_setting(setting_key::DAILY_REPORT, &config, now_ms())
-        .await?;
+    app.db.set_daily_report(&payload, now_ms()).await?;
 
     handle_get_settings(app).await
 }
@@ -1755,6 +1761,7 @@ async fn handle_api(ctx: Context, req: Request, env: Env) -> worker::Result<Resp
 
         // ------------------------------------------------------------ 设置
         (Method::Get, ["settings"]) => handle_get_settings(&app).await,
+        (Method::Put, ["settings", "ddns"]) => handle_update_ddns(&app, req).await,
         (Method::Put, ["settings", "turnstile"]) => handle_update_turnstile(&app, req).await,
         (Method::Put, ["settings", "telegram"]) => handle_update_telegram(&app, req).await,
         (Method::Put, ["settings", "bark"]) => handle_update_bark(&app, req).await,

@@ -145,6 +145,7 @@ export interface AccountOverview {
 
 export interface OverviewResponse {
   accounts: AccountOverview[]
+  total_traffic_gb: number
   timezone: string
   billing_month: string
 }
@@ -205,11 +206,19 @@ export interface AcceptedJob {
 
 export interface DnsConfig {
   enabled: boolean
+  last_error: string | null
+}
+
+export interface DdnsSettings {
   zone_id: string
   name: string
   token_configured: boolean
-  lead_minutes: number
-  last_error: string | null
+}
+
+export interface DdnsUpdate {
+  zone_id: string
+  name: string
+  api_token?: string
 }
 
 export interface AccountDto {
@@ -243,7 +252,7 @@ export interface AccountDto {
 }
 
 export interface AccountInput {
-  dns?: { enabled: boolean; zone_id: string; name: string; api_token?: string; lead_minutes: number }
+  dns?: { enabled: boolean }
   name: string
   site_type: SiteType
   /** 编辑时留空表示沿用原值 */
@@ -324,6 +333,7 @@ export interface AdvancedSettings {
 }
 
 export interface SettingsResponse {
+  ddns: DdnsSettings
   timezone: string
   timezone_options: TimeZoneOption[]
   advanced: AdvancedSettings
@@ -625,6 +635,10 @@ export const api = {
   // ---------------------------------------------------------------- 设置
   settings(): Promise<SettingsResponse> {
     return request<SettingsResponse>('/api/v1/settings')
+  },
+
+  updateDdns(input: DdnsUpdate): Promise<SettingsResponse> {
+    return request<SettingsResponse>('/api/v1/settings/ddns', { method: 'PUT', body: input })
   },
 
   updateTurnstile(input: TurnstileUpdate): Promise<SettingsResponse> {

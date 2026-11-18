@@ -161,7 +161,7 @@ impl AliyunError {
                     && (detail.contains("expired")
                         || detail.contains("notsupplied")
                         || detail.contains("missing"));
-                code == "emptytrafficdetails"
+                code == "invalidtrafficdetails"
                     || code.starts_with("throttling")
                     || code.contains("serviceunavailable")
                     || code.contains("internalerror")
@@ -422,6 +422,18 @@ impl AliyunClient {
         action: &str,
         extra: Vec<(&str, String)>,
     ) -> Result<Value, AliyunError> {
+        self.call_parsed(endpoint, version, action, extra, |_, value| Ok(value))
+            .await
+    }
+
+    async fn call_parsed<T>(
+        &self,
+        endpoint: &str,
+        version: &str,
+        action: &str,
+        extra: Vec<(&str, String)>,
+        parse: impl Fn(u16, Value) -> Result<T, AliyunError>,
+    ) -> Result<T, AliyunError> {
         const MAX_ATTEMPTS: usize = 3;
         let mut last_error: Option<AliyunError> = None;
         let began = crate::models::now_ms();
@@ -429,7 +441,11 @@ impl AliyunClient {
 
         for attempt in 0..MAX_ATTEMPTS {
             attempts += 1;
-            match self.call_once(endpoint, version, action, &extra).await {
+            match self
+                .call_once(endpoint, version, action, &extra)
+                .await
+                .and_then(|(status, value)| parse(status, value))
+            {
                 Ok(value) => return Ok(value),
                 Err(err) => {
                     let retryable = err.is_retryable();
@@ -477,7 +493,7 @@ impl AliyunClient {
         version: &str,
         action: &str,
         extra: &[(&str, String)],
-    ) -> Result<Value, AliyunError> {
+    ) -> Result<(u16, Value), AliyunError> {
         let mut params: BTreeMap<String, String> = BTreeMap::new();
         params.insert("AccessKeyId".to_string(), self.access_key_id.clone());
         params.insert("Action".to_string(), action.to_string());
@@ -543,19 +559,7 @@ impl AliyunClient {
                     AliyunError::Network(safe)
                 })?;
 
-        let value = parse_rpc_response(status, &body, action)?;
-        if action == "ListCdtInternetTraffic" && !CdtTraffic::has_details(&value) {
-            return Err(AliyunError::Api {
-                code: "EmptyTrafficDetails".into(),
-                message: "ListCdtInternetTraffic 连续 3 次未取得有效流量明细，请稍后重试".into(),
-                request_id: value
-                    .get("RequestId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                http_status: status,
-            });
-        }
-        Ok(value)
+        Ok((status, parse_rpc_response(status, &body, action)?))
     }
 
     // -----------------------------------------------------------------------
@@ -569,15 +573,25 @@ impl AliyunClient {
     pub async fn query_cdt_traffic(&self) -> Result<CdtTraffic, AliyunError> {
         // 空明细与限流/网络失败共用一次重试预算，最多 3 次请求，避免嵌套放大。
         // RegionId 与上游一致；该全局接口返回当前计费周期内的累计值。
-        let value = self
-            .call(
-                &self.endpoints.cdt,
-                "2021-08-13",
-                "ListCdtInternetTraffic",
-                vec![("RegionId", "cn-hongkong".into())],
-            )
-            .await?;
-        Ok(CdtTraffic::parse(&value, self.site))
+        self.call_parsed(
+            &self.endpoints.cdt,
+            "2021-08-13",
+            "ListCdtInternetTraffic",
+            vec![("RegionId", "cn-hongkong".into())],
+            |status, value| {
+                CdtTraffic::parse(&value, self.site).ok_or_else(|| AliyunError::Api {
+                    code: "InvalidTrafficDetails".into(),
+                    message: "ListCdtInternetTraffic 连续 3 次未取得有效流量明细，请稍后重试"
+                        .into(),
+                    request_id: value
+                        .get("RequestId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    http_status: status,
+                })
+            },
+        )
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -816,13 +830,11 @@ pub struct CdtTraffic {
     pub domestic_bytes: i64,
     /// 非中国内地（中国香港及海外）累计流量。
     pub overseas_bytes: i64,
-    /// 解析到的条目数（0 表示接口没返回数据）。
-    pub items: usize,
 }
 
 impl CdtTraffic {
     pub fn total_bytes(&self) -> i64 {
-        self.domestic_bytes.max(0) + self.overseas_bytes.max(0)
+        self.domestic_bytes + self.overseas_bytes
     }
 
     /// 解析 `ListCdtInternetTraffic` 的响应。
@@ -832,31 +844,30 @@ impl CdtTraffic {
     ///
     /// 地域字段缺失的条目按站点归入对应池（国内站算内地、国际站算海外），
     /// 这是接口偶发缺字段时的兜底，不改变正常路径。
-    pub fn parse(value: &Value, site: SiteType) -> Self {
+    pub fn parse(value: &Value, site: SiteType) -> Option<Self> {
         let mut out = CdtTraffic::default();
 
         let items = value
             .get("TrafficDetails")
-            .map(traffic_items)
-            .filter(|items| !items.is_empty())
+            .and_then(traffic_items)
             .or_else(|| {
                 value
                     .get("Data")
                     .and_then(|data| data.get("TrafficDetails"))
-                    .map(traffic_items)
-            })
-            .unwrap_or_default();
+                    .and_then(traffic_items)
+            })?;
 
         for item in items {
-            let Some(bytes) = item.get("Traffic").and_then(json_to_i64) else {
-                continue;
-            };
+            let traffic = item.get("Traffic")?;
+            let bytes = traffic
+                .as_i64()
+                .or_else(|| traffic.as_str()?.trim().parse().ok())
+                .filter(|bytes| *bytes >= 0)?;
             let region = item
                 .get("BusinessRegionId")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|v| !v.is_empty());
-            out.items += 1;
 
             let pool = match region {
                 Some(region) => QuotaPool::of_region(region),
@@ -865,57 +876,25 @@ impl CdtTraffic {
                     SiteType::Intl => QuotaPool::Overseas,
                 },
             };
-            match pool {
-                QuotaPool::Domestic => out.domestic_bytes += bytes,
-                QuotaPool::Overseas => out.overseas_bytes += bytes,
-            }
+            let subtotal = match pool {
+                QuotaPool::Domestic => &mut out.domestic_bytes,
+                QuotaPool::Overseas => &mut out.overseas_bytes,
+            };
+            *subtotal = subtotal.checked_add(bytes)?;
         }
 
-        out.domestic_bytes = out.domestic_bytes.max(0);
-        out.overseas_bytes = out.overseas_bytes.max(0);
-        out
-    }
-
-    /// 响应里是否有 `TrafficDetails`（含非空数组）。空数组视为无数据。
-    pub fn has_details(value: &Value) -> bool {
-        value
-            .get("TrafficDetails")
-            .map(traffic_items)
-            .filter(|items| !items.is_empty())
-            .is_some()
-            || value
-                .get("Data")
-                .and_then(|data| data.get("TrafficDetails"))
-                .map(traffic_items)
-                .is_some_and(|items| !items.is_empty())
+        out.domestic_bytes.checked_add(out.overseas_bytes)?;
+        Some(out)
     }
 }
 
 /// 把 `TrafficDetails` 归一化成数组：接受数组本身或 `{"Item": [...]}`。
-fn traffic_items(value: &Value) -> Vec<Value> {
-    if let Some(array) = value.as_array() {
-        return array.clone();
+fn traffic_items(value: &Value) -> Option<&[Value]> {
+    match value.get("Item").unwrap_or(value) {
+        Value::Array(items) if !items.is_empty() => Some(items),
+        item @ Value::Object(_) if value.get("Item").is_some() => Some(std::slice::from_ref(item)),
+        _ => None,
     }
-    if let Some(item) = value.get("Item") {
-        if let Some(array) = item.as_array() {
-            return array.clone();
-        }
-        if item.is_object() {
-            return vec![item.clone()];
-        }
-    }
-    Vec::new()
-}
-
-/// 数字或数字字符串转 `i64`。
-fn json_to_i64(value: &Value) -> Option<i64> {
-    if let Some(n) = value.as_i64() {
-        return Some(n);
-    }
-    if let Some(f) = value.as_f64() {
-        return Some(f.round() as i64);
-    }
-    value.as_str()?.trim().parse::<i64>().ok()
 }
 
 /// 仅真正的实例数组可以用于判断实例不存在；响应结构异常应单独报错。
@@ -1211,10 +1190,7 @@ pub async fn sync_account(
     .await;
     match traffic {
         Ok(traffic) => {
-            if traffic.items == 0 {
-                out.warnings
-                    .push("CDT 接口未返回任何流量条目（可能当月还没有产生流量）".to_string());
-            } else if traffic.total_bytes() < MIN_PLAUSIBLE_TRAFFIC_BYTES {
+            if (1..MIN_PLAUSIBLE_TRAFFIC_BYTES).contains(&traffic.total_bytes()) {
                 // 有条目但总量小到不可能是真实值：多半是接口改了单位
                 // （例如从字节变成 GB），按字节解释会低估 1024³ 倍，
                 // 导致熔断永远不触发。宁可报错也不要静默算错。
@@ -1350,10 +1326,9 @@ mod tests {
                 { "BusinessRegionId": "ap-southeast-1", "Traffic": 1073741824i64 }
             ]
         });
-        let traffic = CdtTraffic::parse(&value, SiteType::China);
+        let traffic = CdtTraffic::parse(&value, SiteType::China).unwrap();
         assert_eq!(traffic.domestic_bytes, 3 * 1073741824, "内地合计 3 GiB");
         assert_eq!(traffic.overseas_bytes, 5 * 1073741824, "非内地合计 5 GiB");
-        assert_eq!(traffic.items, 4);
         assert_eq!(traffic.total_bytes(), 8 * 1073741824);
     }
 
@@ -1369,7 +1344,7 @@ mod tests {
                 { "BusinessRegionId": "cn-hongkong", "Traffic": 21_474_836_480i64 }
             ]
         });
-        let traffic = CdtTraffic::parse(&value, SiteType::China);
+        let traffic = CdtTraffic::parse(&value, SiteType::China).unwrap();
 
         // 必须正好等于 20 GiB，而不是 20
         assert_eq!(traffic.overseas_bytes, 20 * 1024 * 1024 * 1024);
@@ -1391,9 +1366,8 @@ mod tests {
                 ]
             }
         });
-        let traffic = CdtTraffic::parse(&value, SiteType::China);
+        let traffic = CdtTraffic::parse(&value, SiteType::China).unwrap();
         assert_eq!(traffic.domestic_bytes, 1024);
-        assert_eq!(traffic.items, 1);
     }
 
     #[test]
@@ -1405,7 +1379,7 @@ mod tests {
                 ]
             }
         });
-        let traffic = CdtTraffic::parse(&value, SiteType::China);
+        let traffic = CdtTraffic::parse(&value, SiteType::China).unwrap();
         assert_eq!(traffic.overseas_bytes, 2048);
     }
 
@@ -1416,7 +1390,7 @@ mod tests {
                 { "BusinessRegionId": "cn-hangzhou", "Traffic": "1024" }
             ]
         });
-        let traffic = CdtTraffic::parse(&value, SiteType::China);
+        let traffic = CdtTraffic::parse(&value, SiteType::China).unwrap();
         assert_eq!(traffic.domestic_bytes, 1024);
     }
 
@@ -1425,11 +1399,11 @@ mod tests {
         let value = serde_json::json!({
             "TrafficDetails": [ { "Traffic": 42 }, { "Traffic": 8 } ]
         });
-        let cn = CdtTraffic::parse(&value, SiteType::China);
+        let cn = CdtTraffic::parse(&value, SiteType::China).unwrap();
         assert_eq!(cn.domestic_bytes, 50);
         assert_eq!(cn.overseas_bytes, 0);
 
-        let intl = CdtTraffic::parse(&value, SiteType::Intl);
+        let intl = CdtTraffic::parse(&value, SiteType::Intl).unwrap();
         assert_eq!(intl.overseas_bytes, 50);
         assert_eq!(intl.domestic_bytes, 0);
     }
@@ -1445,7 +1419,7 @@ mod tests {
                 { "BusinessRegionId": "ap-southeast-1", "Traffic": 30 }
             ]
         });
-        let traffic = CdtTraffic::parse(&value, SiteType::China);
+        let traffic = CdtTraffic::parse(&value, SiteType::China).unwrap();
         assert_eq!(
             traffic.domestic_bytes, 150,
             "内地仅 cn-hangzhou + cn-shanghai"
@@ -1464,36 +1438,36 @@ mod tests {
                 { "BusinessRegionId": "us-west-1", "Traffic": 400 },
             ]
         });
-        let traffic = CdtTraffic::parse(&value, SiteType::China);
+        let traffic = CdtTraffic::parse(&value, SiteType::China).unwrap();
         assert_eq!(traffic.domestic_bytes, 100);
         assert_eq!(traffic.overseas_bytes, 900);
     }
 
     #[test]
-    fn cdt_parse_empty() {
-        let none = CdtTraffic::parse(&serde_json::json!({ "RequestId": "x" }), SiteType::China);
-        assert_eq!(none, CdtTraffic::default());
-
-        let empty = CdtTraffic::parse(
-            &serde_json::json!({ "TrafficDetails": [] }),
-            SiteType::China,
-        );
-        assert_eq!(empty.items, 0);
-        assert_eq!(empty.total_bytes(), 0);
+    fn cdt_rejects_incomplete_or_overflowing_totals() {
+        use serde_json::json;
+        for value in [
+            json!({}),
+            json!({"TrafficDetails": []}),
+            json!({"TrafficDetails": [{"Traffic": 123}, {"Traffic": null}]}),
+            json!({"TrafficDetails": [{"Traffic": "-1"}]}),
+            json!({"TrafficDetails": [{"Traffic": 1.5}]}),
+            json!({"TrafficDetails": [{"Traffic": "unknown"}]}),
+            json!({"TrafficDetails": [{"Traffic": u64::MAX}]}),
+            json!({"TrafficDetails": [{"Traffic": i64::MAX}, {"Traffic": 1}]}),
+            json!({"TrafficDetails": [{"Traffic": i64::MAX}, {"BusinessRegionId": "cn-hongkong", "Traffic": 1}]}),
+        ] {
+            assert_eq!(CdtTraffic::parse(&value, SiteType::China), None, "{value}");
+        }
     }
 
     #[test]
-    fn has_details_detects_non_empty() {
-        assert!(!CdtTraffic::has_details(&serde_json::json!({})));
-        assert!(!CdtTraffic::has_details(
-            &serde_json::json!({ "TrafficDetails": [] })
-        ));
-        assert!(CdtTraffic::has_details(&serde_json::json!({
-            "TrafficDetails": [ { "BusinessRegionId": "cn-hangzhou", "Traffic": 1 } ]
-        })));
-        assert!(CdtTraffic::has_details(&serde_json::json!({
-            "Data": { "TrafficDetails": [ { "BusinessRegionId": "cn-hangzhou", "Traffic": 1 } ] }
-        })));
+    fn cdt_accepts_explicit_zero() {
+        let value = serde_json::json!({"TrafficDetails": {"Item": {"Traffic": "0"}}});
+        assert_eq!(
+            CdtTraffic::parse(&value, SiteType::China),
+            Some(CdtTraffic::default())
+        );
     }
 
     #[test]

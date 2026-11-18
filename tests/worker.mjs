@@ -23,11 +23,14 @@ state.dnsCalls = 0
 state.dnsDeletes = 0
 state.dnsDeleteFailed = false
 state.dnsWriteUnknown = false
+state.dnsToken = 'fixture-dns-token'
+state.dnsDeniedZone = null
 state.controlEvents = []
 let trafficGate = null
 let instanceGate = null
+let notificationGate = null
 const testDirectory = await mkdtemp(resolve(tmpdir(), 'cdt-worker-test-'))
-const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor',
+const monitor = { name: 'monitor',
   modules: [
     { type: 'ESModule', path: resolve('tests/budget-worker.mjs') },
     { type: 'ESModule', path: resolve('build/index.js') },
@@ -44,22 +47,24 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
     const url = new URL(request.url)
     if (url.hostname === 'api.cloudflare.com') {
       state.dnsCalls++
-      assert.equal(request.headers.get('authorization'), 'Bearer fixture-dns-token')
-      assert.match(url.pathname, /^\/client\/v4\/zones\/a{32}\/dns_records/)
+      assert.equal(request.headers.get('authorization'), `Bearer ${state.dnsToken}`)
+      assert.match(url.pathname, /^\/client\/v4\/zones\/(?:a{32}|b{32})\/dns_records/)
+      const zoneId = url.pathname.split('/')[4]
       const recordId = url.pathname.split('/')[6]
       const ok = result => Response.json({ success: true, result })
+      if (zoneId === state.dnsDeniedZone) return Response.json({ success: false, errors: [{ code: 10000 }] }, { status: 403 })
       if (request.method === 'GET') {
         assert.equal(url.searchParams.get('type'), 'A')
-        assert.equal(url.searchParams.get('name'), 'dns-test.example.com')
+        assert.ok(['dns-test.example.com', 'dns-next.example.com', 'dns-new.example.net'].includes(url.searchParams.get('name')))
         assert.ok(url.searchParams.get('content'), 'never scan a zone or all records for the hostname')
-        return ok(state.dnsRecords.filter(record => record.name === url.searchParams.get('name') && record.content === url.searchParams.get('content')))
+        return ok(state.dnsRecords.filter(record => record.zoneId === zoneId && record.name === url.searchParams.get('name') && record.content === url.searchParams.get('content')))
       }
       if (request.method === 'DELETE') {
         state.dnsDeletes++
         state.controlEvents.push('dns-delete')
         if (state.dnsDeleteDelay) await new Promise(resolve => setTimeout(resolve, state.dnsDeleteDelay))
         if (state.dnsDeleteFailed) return Response.json({ success: false, errors: [{ code: 10000 }] }, { status: 403 })
-        const found = state.dnsRecords.findIndex(record => record.id === recordId)
+        const found = state.dnsRecords.findIndex(record => record.zoneId === zoneId && record.id === recordId)
         if (found < 0) return Response.json({ success: false }, { status: 404 })
         state.dnsRecords.splice(found, 1)
         return ok({ id: recordId })
@@ -68,15 +73,15 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
       assert.equal(body.type, 'A')
       assert.equal(body.ttl, 300)
       assert.equal(body.proxied, false)
-      assert.equal(body.name, 'dns-test.example.com')
+      assert.ok(['dns-test.example.com', 'dns-next.example.com', 'dns-new.example.net'].includes(body.name))
       let record
       if (request.method === 'PATCH') {
-        record = state.dnsRecords.find(record => record.id === recordId)
+        record = state.dnsRecords.find(record => record.zoneId === zoneId && record.id === recordId)
         if (!record) return Response.json({ success: false }, { status: 404 })
         Object.assign(record, body)
       } else {
         assert.equal(request.method, 'POST')
-        record = { id: `record-${state.dnsCalls}`, ...body }
+        record = { id: `record-${state.dnsCalls}`, zoneId, ...body }
         state.dnsRecords.push(record)
       }
       if (state.dnsWriteUnknown) {
@@ -95,6 +100,7 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
       state.notifications++
       const notifyBody = await request.text()
       if (notifyBody.includes('DNS')) state.controlEvents.push('dns-alert')
+      if (notificationGate) await notificationGate
       if (state.notifyDelay) await new Promise(resolve => setTimeout(resolve, state.notifyDelay))
       state.lastTelegram = { path: url.pathname, body: notifyBody }
       return state.notifyFailed ? fail() : Response.json({ ok: true })
@@ -168,7 +174,8 @@ const mf = new Miniflare({ d1Persist: testDirectory, workers: [{ name: 'monitor'
       default: throw new Error(`Unexpected outbound request: ${url.origin}${url.pathname}`)
     }
   },
-}] })
+}
+const mf = new Miniflare({ d1Persist: testDirectory, workers: [monitor] })
 let cookie = ''
 async function request(path, method = 'GET', body, ip = '192.0.2.1') {
   return mf.dispatchFetch(`https://monitor.test/api/v1/${path}`, {
@@ -328,12 +335,24 @@ try {
   }
   assert.deepEqual(await history(), beforeEmptyHistory, 'empty traffic must not overwrite history with zero')
   console.log('✓ 连续空流量响应重试耗尽后失败，保留用量、账期、成功时间、历史与熔断')
+  const malformedCalls = state.trafficCalls
+  state.trafficResponses = [[{ Traffic: null }], [{ Traffic: 100 }, {}], [{ Traffic: -1 }]]
+    .map(rows => ({ status: 200, body: JSON.stringify({ TrafficDetails: rows }) }))
+  assert.match((await refresh('failed')).error_msg, /有效流量明细/)
+  assert.equal(state.trafficCalls - malformedCalls, 3)
+  const afterMalformed = await snapshot()
+  for (const field of ['billing_month', 'cdt_domestic_bytes', 'cdt_overseas_bytes', 'traffic_updated_at', 'threshold_triggered_month', 'threshold_limit_gb']) {
+    assert.equal(afterMalformed[field], beforeEmpty[field])
+  }
+  assert.deepEqual(await history(), beforeEmptyHistory)
+  console.log('✓ 流量缺字段、含部分无效条目或负数均不能覆盖已有样本或解除熔断')
   state.traffic = 0
   state.trafficResponses = [{ status: 200, body: '{"TrafficDetails":[]}' }]
   const recoveredCalls = state.trafficCalls
   await refresh()
   assert.equal(state.trafficCalls - recoveredCalls, 2)
   assert.equal((await snapshot()).cdt_overseas_bytes, 0, 'explicit zero traffic remains valid')
+  assert.doesNotMatch((await snapshot()).sync_errors_json, /单位|有效流量明细/)
   assert.equal((await snapshot()).threshold_triggered_month, null)
   state.traffic = 190
   console.log('✓ 提升阈值必须经成功采集才解除熔断')
@@ -413,6 +432,28 @@ try {
   state.notifyFailed = false
   const staleReport = await runJob('reports/daily')
   assert.match(staleReport.result_msg, /telegram.*✅/i)
+  // 原账号快照停留在旧账期。插入本例的计量快照，无需发出云请求。
+  const samples = [
+    ['1001', 'cn-hongkong', 25, 100],
+    ['1001', 'ap-southeast-1', 12, 200],
+    ['1001', 'cn-hangzhou', 3, 100],
+    ['2002', 'cn-hongkong', 7, 100],
+    ['1001', 'cn-hongkong', 90, null],
+  ]
+  const meterIds = []
+  for (const [owner, region, gb, at] of samples) {
+    const row = await db.prepare("INSERT INTO accounts (name, cloud_account_id, access_key_id, encrypted_access_key_secret, region_id, instance_id, created_at, updated_at) VALUES ('Meter fixture', ?, ?, 'fixture', ?, 'i-meter', 1, 1) RETURNING id")
+      .bind(owner, 'meter-key-' + owner, region).first()
+    meterIds.push(row.id)
+    await db.prepare('INSERT INTO account_snapshots (account_id, billing_month, cdt_domestic_bytes, cdt_overseas_bytes, traffic_updated_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(row.id, overview.billing_month, gb * 1024 ** 3, gb * 1024 ** 3, at, 1000 - (at ?? 0)).run()
+  }
+  const metered = await api('overview')
+  assert.equal(metered.total_traffic_gb, 22)
+  assert.deepEqual(metered.accounts.filter(a => meterIds.includes(a.id)).map(a => a.traffic_used_gb), [25, 12, 3, 7, 90])
+  assert.match((await runJob('reports/daily')).result_msg, /本月合计流量 22\.00 GB/)
+  await db.batch(meterIds.map(key => db.prepare('DELETE FROM accounts WHERE id = ?').bind(key)))
+  console.log('✓ 概览和日报按主账号、当月和额度池取最新成功用量，保留各实例卡片')
   await api('settings/telegram', 'PUT', { enabled: false })
   console.log('✓ 手动日报无通知渠道或发送失败时任务失败，成功送达后才提示成功')
   const beforePreviewSettings = (await db.prepare('SELECT * FROM settings ORDER BY key').all()).results
@@ -1061,8 +1102,8 @@ try {
   await api('settings/telegram', 'PUT', { enabled: false })
   console.log('✓ 采集停滞告警在派发端执行，队列未完成仍可告警，并在送达后去重')
 
-  async function maintenance(retry = false) {
-    const result = await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1, body: 'Maintenance' }])
+  async function maintenance(retry = false, target = worker) {
+    const result = await target.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1, body: 'Maintenance' }])
     assert.equal(result.outcome, 'ok', JSON.stringify(result))
     assert.equal(result.retryMessages.length, retry ? 1 : 0, JSON.stringify(result))
   }
@@ -1098,16 +1139,31 @@ try {
   assert.equal(state.notifications, reportNotifications + 1)
   assert.equal(await db.prepare("SELECT * FROM locks WHERE name LIKE 'daily-report:%'").first(), null, 'notification failure must release its lease')
   const reportConfig = async () => JSON.parse((await db.prepare("SELECT value FROM settings WHERE key = 'daily_report'").first()).value)
-  assert.equal((await reportConfig()).last_sent_date, null)
+  assert.equal((await reportConfig()).last_sent_date ?? null, null)
   state.notifyFailed = false
-  await maintenance()
+  let releaseNotification
+  notificationGate = new Promise(resolve => { releaseNotification = resolve })
+  const sendingReport = maintenance()
+  try {
+    await eventually(() => state.notifications === reportNotifications + 2, 'report reaches notification channel')
+    await api('settings/daily-report', 'PUT', { enabled: false, time: '13:25', timezone: 'UTC+5:30' })
+  } finally {
+    releaseNotification()
+    notificationGate = null
+    await sendingReport
+  }
   assert.equal(state.notifications, reportNotifications + 2)
-  assert.ok((await reportConfig()).last_sent_date)
+  const deliveredReport = await reportConfig()
+  assert.ok(deliveredReport.last_sent_date)
+  assert.deepEqual(deliveredReport, { enabled: false, time: '13:25', timezone: 'UTC+5:30', last_sent_date: deliveredReport.last_sent_date })
+  await api('settings/daily-report', 'PUT', { enabled: true, time: reportTime, timezone: 'UTC+8' })
+  assert.equal((await reportConfig()).last_sent_date, deliveredReport.last_sent_date)
   await maintenance()
   assert.equal(state.notifications, reportNotifications + 2, 'delivered daily report must not repeat')
   await api('settings/daily-report', 'PUT', { enabled: false, time: reportTime, timezone: 'UTC+8' })
   await api('settings/telegram', 'PUT', { enabled: false })
   console.log('✓ 日报生成或推送失败均释放租约，恢复后重试发送，送达后去重')
+  console.log('✓ 推送期间保存的新日报时间、时区和开关生效，之后保存设置也保留送达日期')
 
   state.stallTraffic = true
   let began = Date.now()
@@ -1123,7 +1179,7 @@ try {
   state.stallBody = false
   console.log('✓ 请求头和响应体卡住时均能超时收尾')
 
-  // DNS 联动使用独立实例配置，全部 Cloudflare API 在上述夹具中拦截。
+  // DDNS：共享配置、真实 Worker/D1/队列，全部 Cloudflare API 由夹具拦截。
   state.status = 'Running'
   state.publicIp = '192.0.2.10'
   state.traffic = 1
@@ -1131,60 +1187,310 @@ try {
   state.startFailed = false
   state.notifyFailed = false
   await api('settings/telegram', 'PUT', { enabled: true, token: '123456:fixture-token-for-tests', chat_id: 'fixture-chat' })
-  const dnsInput = { enabled: true, zone_id: 'a'.repeat(32), name: 'dns-test.example.com', api_token: 'fixture-dns-token', lead_minutes: 30 }
-  const dnsAccountInput = { ...config, name: 'DNS fixture', instance_id: state.instanceId, traffic_threshold_gb: 0, spot_keep_alive: false, dns: dnsInput }
+  const ddnsInput = { zone_id: 'a'.repeat(32), name: 'dns-test.example.com', api_token: 'fixture-dns-token' }
+  const dnsAccountInput = { ...config, name: 'DDNS fixture', instance_id: state.instanceId, traffic_threshold_gb: 0, spot_keep_alive: false, dns: { enabled: true } }
+  assert.equal((await request('accounts', 'POST', dnsAccountInput)).status, 400, 'enable only after configuring DDNS')
+  for (const invalid of [{ ...ddnsInput, zone_id: 'invalid' }, { ...ddnsInput, name: 'https://example.com' }, { ...ddnsInput, api_token: 'bad\ntoken' }, { ...ddnsInput, api_token: '' }]) {
+    assert.equal((await request('settings/ddns', 'PUT', invalid)).status, 400)
+  }
+  const savedDdns = await api('settings/ddns', 'PUT', ddnsInput)
+  assert.equal(savedDdns.ddns.token_configured, true)
+  assert.equal(JSON.stringify(savedDdns).includes('fixture-dns-token'), false)
+  const sharedConfig = JSON.parse((await db.prepare("SELECT value FROM settings WHERE key = 'ddns'").first()).value)
+  assert.equal(JSON.stringify(sharedConfig).includes('fixture-dns-token'), false, 'shared token is encrypted')
   const dnsAccount = await api('accounts', 'POST', dnsAccountInput)
   const dnsId = dnsAccount.id
-  const dnsRefresh = () => runJob(`accounts/${dnsId}/refresh`)
+  const dnsRefresh = (expected) => runJob(`accounts/${dnsId}/refresh`, expected)
   const dnsStored = async () => JSON.parse((await db.prepare('SELECT dns_json FROM accounts WHERE id = ?').bind(dnsId).first()).dns_json)
-  const setDnsState = async patch => {
-    const stored = await dnsStored()
-    Object.assign(stored.state, patch)
-    await db.prepare('UPDATE accounts SET dns_json = ? WHERE id = ?').bind(JSON.stringify(stored), dnsId).run()
+  const lightRefresh = async () => {
+    const result = await worker.queue('cdt-monitor-tasks', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
+      body: { Refresh: { account_id: dnsId, requested_at: ++cronSequence } },
+    }])
+    assert.equal(result.retryMessages.length, 0, JSON.stringify(result))
   }
-  assert.equal(dnsAccount.dns.token_configured, true)
-  assert.equal(JSON.stringify(dnsAccount).includes('fixture-dns-token'), false)
-  assert.equal(JSON.stringify(await dnsStored()).includes('fixture-dns-token'), false, 'token must be encrypted in D1')
-  for (const dns of [{ ...dnsInput, lead_minutes: 7 }, { ...dnsInput, zone_id: 'invalid' }, { ...dnsInput, name: 'https://example.com' }]) {
-    assert.equal((await request(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns })).status, 400)
-  }
+  assert.deepEqual(dnsAccount.dns, { enabled: true, last_error: null })
+  assert.equal((await dnsStored()).token_enc, undefined, 'new accounts never duplicate shared credentials')
+
   await dnsRefresh()
   assert.equal(state.dnsRecords.length, 1)
-  assert.equal(state.dnsRecords[0].content, state.publicIp)
-  const stableDnsCalls = state.dnsCalls
-  const stableDnsState = await dnsStored()
+  await api('settings/ddns', 'PUT', { ...ddnsInput, api_token: '' })
+  const retainedConfig = JSON.parse((await db.prepare("SELECT value FROM settings WHERE key = 'ddns'").first()).value)
+  assert.equal(retainedConfig.token_enc, sharedConfig.token_enc, 'blank token preserves the shared credential')
+  console.log('✓ DDNS 共享配置验证、凭据加密与留空保留；实例仅保存开关和同步状态')
+
+  // 升级前 D1 在实例行存凭据，状态里的 IP 没有 Zone 和域名归属。
+  const peerRecords = ['192.0.2.51', '192.0.2.52'].map((content, i) => ({ ...state.dnsRecords[0], id: `peer-${i}`, content }))
+  state.dnsRecords.push(...peerRecords)
+  const legacyDns = {
+    enabled: true, zone_id: 'c'.repeat(32), name: 'old.example.org', token_enc: sharedConfig.token_enc, lead_minutes: 30,
+    state: { record_id: 'old-record', published_ip: peerRecords[0].content, pending_ip: peerRecords[1].content, paused: true },
+  }
+  await db.batch([
+    db.prepare("DELETE FROM settings WHERE key = 'ddns'"),
+    db.prepare('UPDATE accounts SET dns_json = ? WHERE id = ?').bind(JSON.stringify(legacyDns), dnsId),
+  ])
+  assert.deepEqual((await api('settings')).ddns, { zone_id: '', name: '', token_configured: false })
+  const dnsCallsWithoutConfig = state.dnsCalls
+  const renamed = await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, name: 'DDNS renamed' })
+  assert.equal(renamed.name, 'DDNS renamed')
+  assert.equal(renamed.dns.enabled, true, 'the browser always submits the unchanged switch')
+  const edited = await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, stop_mode: 'KeepCharging', dns: undefined })
+  assert.equal(edited.stop_mode, 'KeepCharging')
+  assert.equal(edited.dns.enabled, true, 'omitting the switch preserves its value')
+  assert.equal((await dnsStored()).token_enc, undefined, 'saving the account drops its old private configuration')
+  await dnsRefresh()
+  assert.match((await dnsStored()).state.last_error, /请先在控制台设置的 DDNS 中配置/)
+  assert.equal(state.dnsCalls, dnsCallsWithoutConfig, 'missing shared configuration never calls Cloudflare')
+  const dnsOff = await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { enabled: false } })
+  assert.equal(dnsOff.dns.enabled, false)
+  const invalidEnable = await request(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, name: 'must not save' })
+  assert.equal(invalidEnable.status, 400, 'enabling still requires shared configuration')
+  assert.equal((await dnsStored()).enabled, false)
+  assert.equal((await db.prepare('SELECT name FROM accounts WHERE id = ?').bind(dnsId).first()).name, dnsAccountInput.name)
+  await api('settings/ddns', 'PUT', ddnsInput)
+  await api(`accounts/${dnsId}`, 'PUT', dnsAccountInput)
+  await dnsRefresh()
+  const recovered = (await dnsStored()).state
+  assert.equal(recovered.last_error, null)
+  assert.equal(recovered.zone_id, ddnsInput.zone_id)
+  assert.equal(recovered.published_ip, state.publicIp)
+  assert.equal(recovered.pending_ip, null)
+  assert.equal(state.dnsRecords.filter(record => record.content === state.publicIp).length, 1)
+  assert.deepEqual(state.dnsRecords.filter(record => record.content !== state.publicIp), peerRecords, 'unscoped cached IPs must never remove other nodes in the new target')
+  state.dnsRecords = state.dnsRecords.filter(record => record.content === state.publicIp)
+  console.log('✓ 旧格式实例可编辑和关闭开关，重新启用需全局配置，首次同步保留其他节点的记录')
+
+  state.dnsRecords[0].ttl = 1
+  state.dnsRecords[0].proxied = true
+  await dnsRefresh()
+  assert.equal(state.dnsRecords[0].ttl, 300)
+  assert.equal(state.dnsRecords[0].proxied, false, 'adopted records use the configured DNS-only behavior')
+  const stableState = await dnsStored()
+  const stableCalls = state.dnsCalls
   await dnsRefresh()
   await cronAccount(worker, dnsId)
-  assert.equal(state.dnsCalls, stableDnsCalls, 'stable running state makes no DNS requests')
-  assert.deepEqual(await dnsStored(), stableDnsState, 'stable state does not rewrite DNS state')
+  assert.ok(state.dnsCalls > stableCalls, 'stable state still verifies actual DNS records')
+  assert.deepEqual(await dnsStored(), stableState, 'healthy verification does not rewrite state')
+  state.dnsRecords = []
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.length, 1, 'external deletion is repaired even when IP is unchanged')
   state.publicIp = '192.0.2.11'
   await dnsRefresh()
-  assert.equal(state.dnsRecords.length, 1)
-  assert.equal(state.dnsRecords[0].content, state.publicIp)
-  console.log('✓ DNS 配置验证、凭据加密、TTL 300、稳定状态零请求与公网 IP 变化更新')
+  assert.deepEqual(state.dnsRecords.map(r => r.content), ['192.0.2.11'])
+  console.log('✓ 稳定状态核查真实记录，外部删除自动补回，IP 变化清理旧地址且不重复创建')
 
-  state.dnsRecords.push({ id: 'other-node', type: 'A', name: dnsInput.name, content: '192.0.2.99' })
+  const nodeAInstanceId = state.instanceId
+  state.instanceId = 'i-ddns-second'
+  state.publicIp = '192.0.2.20'
+  const secondInput = { ...dnsAccountInput, name: 'DDNS second', instance_id: state.instanceId, access_key_id: 'replacement-key' }
+  const second = await api('accounts', 'POST', secondInput)
+  await runJob(`accounts/${second.id}/refresh`)
+  assert.deepEqual(state.dnsRecords.map(r => r.content).sort(), ['192.0.2.11', '192.0.2.20'])
+  state.instanceId = nodeAInstanceId
+  state.publicIp = '192.0.2.11'
+  const ownRecord = () => state.dnsRecords.find(r => r.content === state.publicIp)
+  const assertSecond = () => assert.equal(state.dnsRecords.filter(r => r.content === '192.0.2.20').length, 1)
   state.dnsDeleteFailed = true
-  const manualAlerts = state.notifications
   state.controlEvents = []
-  const manualDeletes = state.dnsDeletes
+  const manualAlerts = state.notifications
+  state.notifyFailed = true
   await runJob(`accounts/${dnsId}/instances/${state.instanceId}/stop`)
-  assert.equal(state.status, 'Stopped', 'DNS failure must never block manual shutdown')
-  assert.deepEqual(state.controlEvents, ['dns-delete', 'stop', 'dns-alert'])
+  assert.equal(state.status, 'Stopped')
+  assert.deepEqual(state.controlEvents, ['stop', 'dns-delete', 'dns-alert'], 'DNS follows verified shutdown and never delays the stop command')
   assert.equal(state.notifications, manualAlerts + 1)
+  const manualDeletes = state.dnsDeletes
   await dnsRefresh()
+  assert.equal(state.notifications, manualAlerts + 2, 'an undelivered alert is retried on the same DNS fault')
+  state.notifyFailed = false
+  await cronAccount(worker, dnsId)
   await dnsRefresh()
-  assert.equal(state.dnsDeletes, manualDeletes + 1, 'stopped instance never retries failed manual DNS withdrawal')
-  assert.equal(state.notifications, manualAlerts + 1)
+  assert.equal(state.dnsDeletes, manualDeletes + 3, 'failed cleanup retries even while stopped')
+  assert.equal(state.notifications, manualAlerts + 3, 'delivery is confirmed before suppressing further alerts')
+  console.log('✓ DDNS 告警发送失败会再试，持续故障在确认送达后去重')
+  state.dnsDeleteFailed = false
+  state.publicIp = null // 节省停机可能释放公网 IP，仍必须清理最后一次登记的地址。
+  await cronAccount(worker, dnsId)
+  assert.deepEqual(state.dnsRecords.map(r => r.content), ['192.0.2.20'])
+  assert.equal((await dnsStored()).state.published_ip, null)
+  state.instanceId = 'i-ddns-second'
+  state.status = 'Running'
+  state.publicIp = '192.0.2.11'
+  await runJob(`accounts/${second.id}/refresh`)
+  const successor = structuredClone(ownRecord())
+  state.instanceId = nodeAInstanceId
+  state.status = 'Stopped'
+  state.publicIp = null
+  const callsAfterRelease = state.dnsCalls
+  await cronAccount(worker, dnsId)
+  assert.equal(state.dnsCalls, callsAfterRelease)
+  assert.deepEqual(state.dnsRecords, [successor], 'the old owner must leave the new node’s recycled IP alone')
+  state.instanceId = 'i-ddns-second'
+  state.status = 'Running'
+  state.publicIp = '192.0.2.20'
+  await runJob(`accounts/${second.id}/refresh`)
+  state.instanceId = nodeAInstanceId
+  state.status = 'Stopped'
+  state.publicIp = '192.0.2.11'
   await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
-  state.publicIp = '192.0.2.12'
-  await dnsRefresh()
-  assert.equal(state.dnsRecords.filter(r => r.id !== 'other-node').length, 1, 'reuse leftover record after failed delete')
-  assert.equal(state.dnsRecords.find(r => r.id !== 'other-node').content, state.publicIp)
-  assert.equal(state.dnsRecords.find(r => r.id === 'other-node').content, '192.0.2.99')
-  console.log('✓ 手动关机先摘除，失败仅告警一次、不阻断关机、不重试，开机更新遗留记录且保留其他节点')
+  assert.ok(ownRecord(), 'manual start publishes immediately after verifying Running')
+  assertSecond()
+  console.log('✓ 两实例共享域名互不误删；停机删除失败后持续重试、告警去重，IP 释放仍能清理，开机立即补回')
+  console.log('✓ 地址回收后分配给另一节点，旧节点重复巡检保留新节点解析')
 
-  // 前置查询与停机均经历慢速重试，DNS 超时、通知卡住仍不能挤掉停机预算。
+  const adopted = structuredClone(ownRecord())
+  state.instanceId = 'i-ddns-second'
+  await runJob(`accounts/${second.id}/refresh`)
+  assert.deepEqual(ownRecord(), adopted, 'the new owner adopts the existing record ID')
+  state.instanceId = nodeAInstanceId
+  state.status = 'Stopped'
+  state.publicIp = null
+  await dnsRefresh()
+  assert.deepEqual(state.dnsRecords, [adopted], 'a delayed stop cannot delete a record already adopted by the running peer')
+  assert.equal((await dnsStored()).state.published_ip, null)
+  state.instanceId = 'i-ddns-second'
+  state.status = 'Running'
+  state.publicIp = '192.0.2.20'
+  await runJob(`accounts/${second.id}/refresh`)
+  state.instanceId = nodeAInstanceId
+  state.publicIp = '192.0.2.11'
+  await dnsRefresh()
+  assertSecond()
+  console.log('✓ 新节点先接管原 A 记录时，旧节点的延迟停机清理保留同一条记录')
+
+  state.dnsDeleteFailed = true
+  state.status = 'Stopped'
+  const attemptsBeforeRecovery = state.notifications
+  let releaseDnsNotification
+  notificationGate = new Promise(resolve => { releaseDnsNotification = resolve })
+  const alertInFlight = dnsRefresh()
+  try {
+    await eventually(() => state.notifications > attemptsBeforeRecovery, 'DNS alert reached the channel')
+    const enabled = await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { enabled: false } })
+    assert.equal(enabled.dns.enabled, false, 'a slow notification does not lock the account')
+    await api(`accounts/${dnsId}`, 'PUT', dnsAccountInput)
+  } finally {
+    releaseDnsNotification()
+    notificationGate = null
+    await alertInFlight
+  }
+  await api('settings/bark', 'PUT', { ...barkDraft, enabled: true })
+  state.lastBark = null
+  state.notifyDelay = 9000
+  await lightRefresh()
+  assert.ok(state.lastBark, 'Bark receives the new alert while Telegram times out')
+  assert.equal(state.notifications, attemptsBeforeRecovery + 2, 'a late receipt cannot silence the next incident')
+  state.notifyDelay = 0
+  await lightRefresh()
+  assert.equal(state.notifications, attemptsBeforeRecovery + 2, 'one confirmed channel is sufficient')
+  await api('settings/bark', 'PUT', { enabled: false })
+  state.dnsDeleteFailed = false
+  state.status = 'Running'
+  await dnsRefresh()
+  console.log('✓ 告警发送期间可以编辑负载均衡，新故障单独确认送达')
+
+  // 阿里云控制台、抢占回收等外部状态变化，由相同同步逻辑处理。
+  for (const status of ['Starting', 'Stopping', 'Unknown']) {
+    state.status = status
+    const calls = state.dnsCalls
+    await dnsRefresh()
+    assert.equal(state.dnsCalls, calls, 'unknown/transitional states must not mutate DNS')
+  }
+  state.status = 'Stopped'
+  const balancesBefore = state.balanceCalls
+  const trafficBefore = state.trafficCalls
+  await lightRefresh()
+  assert.equal(ownRecord(), undefined)
+  state.status = 'Running'
+  await lightRefresh()
+  assert.ok(ownRecord())
+  assert.equal(state.balanceCalls, balancesBefore)
+  assert.equal(state.trafficCalls, trafficBefore)
+  state.instancesFailed = true
+  const staleCalls = state.dnsCalls
+  await dnsRefresh('failed')
+  assert.equal(state.dnsCalls, staleCalls, 'failed ECS lookup must not reconcile from stale snapshot')
+  state.instancesFailed = false
+  console.log('✓ 外部启停通过状态补采同步 DDNS；过渡态、未知状态及查询失败不使用旧快照操作解析')
+
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { enabled: false } })
+  state.status = 'Stopped'
+  const disabledCalls = state.dnsCalls
+  await dnsRefresh()
+  assert.equal(state.dnsCalls, disabledCalls)
+  assert.ok(ownRecord(), 'switch off stops managing existing records')
+  await api(`accounts/${dnsId}`, 'PUT', dnsAccountInput)
+  await dnsRefresh()
+  assert.equal(ownRecord(), undefined, 'enabling for a stopped instance removes its existing record')
+  state.status = 'Running'
+  state.dnsWriteUnknown = true
+  await dnsRefresh()
+  assert.ok(ownRecord())
+  assert.ok((await dnsStored()).state.pending_ip)
+  await dnsRefresh()
+  assert.equal(state.dnsRecords.filter(r => r.content === state.publicIp).length, 1)
+  assert.equal((await dnsStored()).state.pending_ip, null)
+  console.log('✓ DDNS 关闭后停止管理，重新开启按真实状态同步；创建结果未知先核实，不重复 POST')
+
+  // 记录 ID 被人工改成另一台机器的 IP，不能依赖缓存 ID 误删。
+  ownRecord().content = '192.0.2.99'
+  await dnsRefresh()
+  assert.ok(ownRecord())
+  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/stop`)
+  assert.ok(state.dnsRecords.some(r => r.content === '192.0.2.99'))
+  assertSecond()
+  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
+  console.log('✓ 缓存记录被人工改为其他 IP 后不会误删，始终精确匹配域名和本机 IP')
+
+  const scheduled = new Date(Date.now() + 20 * 60_000 + 8 * 3600_000)
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, schedule_mode: 'advanced', schedule_stop_cron: `${scheduled.getUTCMinutes()} ${scheduled.getUTCHours()} * * *` })
+  await cronAccount(worker, dnsId)
+  assert.ok(ownRecord(), 'running nodes stay published until stopped; no early drain')
+  for (const mode of ['simple', 'advanced']) {
+    const stopAt = new Date(Date.now() - 60_000 + 8 * 3600_000)
+    await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, schedule_mode: mode,
+      ...(mode === 'simple'
+        ? { schedule_stop_time: `${String(stopAt.getUTCHours()).padStart(2, '0')}:${String(stopAt.getUTCMinutes()).padStart(2, '0')}` }
+        : { schedule_stop_cron: `${stopAt.getUTCMinutes()} ${stopAt.getUTCHours()} * * *` }),
+    })
+    await cronAccount(worker, dnsId)
+    assert.equal(state.status, 'Stopped')
+    await lightRefresh()
+    assert.equal(ownRecord(), undefined)
+    await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
+    assert.ok(ownRecord(), `${mode}: immediate restart publishes despite unchanged schedule`)
+    await cronAccount(worker, dnsId)
+    assert.ok(ownRecord())
+  }
+  await api(`accounts/${dnsId}`, 'PUT', dnsAccountInput)
+  console.log('✓ 定时关机不再提前摘除，确认停机后删除；简单/Cron 计划关机后立即重启均恢复解析')
+
+  // 流量熔断只控制实例，DDNS 根据查询到的终态收敛；删除失败不能影响停机。
+  state.dnsDeleteFailed = true
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, traffic_threshold_gb: 0.5 })
+  await dnsRefresh()
+  assert.equal(state.status, 'Stopped')
+  await dnsRefresh()
+  assert.ok(ownRecord(), 'failed DNS cleanup remains pending')
+  const thresholdDeletes = state.dnsDeletes
+  await cronAccount(worker, dnsId)
+  assert.equal(state.dnsDeletes, thresholdDeletes + 1)
+  state.dnsDeleteFailed = false
+  await dnsRefresh()
+  assert.equal(ownRecord(), undefined)
+  assertSecond()
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, traffic_threshold_gb: 0.5, over_limit_action: 'notify_only' })
+  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
+  assert.ok(ownRecord())
+  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, traffic_threshold_gb: 0.5 })
+  await cronAccount(worker, dnsId)
+  await cronAccount(worker, dnsId)
+  assert.equal(ownRecord(), undefined, 'a later threshold stop must remove the newly published record again')
+  await api(`accounts/${dnsId}`, 'PUT', dnsAccountInput)
+  await dnsRefresh()
+  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
+  console.log('✓ 熔断停机退出共享域名，失败自动补偿；恢复再熔断不会继承旧的一次性标记')
+
+  // DNS 请求和通知均卡住时，控制命令已先执行；恢复后正常巡检清理。
   state.slowDescribeAttempts = 3
   state.slowStopAttempts = 3
   state.dnsDeleteDelay = 2500
@@ -1193,104 +1499,73 @@ try {
   const slowStopBegan = Date.now()
   await runJob(`accounts/${dnsId}/instances/${state.instanceId}/stop`)
   assert.equal(state.status, 'Stopped')
-  assert.deepEqual(state.controlEvents, ['dns-delete', 'stop', 'stop', 'stop', 'dns-alert'])
+  assert.deepEqual(state.controlEvents, ['stop', 'stop', 'stop', 'dns-delete', 'dns-alert'])
   assert.ok(Date.now() - slowStopBegan < 55_000)
   state.dnsDeleteDelay = 0
   state.notifyDelay = 0
+  await dnsRefresh()
   await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
-  await dnsRefresh()
-  console.log('✓ 慢实例查询、DNS 超时、慢停机重试和卡住的通知均不会挤掉关机预算，告警在关机之后发送')
+  console.log('✓ 慢查询、慢停机、DNS 超时和通知卡住不挤占关机预算，同步失败可恢复')
 
-  const scheduled = new Date(Date.now() + 20 * 60_000 + 8 * 3600_000)
-  const stopCron = `${scheduled.getUTCMinutes()} ${scheduled.getUTCHours()} * * *`
-  const scheduledConfig = { ...dnsAccountInput, schedule_mode: 'advanced', schedule_stop_cron: stopCron, dns: { ...dnsInput, api_token: '' } }
-  await api(`accounts/${dnsId}`, 'PUT', scheduledConfig)
-  const scheduledAlerts = state.notifications
-  const scheduledDeletes = state.dnsDeletes
-  await cronAccount(worker, dnsId)
-  assert.equal(state.status, 'Running')
-  assert.equal(state.dnsDeletes, scheduledDeletes + 1)
-  assert.equal(state.notifications, scheduledAlerts + 1)
-  // 下一次五分钟巡检：只推进 DNS 重试槽，不修改实际系统时间。
-  await setDnsState({ attempt_slot: null })
-  await cronAccount(worker, dnsId)
-  assert.equal(state.dnsDeletes, scheduledDeletes + 2)
-  assert.equal(state.notifications, scheduledAlerts + 1, 'same scheduled stop alerts only once')
-  state.dnsDeleteFailed = false
-  await setDnsState({ attempt_slot: null })
-  await cronAccount(worker, dnsId)
-  assert.deepEqual(state.dnsRecords.map(r => r.id), ['other-node'])
-  const drainedCalls = state.dnsCalls
+  // 更换共享域名后，先清理本实例旧记录，再登记新域名；其他节点下轮各自迁移。
+  await api('settings/ddns', 'PUT', { ...ddnsInput, name: 'dns-next.example.com', api_token: '' })
   await dnsRefresh()
-  assert.equal(state.dnsCalls, drainedCalls, 'running inside drain window must not republish or delete again')
-  // 取消定时关机，应恢复解析。
-  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { ...dnsInput, api_token: '' } })
-  await dnsRefresh()
-  assert.equal(state.dnsRecords.length, 2)
-  assert.equal((await dnsStored()).state.drain_at, null)
-  console.log('✓ 定时提前摘除失败逐轮重试且告警去重，成功不重复请求，取消计划恢复解析')
+  assert.equal(state.dnsRecords.filter(r => r.content === state.publicIp).length, 1)
+  assert.equal(ownRecord().name, 'dns-next.example.com')
+  assert.equal(state.dnsRecords.find(r => r.content === '192.0.2.20').name, ddnsInput.name)
+  state.instanceId = 'i-ddns-second'
+  state.publicIp = '192.0.2.20'
+  await runJob(`accounts/${second.id}/refresh`)
+  assert.equal(ownRecord().name, 'dns-next.example.com')
+  assert.equal(state.dnsRecords.filter(r => r.content === state.publicIp).length, 1)
+  state.instanceId = nodeAInstanceId
+  state.publicIp = '192.0.2.11'
+  console.log('✓ 共享域名修改后逐实例迁移解析，清理自己的旧记录并保留其他节点')
 
-  // 真正执行定时关机后，即使删除失败也不继续重试。
-  state.dnsDeleteFailed = true
-  await api(`accounts/${dnsId}`, 'PUT', { ...scheduledConfig, schedule_stop_cron: '* * * * *' })
-  await cronAccount(worker, dnsId)
-  assert.equal(state.status, 'Stopped', 'scheduled shutdown proceeds despite DNS failure')
-  const stoppedScheduledDeletes = state.dnsDeletes
-  await cronAccount(worker, dnsId)
+  // 更换 Zone 和 Token：权限不足时保留归属并说明原因，恢复权限后重试迁移。
+  const nextZone = 'b'.repeat(32)
+  const previousIp = state.publicIp
+  const reassignedIp = '192.0.2.31'
+  state.dnsRecords.push({ ...ownRecord(), id: 'independent-old-record', content: reassignedIp })
+  state.publicIp = reassignedIp
+  state.dnsToken = 'fixture-new-zone-token'
+  state.dnsDeniedZone = ddnsInput.zone_id
+  await api('settings/ddns', 'PUT', { zone_id: nextZone, name: 'dns-new.example.net', api_token: state.dnsToken })
+  const beforeZoneSwitch = structuredClone(state.dnsRecords)
+  const zoneAlerts = state.notifications
   await dnsRefresh()
-  assert.equal(state.dnsDeletes, stoppedScheduledDeletes)
-  // 关闭计划并重新开机，遗留记录仍应复用。
-  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { ...dnsInput, api_token: '' } })
-  state.dnsDeleteFailed = false
-  await runJob(`accounts/${dnsId}/instances/${state.instanceId}/start`)
+  assert.deepEqual(state.dnsRecords, beforeZoneSwitch)
+  assert.equal((await dnsStored()).state.zone_id, ddnsInput.zone_id)
+  const cleanupError = (await dnsStored()).state.last_error
+  assert.match(cleanupError, /旧解析 dns-next\.example\.com 清理失败.*HTTP 403.*新旧 Zone/)
+  assert.equal(cleanupError.includes(state.dnsToken), false)
+  assert.equal(state.notifications, zoneAlerts + 1)
   await dnsRefresh()
-  assert.equal(state.dnsRecords.length, 2)
-  console.log('✓ 定时摘除失败不影响到点关机，停止后不再尝试摘除，重新运行恢复登记')
-
-  // 创建请求在云端成功、返回失败：下轮查找已创建记录，不能重复 POST。
-  state.dnsRecords = state.dnsRecords.filter(r => r.id === 'other-node')
-  await setDnsState({ record_id: null, published_ip: null, pending_ip: null })
-  state.dnsWriteUnknown = true
+  assert.equal(state.notifications, zoneAlerts + 1, 'missing old Zone access is reported once')
+  state.dnsDeniedZone = null
   await dnsRefresh()
-  assert.equal(state.dnsRecords.length, 2)
-  await dnsRefresh()
-  assert.equal(state.dnsRecords.length, 2)
-  assert.ok((await dnsStored()).state.record_id)
-  // 记录被人工删除后，IP 变化触发 PATCH 404，下一轮应重建。
-  state.dnsRecords = state.dnsRecords.filter(r => r.id === 'other-node')
-  state.publicIp = '192.0.2.13'
-  await dnsRefresh()
-  await dnsRefresh()
-  assert.equal(state.dnsRecords.filter(r => r.id !== 'other-node').length, 1)
-  assert.equal(state.dnsRecords.find(r => r.id !== 'other-node').content, state.publicIp)
-  console.log('✓ DNS 创建结果未知时按目标 IP 核实，不重复创建，记录 ID 失效后可恢复')
-
-  // 重新启用可主动修复外部删除，稳定状态不需要轮询 DNS。
-  state.dnsRecords = state.dnsRecords.filter(r => r.id === 'other-node')
-  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { ...dnsInput, enabled: false, api_token: '' } })
-  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, dns: { ...dnsInput, api_token: '' } })
-  await dnsRefresh()
-  await dnsRefresh()
-  assert.equal(state.dnsRecords.filter(r => r.id !== 'other-node').length, 1)
-  console.log('✓ 重新启用 DNS 联动会重新核实并修复记录')
-
-  // 熔断的关机指令会重试，但 DNS 摘除只尝试一次。
-  state.dnsDeleteFailed = true
-  state.stopFailed = true
-  const thresholdDeletes = state.dnsDeletes
-  await api(`accounts/${dnsId}`, 'PUT', { ...dnsAccountInput, traffic_threshold_gb: 0.5, dns: { ...dnsInput, api_token: '' } })
-  await dnsRefresh()
-  await dnsRefresh()
-  assert.equal(state.dnsDeletes, thresholdDeletes + 1)
-  assert.equal(state.status, 'Running')
-  state.stopFailed = false
-  await dnsRefresh()
-  assert.equal(state.status, 'Stopped')
-  await dnsRefresh()
-  assert.equal(state.dnsDeletes, thresholdDeletes + 1)
-  console.log('✓ 熔断只尝试一次 DNS 摘除，失败不阻断关机，后续熔断重试不重复摘除')
+  const published = state.dnsRecords.filter(r => r.content === reassignedIp && r.zoneId === nextZone)
+  assert.deepEqual(published.map(r => r.name), ['dns-new.example.net'])
+  assert.ok(!state.dnsRecords.some(r => r.content === previousIp && r.zoneId === ddnsInput.zone_id), 'only the previously published IP is removed from the old Zone')
+  assert.ok(state.dnsRecords.some(r => r.id === 'independent-old-record' && r.content === reassignedIp), 'a newly assigned IP confers no ownership in the old Zone')
+  assert.equal((await dnsStored()).state.zone_id, nextZone)
+  assert.equal((await dnsStored()).state.last_error, null)
+  assert.equal(state.dnsRecords.find(r => r.content === '192.0.2.20').zoneId, ddnsInput.zone_id)
+  assert.ok(state.dnsRecords.some(r => r.content === '192.0.2.99' && r.zoneId === ddnsInput.zone_id), 'unrelated old Zone record is preserved')
+  state.instanceId = 'i-ddns-second'
+  state.publicIp = '192.0.2.20'
+  state.status = 'Stopped'
+  await runJob(`accounts/${second.id}/refresh`)
+  assert.equal(ownRecord(), undefined, 'stopped node cleans its old Zone without publishing in the new one')
+  assert.ok(state.dnsRecords.some(r => r.content === reassignedIp && r.zoneId === nextZone))
+  state.status = 'Running'
+  await runJob(`accounts/${second.id}/refresh`)
+  assert.equal(ownRecord().zoneId, nextZone)
+  state.instanceId = nodeAInstanceId
+  state.publicIp = reassignedIp
+  console.log('✓ 更换 Zone 和 Token 后明确提示旧 Zone 权限不足，恢复授权可重试，运行及停止节点分别同步且不误删其他记录')
   await api(`accounts/${dnsId}`, 'DELETE')
-  state.dnsDeleteFailed = false
+  await api(`accounts/${second.id}`, 'DELETE')
   state.publicIp = null
 
   const attempts = await Promise.all(Array.from({ length: 12 }, () => request('auth/login', 'POST', { username: 'review', password: 'wrong' }, '192.0.2.2')))
@@ -1303,6 +1578,58 @@ try {
   assert.equal(response.status, 500)
   assert.equal((await response.json()).code, 'turnstile_broken')
   console.log('✓ 人机校验配置损坏时拒绝登录')
+
+  // 在独立时钟的 Worker 中复用本地 D1，实际投递巡检和维护队列。
+  const year = new Date().getUTCFullYear() + 1
+  const previousDay = `${year - 1}-12-31`
+  const nextDay = `${year}-01-01`
+  async function atLocalTime(time) {
+    const now = Date.parse(time + '+08:00')
+    await mf.setOptions({ d1Persist: testDirectory, workers: [{
+      ...monitor, bindings: { ...monitor.bindings, FIXED_TIME_MS: now },
+    }] })
+    cronSequence = now - 1000
+    return { db: await mf.getD1Database('DB'), worker: await mf.getWorker('monitor') }
+  }
+  await db.batch([
+    db.prepare("UPDATE accounts SET enabled = 1, traffic_threshold_gb = 0, spot_keep_alive = 0, schedule_mode = 'simple', schedule_start_time = '23:59', schedule_stop_time = NULL, last_schedule_start_date = NULL WHERE id = ?").bind(id),
+    db.prepare('UPDATE account_snapshots SET billing_month = ?, cdt_overseas_bytes = ?, traffic_updated_at = ? WHERE account_id = ?').bind(previousDay.slice(0, 7), 12 * 1024 ** 3, Date.parse(previousDay + 'T23:58:00+08:00'), id),
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'daily_report'").bind(JSON.stringify({ enabled: true, time: '23:59', timezone: 'UTC+8' })),
+  ])
+  const midnight = await atLocalTime(nextDay + 'T00:00:03')
+  const reminders = state.notifications
+  await maintenance(false, midnight.worker)
+  await maintenance(false, midnight.worker)
+  assert.equal(state.notifications, reminders + 1)
+  const reportText = new URLSearchParams(state.lastTelegram.body).get('text')
+  assert.ok(reportText.includes(previousDay))
+  assert.match(reportText, /本月合计流量 12\.00 GB/)
+  const sentDate = database => database.prepare("SELECT json_extract(value, '$.last_sent_date') AS day FROM settings WHERE key = 'daily_report'").first('day')
+  assert.equal(await sentDate(midnight.db), previousDay)
+  state.status = 'Stopped'
+  const startsAtMidnight = state.starts
+  await cronAccount(midnight.worker, id)
+  assert.equal(state.starts, startsAtMidnight + 1)
+  assert.equal(await midnight.db.prepare('SELECT last_schedule_start_date FROM accounts WHERE id = ?').bind(id).first('last_schedule_start_date'), previousDay)
+  state.status = 'Stopped'
+  await cronAccount(midnight.worker, id)
+  assert.equal(state.starts, startsAtMidnight + 1)
+  await midnight.db.prepare("UPDATE accounts SET schedule_stop_time = '23:59', schedule_start_time = '00:00', last_schedule_stop_date = NULL WHERE id = ?").bind(id).run()
+  state.status = 'Running'
+  const stopsAtMidnight = state.stops
+  await cronAccount(midnight.worker, id)
+  await cronAccount(midnight.worker, id)
+  assert.equal(state.stops, stopsAtMidnight + 1)
+  assert.equal(state.starts, startsAtMidnight + 1, 'midnight start yields to the preceding stop window')
+  assert.equal(await midnight.db.prepare('SELECT last_schedule_stop_date FROM accounts WHERE id = ?').bind(id).first('last_schedule_stop_date'), previousDay)
+  await midnight.db.prepare("UPDATE accounts SET schedule_start_time = '23:59', schedule_stop_time = NULL WHERE id = ?").bind(id).run()
+  const evening = await atLocalTime(nextDay + 'T23:59:03')
+  await cronAccount(evening.worker, id)
+  assert.equal(state.starts, startsAtMidnight + 2)
+  await maintenance(false, evening.worker)
+  assert.equal(state.notifications, reminders + 2)
+  assert.equal(await sentDate(evening.db), nextDay)
+  console.log('✓ 跨年补跑 23:59 开机、关机与日报，按计划日去重和汇总，次日晚照常执行')
 } finally {
   await mf.dispose()
   await rm(testDirectory, { recursive: true, force: true })

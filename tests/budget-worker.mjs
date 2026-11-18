@@ -1,5 +1,7 @@
 import Worker from '../build/index.js'
 
+const SystemDate = Date
+
 // Miniflare 不自动模拟套餐额度；在真实 D1 binding 外统计每次执行的调用次数。
 // batch 算一次，prepare/bind 本身不产生数据库调用。
 function budget(database) {
@@ -36,5 +38,12 @@ function budget(database) {
 export default class BudgetWorker extends Worker {
   constructor(ctx, env) {
     super(ctx, { ...env, DB: budget(env.DB) })
+    if (env.FIXED_TIME_MS !== undefined) {
+      const now = env.FIXED_TIME_MS
+      globalThis.Date = class extends SystemDate {
+        constructor(...args) { super(...(args.length ? args : [now])) }
+        static now() { return now }
+      }
+    }
   }
 }

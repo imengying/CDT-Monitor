@@ -12,6 +12,7 @@
 
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ===========================================================================
 // 常量
@@ -22,6 +23,7 @@ pub const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// 系统设置表的固定 key。
 pub mod setting_key {
+    pub const DDNS: &str = "ddns";
     pub const TIMEZONE: &str = "timezone";
     pub const DAILY_REPORT: &str = "daily_report";
     pub const TELEGRAM: &str = "telegram";
@@ -164,12 +166,13 @@ pub fn minutes_to_hhmm(minutes: u32) -> String {
     format!("{:02}:{:02}", (minutes / 60) % 24, minutes % 60)
 }
 
-/// 判断当前本地时间是否落在 `target` 分钟之后 `window` 分钟的短窗口内。
-/// Cron 每 5 分钟触发一次，窗口用于兜住边缘抖动（不至于整天错过）。
-///
-/// 区间为闭区间 `[target, target + window]`，与上游 `dueWithin` 一致。
-pub fn within_window(now_minutes: u32, target_minutes: u32, window: u32) -> bool {
-    now_minutes >= target_minutes && now_minutes <= target_minutes.saturating_add(window)
+/// 返回补偿窗口内最近一次 HH:MM 的时间戳，用计划发生的本地日期去重。
+pub fn daily_occurrence_within(now: i64, tz: &str, target: u32, window: u32) -> Option<i64> {
+    let mut at = local_day_start_ms(now, tz) + i64::from(target) * 60_000;
+    if at > now {
+        at -= 86_400_000;
+    }
+    ((now - at) / 60_000 <= i64::from(window)).then_some(at)
 }
 
 // ===========================================================================
@@ -222,7 +225,7 @@ impl RegionName {
 }
 
 /// 账号所属的额度池。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuotaPool {
     /// 中国内地地域。
     Domestic,
@@ -682,6 +685,13 @@ pub struct SnapshotRow {
 }
 
 impl SnapshotRow {
+    fn pool_bytes(&self, pool: QuotaPool) -> i64 {
+        match pool {
+            QuotaPool::Domestic => self.cdt_domestic_bytes.max(0),
+            QuotaPool::Overseas => self.cdt_overseas_bytes.max(0),
+        }
+    }
+
     pub fn instances(&self) -> Vec<InstanceInfo> {
         serde_json::from_str(&self.instances_json).unwrap_or_default()
     }
@@ -1052,6 +1062,16 @@ fn default_report_time() -> String {
     "09:00".to_string()
 }
 
+impl DailyReportConfig {
+    pub fn timezone_or<'a>(&'a self, system: &'a str) -> &'a str {
+        if self.timezone.trim().is_empty() {
+            system
+        } else {
+            &self.timezone
+        }
+    }
+}
+
 impl Default for DailyReportConfig {
     fn default() -> Self {
         Self {
@@ -1370,6 +1390,7 @@ pub struct AccountOverview {
 #[derive(Debug, Clone, Serialize)]
 pub struct OverviewResponse {
     pub accounts: Vec<AccountOverview>,
+    pub total_traffic_gb: f64,
     pub timezone: String,
     pub billing_month: String,
 }
@@ -1523,6 +1544,7 @@ pub struct DailyReportDto {
 /// 全量设置响应。
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsDto {
+    pub ddns: crate::dns::DdnsDto,
     pub timezone: String,
     /// 可选时区（value, label），供界面下拉使用。
     pub timezone_options: Vec<TimeZoneOption>,
@@ -1565,14 +1587,58 @@ pub struct CronPreviewRequest {
 // 组合工具
 // ===========================================================================
 
+/// CDT 按云主账号和额度池计量。多个实例监控同一池时只取最近成功的一份。
+pub fn monthly_traffic_gb(
+    accounts: &[AccountRow],
+    snapshots: &HashMap<i64, SnapshotRow>,
+    month: &str,
+) -> f64 {
+    #[derive(PartialEq, Eq, Hash)]
+    enum Owner<'a> {
+        Cloud(&'a str),
+        AccessKey(&'a str),
+    }
+    let known_accounts: HashMap<&str, &str> = accounts
+        .iter()
+        .filter_map(|a| Some((a.access_key_id.as_str(), a.cloud_account_id.as_deref()?)))
+        .collect();
+    let mut latest = HashMap::new();
+    for account in accounts {
+        let Some(snapshot) = snapshots
+            .get(&account.id)
+            .filter(|s| s.billing_month == month)
+        else {
+            continue;
+        };
+        let Some(at) = snapshot.traffic_updated_at else {
+            continue;
+        };
+        let key = account.access_key_id.as_str();
+        let owner = account
+            .cloud_account_id
+            .as_deref()
+            .or_else(|| known_accounts.get(key).copied())
+            .map_or(Owner::AccessKey(key), Owner::Cloud);
+        let pool = account.quota_pool();
+        let sample = (at, account.id, snapshot.pool_bytes(pool));
+        let entry = latest.entry((owner, pool)).or_insert(sample);
+        if (at, account.id) > (entry.0, entry.1) {
+            *entry = sample;
+        }
+    }
+    let bytes: i128 = latest
+        .values()
+        .map(|(_, _, bytes)| i128::from(*bytes))
+        .sum();
+    bytes as f64 / GIB
+}
+
 /// 由账号行 + 快照行拼出首页卡片数据。
 pub fn build_overview(
     account: &AccountRow,
     snapshot: Option<&SnapshotRow>,
-    timezone: &str,
-    now: i64,
+    month: &str,
 ) -> AccountOverview {
-    let month = billing_month(now, timezone);
     let pool = account.quota_pool();
     let quota_gb = pool.quota_gb();
 
@@ -1587,16 +1653,13 @@ pub fn build_overview(
         instances,
     ) = match snapshot {
         Some(snap) => (
-            match pool {
-                QuotaPool::Domestic => snap.cdt_domestic_bytes.max(0),
-                QuotaPool::Overseas => snap.cdt_overseas_bytes.max(0),
-            },
+            snap.pool_bytes(pool),
             snap.balance_amount,
             snap.balance_currency.clone(),
             snap.balance_cash,
             snap.balance_credit,
             Some(snap.updated_at),
-            snap.threshold_triggered(&month),
+            snap.threshold_triggered(month),
             snap.instances(),
         ),
         None => (0, None, None, None, None, None, false, Vec::new()),
@@ -1652,7 +1715,7 @@ pub fn build_overview(
         balance_credit,
         traffic_used_gb: used_gb,
         percentage: percent_of(used_gb, quota_gb),
-        billing_month: month.clone(),
+        billing_month: month.to_owned(),
         threshold_triggered: triggered,
         snapshot_updated_at: updated_at,
         traffic_updated_at: snapshot.and_then(|s| s.traffic_updated_at),
@@ -1808,13 +1871,21 @@ mod tests {
     }
 
     #[test]
-    fn within_window_semantics() {
-        // 目标 10:00，窗口 20 分钟 -> 闭区间 [10:00, 10:20]
-        assert!(!within_window(9 * 60 + 59, 10 * 60, 20));
-        assert!(within_window(10 * 60, 10 * 60, 20));
-        assert!(within_window(10 * 60 + 19, 10 * 60, 20));
-        assert!(within_window(10 * 60 + 20, 10 * 60, 20));
-        assert!(!within_window(10 * 60 + 21, 10 * 60, 20));
+    fn daily_window_uses_the_planned_date_across_midnight() {
+        // 2026-12-31 23:59 当地时间。
+        let at = DateTime::parse_from_rfc3339("2026-12-31T23:59:00+05:30")
+            .unwrap()
+            .timestamp_millis();
+        let due = |now| daily_occurrence_within(now, "UTC+5:30", 23 * 60 + 59, 10);
+        assert_eq!(due(at - 1), None);
+        assert_eq!(due(at), Some(at));
+        assert_eq!(due(at + 10 * 60_000 + 59_999), Some(at));
+        assert_eq!(due(at + 11 * 60_000), None);
+        assert_eq!(
+            local_date(due(at + 63_000).unwrap(), "UTC+5:30"),
+            "2026-12-31"
+        );
+        assert_eq!(due(at + 86_400_000), Some(at + 86_400_000));
     }
 
     #[test]
@@ -1932,7 +2003,7 @@ mod tests {
             updated_at: 0,
         };
 
-        let overview = build_overview(&account, None, "UTC+8", 1_700_000_000_000);
+        let overview = build_overview(&account, None, "2023-11");
         assert_eq!(overview.instances.len(), 1, "应合成一个占位实例");
         let inst = &overview.instances[0];
         assert_eq!(inst.instance_id, "i-bp1test");
@@ -1999,7 +2070,7 @@ mod tests {
             updated_at: 1_700_000_000_000,
         };
 
-        let overview = build_overview(&account, Some(&snapshot), "UTC+8", 1_700_000_000_000);
+        let overview = build_overview(&account, Some(&snapshot), "2023-11");
         assert_eq!(overview.instances.len(), 1);
         assert_eq!(overview.instances[0].instance_id, "i-bp1real");
         assert_eq!(overview.instances[0].status, "Running");

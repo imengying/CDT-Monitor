@@ -1,4 +1,4 @@
-//! Cloudflare DNS-only A 记录联动。稳定状态不请求 API，TTL 固定 300 秒。
+//! Cloudflare DDNS：共享凭据和域名，每台实例独立维护自己的 A 记录。
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use worker::{Headers, Method, Request, RequestInit, wasm_bindgen::JsValue};
@@ -6,9 +6,71 @@ use worker::{Headers, Method, Request, RequestInit, wasm_bindgen::JsValue};
 use crate::{crypto::Crypto, models::AccountRow};
 
 pub const TTL: u32 = 300;
-pub const TICK_MS: i64 = 5 * 60_000;
-fn default_lead() -> u32 {
-    30
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DdnsConfig {
+    pub zone_id: String,
+    pub name: String,
+    pub token_enc: Option<String>,
+}
+impl DdnsConfig {
+    pub fn configured(&self) -> bool {
+        self.zone_id.len() == 32
+            && self.zone_id.bytes().all(|b| b.is_ascii_hexdigit())
+            && valid_name(&self.name)
+            && self.token_enc.is_some()
+    }
+    pub fn dto(&self) -> DdnsDto {
+        DdnsDto {
+            zone_id: self.zone_id.clone(),
+            name: self.name.clone(),
+            token_configured: self.token_enc.is_some(),
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct DdnsDto {
+    pub zone_id: String,
+    pub name: String,
+    pub token_configured: bool,
+}
+#[derive(Clone, Debug, Deserialize)]
+pub struct DdnsInput {
+    pub zone_id: String,
+    pub name: String,
+    pub api_token: Option<String>,
+}
+impl DdnsInput {
+    pub fn apply(&self, previous: &DdnsConfig, crypto: &Crypto) -> Result<DdnsConfig, String> {
+        let zone_id = self.zone_id.trim().to_ascii_lowercase();
+        let name = self.name.trim().trim_end_matches('.').to_ascii_lowercase();
+        let supplied = self
+            .api_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if zone_id.len() != 32 || !zone_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("Cloudflare Zone ID 应为 32 位十六进制字符".into());
+        }
+        if !valid_name(&name) {
+            return Err("请填写完整的 DNS 域名，例如 app.example.com".into());
+        }
+        if supplied.is_none() && previous.token_enc.is_none() {
+            return Err("请填写 Cloudflare API Token".into());
+        }
+        if supplied.is_some_and(|s| s.len() > 512 || s.contains(['\r', '\n'])) {
+            return Err("Cloudflare API Token 格式不合法".into());
+        }
+        Ok(DdnsConfig {
+            zone_id,
+            name,
+            token_enc: match supplied {
+                Some(token) => Some(crypto.encrypt(token).map_err(|_| "DDNS 凭据加密失败")?),
+                None => previous.token_enc.clone(),
+            },
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -16,39 +78,23 @@ fn default_lead() -> u32 {
 pub struct DnsState {
     pub record_id: Option<String>,
     pub published_ip: Option<String>,
-    // 创建请求结果不确定时，下次按此 IP 查找，不能盲目重复 POST。
+    // 创建结果未知时，下轮先按此 IP 核实，避免重复创建或遗留记录。
     pub pending_ip: Option<String>,
-    pub drain_at: Option<i64>,
-    pub schedule_key: String,
-    pub paused: bool,
-    pub seen_stopped: bool,
-    pub once_event: Option<String>,
-    pub alerted_event: Option<String>,
-    pub attempt_slot: Option<i64>,
+    pub zone_id: String,
+    pub name: String,
+    pub alert: Option<DnsAlert>,
     pub last_error: Option<String>,
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsAlert {
+    pub id: String,
+    pub running: bool,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DnsSettings {
     pub enabled: bool,
-    pub zone_id: String,
-    pub name: String,
-    pub token_enc: Option<String>,
-    pub lead_minutes: u32,
     pub state: DnsState,
-}
-impl Default for DnsSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            zone_id: String::new(),
-            name: String::new(),
-            token_enc: None,
-            lead_minutes: 30,
-            state: DnsState::default(),
-        }
-    }
 }
 impl DnsSettings {
     pub fn from_account(account: &AccountRow) -> Self {
@@ -57,10 +103,6 @@ impl DnsSettings {
     pub fn dto(&self) -> DnsDto {
         DnsDto {
             enabled: self.enabled,
-            zone_id: self.zone_id.clone(),
-            name: self.name.clone(),
-            token_configured: self.token_enc.is_some(),
-            lead_minutes: self.lead_minutes,
             last_error: self.state.last_error.clone(),
         }
     }
@@ -68,90 +110,21 @@ impl DnsSettings {
 #[derive(Clone, Debug, Serialize)]
 pub struct DnsDto {
     pub enabled: bool,
-    pub zone_id: String,
-    pub name: String,
-    pub token_configured: bool,
-    pub lead_minutes: u32,
     pub last_error: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct DnsInput {
-    #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
-    pub zone_id: String,
-    #[serde(default)]
-    pub name: String,
-    pub api_token: Option<String>,
-    #[serde(default = "default_lead")]
-    pub lead_minutes: u32,
 }
 impl DnsInput {
-    pub fn apply(
-        &self,
-        previous: &DnsSettings,
-        crypto: &Crypto,
-        resource_changed: bool,
-    ) -> Result<DnsSettings, String> {
-        if self.lead_minutes > 1440 || !self.lead_minutes.is_multiple_of(5) {
-            return Err("DNS 提前摘除时间必须为 0～1440 分钟内的 5 分钟整数倍".into());
+    pub fn apply(&self, previous: &DnsSettings) -> DnsSettings {
+        let mut next = previous.clone();
+        next.enabled = self.enabled;
+        if self.enabled != previous.enabled {
+            next.state.last_error = None;
+            next.state.alert = None;
         }
-        let zone = self.zone_id.trim().to_ascii_lowercase();
-        let name = self.name.trim().trim_end_matches('.').to_ascii_lowercase();
-        let supplied = self
-            .api_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if self.enabled {
-            if zone.len() != 32 || !zone.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("Cloudflare Zone ID 应为 32 位十六进制字符".into());
-            }
-            if !valid_name(&name) {
-                return Err("请填写完整的 DNS 域名，例如 app.example.com".into());
-            }
-            if supplied.is_none() && previous.token_enc.is_none() {
-                return Err("启用 DNS 联动必须提供 Cloudflare API Token".into());
-            }
-        }
-        if supplied.is_some_and(|s| s.len() > 512 || s.contains(['\r', '\n'])) {
-            return Err("Cloudflare API Token 格式不合法".into());
-        }
-        let binding_changed = zone != previous.zone_id || name != previous.name;
-        let mut state = if binding_changed {
-            DnsState::default()
-        } else {
-            previous.state.clone()
-        };
-        if resource_changed
-            || self.enabled != previous.enabled
-            || self.lead_minutes != previous.lead_minutes
-        {
-            state.drain_at = None;
-            state.paused = false;
-            state.alerted_event = None;
-            state.attempt_slot = None;
-            if resource_changed {
-                state.seen_stopped = false;
-                state.once_event = None;
-            }
-            if resource_changed || (self.enabled && !previous.enabled) {
-                // 保留原记录归属和旧 IP，重新启用或更换实例后强制同步。
-                state.pending_ip = state.pending_ip.take().or(state.published_ip.take());
-                state.last_error = None;
-            }
-        }
-        Ok(DnsSettings {
-            enabled: self.enabled,
-            zone_id: zone,
-            name,
-            token_enc: match supplied {
-                Some(token) => Some(crypto.encrypt(token).map_err(|_| "DNS 凭据加密失败")?),
-                None => previous.token_enc.clone(),
-            },
-            lead_minutes: self.lead_minutes,
-            state,
-        })
+        next
     }
 }
 fn valid_name(name: &str) -> bool {
@@ -168,48 +141,13 @@ fn valid_name(name: &str) -> bool {
         })
 }
 
-/// 计算下一次停机；简单模式也通过同一 Cron 计算，覆盖跨午夜。
-pub fn next_stop(account: &AccountRow, timezone: &str, now: i64) -> Option<i64> {
-    if account.schedule_is_advanced() {
-        crate::cron::next_occurrences(account.stop_cron()?, timezone, now, 1)
-            .first()
-            .copied()
-    } else {
-        let minute = account.schedule_stop_minutes()?;
-        crate::cron::next_occurrences(
-            &format!("{} {} * * *", minute % 60, minute / 60),
-            timezone,
-            now,
-            1,
-        )
-        .first()
-        .copied()
-    }
-}
-pub fn drain_due(stop_at: i64, lead_minutes: u32, now: i64) -> bool {
-    let target = stop_at - i64::from(lead_minutes) * 60_000;
-    let target = if lead_minutes == 0 {
-        target
-    } else {
-        target.div_euclid(TICK_MS) * TICK_MS
-    };
-    now >= target
-}
-pub fn schedule_key(account: &AccountRow, timezone: &str) -> String {
-    format!(
-        "{}|{}|{}",
-        timezone,
-        account.schedule_mode.as_deref().unwrap_or("simple"),
-        if account.schedule_is_advanced() {
-            account.stop_cron().unwrap_or("")
-        } else {
-            account.schedule_stop_time.as_deref().unwrap_or("")
-        }
-    )
+pub struct DnsRecord {
+    pub id: String,
+    pub needs_update: bool,
 }
 
 pub struct CloudflareDns<'a> {
-    pub settings: &'a DnsSettings,
+    pub settings: &'a DdnsConfig,
     pub token: &'a str,
 }
 impl CloudflareDns<'_> {
@@ -267,7 +205,7 @@ impl CloudflareDns<'_> {
             .cloned()
             .ok_or_else(|| "Cloudflare DNS 响应缺少 result".into())
     }
-    pub async fn find(&self, ip: &str) -> Result<Option<String>, String> {
+    pub async fn find(&self, ip: &str) -> Result<Option<DnsRecord>, String> {
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("type", "A")
             .append_pair("name", &self.settings.name)
@@ -295,7 +233,11 @@ impl CloudflareDns<'_> {
             .map(|record| {
                 record["id"]
                     .as_str()
-                    .map(str::to_owned)
+                    .map(|id| DnsRecord {
+                        id: id.to_owned(),
+                        needs_update: record["ttl"].as_u64() != Some(u64::from(TTL))
+                            || record["proxied"].as_bool() != Some(false),
+                    })
                     .ok_or_else(|| "Cloudflare DNS 记录缺少 ID".into())
             })
             .transpose()
@@ -329,14 +271,6 @@ impl CloudflareDns<'_> {
 mod tests {
     use super::*;
     #[test]
-    fn lead_rounds_down_without_early_zero() {
-        let stop = 22 * 3600_000 + 3 * 60_000;
-        assert!(!drain_due(stop, 30, 21 * 3600_000 + 29 * 60_000));
-        assert!(drain_due(stop, 30, 21 * 3600_000 + 30 * 60_000));
-        assert!(!drain_due(stop, 0, stop - 1));
-        assert!(drain_due(stop, 0, stop));
-    }
-    #[test]
     fn validates_names() {
         assert!(valid_name("app.example.com"));
         for name in [
@@ -351,46 +285,28 @@ mod tests {
         }
     }
     #[test]
-    fn dto_never_contains_credentials() {
-        let config = DnsSettings {
-            token_enc: Some("secret-ciphertext".into()),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&config.dto()).unwrap();
-        assert!(json.contains("token_configured"));
-        assert!(!json.contains("secret-ciphertext"));
-    }
-    #[test]
-    fn replacing_instance_retains_managed_record_and_blank_token() {
+    fn credentials_stay_encrypted_and_blank_token_is_preserved() {
         let crypto = Crypto::new(crate::crypto::MasterKey::parse(&"ab".repeat(32)).unwrap());
-        let previous = DnsSettings {
-            enabled: true,
-            zone_id: "a".repeat(32),
-            name: "app.example.com".into(),
-            token_enc: Some(crypto.encrypt("fixture-token").unwrap()),
-            state: DnsState {
-                record_id: Some("record-a".into()),
-                published_ip: Some("192.0.2.1".into()),
-                drain_at: Some(1000),
-                paused: true,
-                ..Default::default()
-            },
-            ..Default::default()
+        let input = DdnsInput {
+            zone_id: "A".repeat(32),
+            name: " App.Example.com. ".into(),
+            api_token: Some("fixture-token".into()),
         };
-        let input = DnsInput {
-            enabled: true,
-            zone_id: previous.zone_id.clone(),
-            name: previous.name.clone(),
+        let config = input.apply(&DdnsConfig::default(), &crypto).unwrap();
+        assert_eq!(config.name, "app.example.com");
+        assert_eq!(
+            crypto.decrypt(config.token_enc.as_ref().unwrap()).unwrap(),
+            "fixture-token"
+        );
+        let dto = serde_json::to_string(&config.dto()).unwrap();
+        assert!(!dto.contains("fixture-token"));
+        assert!(!dto.contains(config.token_enc.as_ref().unwrap()));
+        let next = DdnsInput {
             api_token: Some(String::new()),
-            lead_minutes: 30,
-        };
-        let next = input.apply(&previous, &crypto, true).unwrap();
-        assert_eq!(next.state.record_id, previous.state.record_id);
-        assert!(next.state.published_ip.is_none());
-        assert_eq!(next.state.pending_ip, previous.state.published_ip);
-        assert_eq!(next.token_enc, previous.token_enc);
-        assert!(next.state.drain_at.is_none());
-        assert!(!next.state.paused);
-        assert!(next.state.last_error.is_none());
+            ..input
+        }
+        .apply(&config, &crypto)
+        .unwrap();
+        assert_eq!(config, next);
     }
 }

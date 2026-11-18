@@ -28,11 +28,11 @@
     "test": "cargo test --locked && bun run typecheck:web && bun run check:config && bun run lint && bun run test:worker"
   },
   "devDependencies": {
-    "wrangler": "4.158.0",
+    "wrangler": "4.163.0",
     "miniflare": "4.20260730.0"
   },
   "overrides": {
-    "workerd": "1.20261104.1"
+    "workerd": "1.20261117.1"
   },
   "trustedDependencies": [
     "esbuild",

@@ -315,7 +315,7 @@ export class App {
     }
 
     this.renderErrorBanner(state)
-    this.renderMetrics(accounts)
+    this.renderMetrics(accounts, overview?.total_traffic_gb ?? 0)
     this.renderEmptyState(state, accounts)
     this.accountList.render(accounts)
   }
@@ -345,14 +345,12 @@ export class App {
   }
 
   /** 四格汇总。 */
-  private renderMetrics(accounts: AccountOverview[]): void {
+  private renderMetrics(accounts: AccountOverview[], totalUsedGb: number): void {
     if (!this.metricStrip) return
 
-    let totalUsedGb = 0
     let running = 0
     let triggered = 0
     for (const account of accounts) {
-      totalUsedGb += account.traffic_current ? account.traffic_used_gb : 0
       if (account.threshold_triggered) triggered += 1
       for (const instance of account.instances) {
         if (instance.status.toLowerCase() === 'running') running += 1

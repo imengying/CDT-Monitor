@@ -10,8 +10,8 @@ import { el } from '@/lib/dom'
 
 /** 动作类型 → 中文名。 */
 export const ACTION_LABELS: Record<string, string> = {
-  dns_synced: 'DNS 同步',
-  dns_failed: 'DNS 联动失败',
+  dns_synced: 'DDNS 同步',
+  dns_failed: 'DDNS 同步失败',
   threshold_triggered: '流量熔断',
   threshold_stop: '熔断停机',
   threshold_stop_failed: '熔断停机失败',
@@ -43,6 +43,7 @@ export const ACTION_LABELS: Record<string, string> = {
   notify_test_bark: '测试 Bark',
   daily_report: '日报推送',
   daily_report_manual: '手动日报',
+  settings_ddns: 'DDNS 设置',
   settings_telegram: 'Telegram 设置',
   settings_bark: 'Bark 设置',
 }

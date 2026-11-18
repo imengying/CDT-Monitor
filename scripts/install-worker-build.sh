@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# 使用官方源码包与项目维护的锁文件安装构建工具，避免上游锁文件中的撤回依赖。
+# 使用校验过的官方源码包与项目锁文件，固定构建工具及其依赖。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-tool_version="0.8.7"
-source_sha256="1051c05ef088889a30ad3bad40c22a716ba8ca8d02a3fb01cef8c143ba952222"
+tool_version="0.9.0"
+source_sha256="bdcd75703783317d833b09c6724d5e4f642ad23804d8d14e3ac362e990c7cab7"
 tool_root="$ROOT/.tools/worker-build"
+export PATH="$tool_root/bin:$PATH"
 lock_file="$ROOT/scripts/worker-build.Cargo.lock"
 hash_file() {
   node --input-type=module -e 'import {createHash} from "node:crypto"; import {readFileSync} from "node:fs"; console.log(createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"))' "$1"

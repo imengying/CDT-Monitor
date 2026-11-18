@@ -238,6 +238,10 @@ impl Db {
         Ok(row.map(|r| r.value))
     }
 
+    pub async fn get_ddns_config(&self) -> Result<crate::dns::DdnsConfig> {
+        self.get_json_setting(setting_key::DDNS).await
+    }
+
     /// 写入一个配置项（不存在则插入）。
     pub async fn set_setting(&self, key: &str, value: &str, now_ms: i64) -> Result<()> {
         self.exec(
@@ -271,6 +275,30 @@ impl Db {
         let raw = serde_json::to_string(value)
             .map_err(|e| worker::Error::RustError(format!("配置序列化失败：{e}")))?;
         self.set_setting(key, &raw, now_ms).await
+    }
+
+    pub async fn set_daily_report(
+        &self,
+        config: &crate::models::DailyReportDto,
+        now: i64,
+    ) -> Result<()> {
+        let fields =
+            serde_json::to_string(config).map_err(|e| worker::Error::RustError(e.to_string()))?;
+        self.exec(
+            "INSERT INTO settings (key, value, updated_at) VALUES ('daily_report', json_set(?1, '$.last_sent_date', NULL), ?2)
+             ON CONFLICT(key) DO UPDATE SET value = json_patch(settings.value, ?1), updated_at = excluded.updated_at",
+            &[j_text(&fields), j_i64(now)],
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn mark_daily_report_sent(&self, date: &str, now: i64) -> Result<()> {
+        self.exec(
+            "UPDATE settings SET value = json_set(value, '$.last_sent_date', ?1), updated_at = ?2
+             WHERE key = 'daily_report' AND COALESCE(json_extract(value, '$.last_sent_date'), '') < ?1",
+            &[j_text(date), j_i64(now)],
+        ).await?;
+        Ok(())
     }
 
     /// 读取高级配置；缺失或解析失败时返回默认值。
@@ -340,6 +368,64 @@ impl Db {
             &[j_text(&json), j_i64(id)],
         )
         .await?;
+        Ok(())
+    }
+
+    /// 另一节点可能已经接管相同地址，甚至沿用了同一条 A 记录。
+    pub async fn dns_ip_in_use(
+        &self,
+        id: i64,
+        target: &crate::dns::DdnsConfig,
+        ip: &str,
+    ) -> Result<bool> {
+        Ok(self.query_first::<serde_json::Value>(
+            "SELECT a.id FROM accounts a JOIN account_snapshots s ON s.account_id = a.id
+             WHERE a.id <> ?1 AND a.enabled = 1 AND json_extract(a.dns_json, '$.enabled') = 1
+               AND ((json_extract(a.dns_json, '$.state.zone_id') = ?2 AND json_extract(a.dns_json, '$.state.name') = ?3)
+                    OR EXISTS (SELECT 1 FROM settings WHERE key = 'ddns'
+                               AND json_extract(value, '$.zone_id') = ?2 AND json_extract(value, '$.name') = ?3))
+               AND EXISTS (SELECT 1 FROM json_each(s.instances_json) i
+                           WHERE lower(json_extract(i.value, '$.status')) = 'running' AND json_extract(i.value, '$.public_ip') = ?4)
+             LIMIT 1",
+            &[j_i64(id), j_text(&target.zone_id), j_text(&target.name), j_text(ip)],
+        ).await?.is_some())
+    }
+
+    /// 只给仍在持续且未确认送达的故障发放通知租约，发送期间实例可继续启停。
+    pub async fn claim_dns_alert(
+        &self,
+        id: i64,
+        incident: &str,
+        key: &str,
+        owner: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let changed = self.exec(
+            "INSERT INTO locks (name, owner, expires_at)
+             SELECT ?1, ?2, ?3 FROM accounts WHERE id = ?4 AND enabled = 1
+               AND json_extract(dns_json, '$.state.alert.id') = ?5
+               AND NOT EXISTS (SELECT 1 FROM settings WHERE key = ?1 AND value = ?5)
+             ON CONFLICT(name) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at
+             WHERE locks.expires_at <= ?6",
+            &[j_text(key), j_text(owner), j_i64(now + 15_000), j_i64(id), j_text(incident), j_i64(now)],
+        ).await?;
+        Ok(changed > 0)
+    }
+
+    /// 回执独立于账号表单和同步状态，迟到的回执只对原故障有效。
+    pub async fn mark_dns_alert_delivered(
+        &self,
+        id: i64,
+        incident: &str,
+        key: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.exec(
+            "INSERT INTO settings (key, value, updated_at)
+             SELECT ?1, ?2, ?3 FROM accounts WHERE id = ?4 AND json_extract(dns_json, '$.state.alert.id') = ?2
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            &[j_text(key), j_text(incident), j_i64(now), j_i64(id)],
+        ).await?;
         Ok(())
     }
 
@@ -526,6 +612,8 @@ impl Db {
     pub async fn delete_account(&self, id: i64) -> Result<()> {
         let db = self.conn()?;
         let statements = vec![
+            db.prepare("DELETE FROM settings WHERE key = ?")
+                .bind(&[j_text(&format!("dns-alert:{id}"))])?,
             db.prepare("DELETE FROM traffic_hourly WHERE account_id = ?")
                 .bind(&[j_i64(id)])?,
             db.prepare("DELETE FROM traffic_daily WHERE account_id = ?")

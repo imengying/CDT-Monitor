@@ -60,7 +60,7 @@ import { currentMode, setThemeMode, type ThemeMode } from '@/lib/theme'
 import { afterSettingsChanged, pushDailyReport, testNotification } from '@/lib/actions'
 import { toast } from '@/lib/store'
 
-type Tab = 'accounts' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'logs' | 'system'
+type Tab = 'accounts' | 'ddns' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'logs' | 'system'
 
 /**
  * 可选地域。
@@ -114,11 +114,6 @@ interface AccountForm {
   scheduleStartCron: string
   scheduleStopCron: string
   dnsEnabled: boolean
-  dnsZoneId: string
-  dnsName: string
-  dnsToken: string
-  dnsTokenConfigured: boolean
-  dnsLeadMinutes: number
   dnsError: string | null
   spotKeepAlive: boolean
   enabled: boolean
@@ -143,11 +138,6 @@ function blankAccountForm(): AccountForm {
     scheduleStartCron: '',
     scheduleStopCron: '',
     dnsEnabled: false,
-    dnsZoneId: '',
-    dnsName: '',
-    dnsToken: '',
-    dnsTokenConfigured: false,
-    dnsLeadMinutes: 30,
     dnsError: null,
     spotKeepAlive: false,
     enabled: true,
@@ -173,11 +163,6 @@ function formFromAccount(account: AccountDto): AccountForm {
     scheduleStartCron: account.schedule_start_cron ?? '',
     scheduleStopCron: account.schedule_stop_cron ?? '',
     dnsEnabled: account.dns.enabled,
-    dnsZoneId: account.dns.zone_id,
-    dnsName: account.dns.name,
-    dnsToken: '',
-    dnsTokenConfigured: account.dns.token_configured,
-    dnsLeadMinutes: account.dns.lead_minutes,
     dnsError: account.dns.last_error,
     spotKeepAlive: account.spot_keep_alive,
     enabled: account.enabled,
@@ -219,6 +204,7 @@ function deviceName(ua: string): string {
 /** 选项卡定义。 */
 const TABS: { key: Tab; label: string; icon: IconNode }[] = [
   { key: 'accounts', label: '实例', icon: icons.server },
+  { key: 'ddns', label: 'DDNS', icon: icons.cloud },
   { key: 'turnstile', label: '人机校验', icon: icons.shield },
   { key: 'telegram', label: 'Telegram', icon: icons.send },
   { key: 'bark', label: 'Bark', icon: icons.phone },
@@ -247,6 +233,7 @@ export class SettingsModal {
   private saving = false
   private testing: NotifyChannel | 'report' | null = null
 
+  private ddnsDraft = { zoneId: '', name: '', token: '' }
   private turnstileDraft = { enabled: false, siteKey: '', secretKey: '' }
   private telegramDraft = { enabled: false, chatId: '', token: '' }
   private barkDraft = {
@@ -382,6 +369,11 @@ export class SettingsModal {
     const settings = this.settings
     if (!settings) return
 
+    this.ddnsDraft = {
+      zoneId: settings.ddns.zone_id,
+      name: settings.ddns.name,
+      token: '',
+    }
     // 敏感字段一律不回填：留空即保持原值
     this.turnstileDraft = {
       enabled: settings.turnstile.enabled,
@@ -602,6 +594,9 @@ export class SettingsModal {
       case 'accounts':
         this.renderAccounts()
         break
+      case 'ddns':
+        this.renderDdns()
+        break
       case 'turnstile':
         this.renderTurnstile()
         break
@@ -627,6 +622,9 @@ export class SettingsModal {
 
   private saveActiveTab(): void {
     switch (this.activeTab) {
+      case 'ddns':
+        void this.saveDdns()
+        break
       case 'turnstile':
         void this.saveTurnstile()
         break
@@ -878,19 +876,30 @@ export class SettingsModal {
           },
         ),
       ),
-      field(
-        '停机模式',
-        this.picker(
-          form.stopMode,
-          [
-            { value: 'StopCharging', label: '节省停机' },
-            { value: 'KeepCharging', label: '普通停机' },
-          ],
-          (value) => {
-            this.form.stopMode = value
-          },
+      el('div', { class: 'account-fields__full account-operation-row' },
+        field(
+          '停机模式',
+          this.picker(
+            form.stopMode,
+            [
+              { value: 'StopCharging', label: '节省停机' },
+              { value: 'KeepCharging', label: '普通停机' },
+            ],
+            (value) => {
+              this.form.stopMode = value
+            },
+          ),
+        ),
+        el('div', { class: 'account-ddns' },
+          toggleRow({
+            title: '负载均衡',
+            icon: icons.cloud,
+            checked: form.dnsEnabled,
+            onChange: (checked) => { this.form.dnsEnabled = checked },
+          }),
         ),
       ),
+      form.dnsError ? el('p', { class: 'field-hint account-fields__full', text: `最近 DDNS 错误：${form.dnsError}` }) : null,
       el(
         'div',
         { class: 'account-fields__full cron-mode-row' },
@@ -923,23 +932,6 @@ export class SettingsModal {
             ),
           ]
         : [field('每日定时开机', scheduleStart), field('每日定时关机', scheduleStop)]),
-      el('div', { class: 'account-fields__full toggle-list' },
-        toggleRow({
-          title: 'Cloudflare DNS 联动',
-          icon: icons.cloud,
-          checked: form.dnsEnabled,
-          onChange: (checked) => { this.form.dnsEnabled = checked; this.renderContent() },
-        }),
-      ),
-      ...(form.dnsEnabled ? [
-        field('Cloudflare Zone ID', this.line(form.dnsZoneId, (value) => { this.form.dnsZoneId = value }, { placeholder: '域名概述中的 32 位 Zone ID' })),
-        field('完整域名', this.line(form.dnsName, (value) => { this.form.dnsName = value }, { placeholder: 'app.example.com' })),
-        field('Cloudflare API Token', this.line(form.dnsToken, (value) => { this.form.dnsToken = value }, { type: 'password', placeholder: form.dnsTokenConfigured ? '已配置，留空保持不变' : '指定 Zone 的 DNS 编辑权限' })),
-        field('提前摘除（分钟）', this.numberLine(form.dnsLeadMinutes, (value) => { this.form.dnsLeadMinutes = value }, { min: '0', max: '1440', step: '5', suffix: '分钟' })),
-        el('p', { class: 'field-hint account-fields__full', text: '仅管理一条 A 记录，TTL 固定 300 秒。提前时间为 5 分钟的倍数，0 表示关机时摘除。失败会告警，且不影响关机；定时摘除重试至实例停止，手动关机和熔断仅尝试一次。运行后自动恢复解析。' }),
-        el('p', { class: 'field-hint account-fields__full', text: '关闭联动或更换域名不会删除原域名记录；如需清理，请到 Cloudflare 操作。' }),
-        form.dnsError ? el('p', { class: 'field-hint account-fields__full', text: `最近 DNS 错误：${form.dnsError}` }) : null,
-      ] : []),
       el(
         'div',
         { class: 'account-fields__full toggle-list' },
@@ -1015,13 +1007,7 @@ export class SettingsModal {
     }
 
     const payload: AccountInput = {
-      dns: {
-        enabled: form.dnsEnabled,
-        zone_id: form.dnsZoneId.trim(),
-        name: form.dnsName.trim(),
-        lead_minutes: form.dnsLeadMinutes,
-        ...(form.dnsToken.trim() ? { api_token: form.dnsToken.trim() } : {}),
-      },
+      dns: { enabled: form.dnsEnabled },
       name: form.name.trim(),
       site_type: form.siteType,
       access_key_id: form.accessKeyId.trim(),
@@ -1100,6 +1086,39 @@ export class SettingsModal {
       if (changed) this.renderContent()
       this.paintFooter()
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // DDNS
+  // -------------------------------------------------------------------------
+
+  private renderDdns(): void {
+    const config = this.settings?.ddns
+    replaceChildren(this.content,
+      el('section', { class: 'settings-section' },
+        sectionTitle({ icon: icons.cloud, title: 'DDNS', subtitle: 'DYNAMIC DNS' }),
+        el('p', { class: 'field-hint', text: '为启用负载均衡的实例使用同一域名：运行时添加公网 IPv4 的 A 记录，停止后删除该实例的记录。' }),
+        el('div', { class: 'form-grid' },
+          field('Cloudflare Zone ID', this.line(this.ddnsDraft.zoneId, value => { this.ddnsDraft.zoneId = value }, { placeholder: '域名概述中的 32 位 Zone ID' })),
+          field('完整域名', this.line(this.ddnsDraft.name, value => { this.ddnsDraft.name = value }, { placeholder: 'app.example.com' })),
+          field('Cloudflare API Token', this.line(this.ddnsDraft.token, value => { this.ddnsDraft.token = value }, { type: 'password', placeholder: config?.token_configured ? '已配置，留空保持不变' : '指定 Zone 的 DNS 编辑权限' })),
+        ),
+        el('p', { class: 'field-hint', text: '保存后，在实例的「停机模式」旁开启「负载均衡」。解析每五分钟随巡检同步，失败后自动重试；DNS 缓存可能使变更延后生效。' }),
+        el('p', { class: 'field-hint', text: '更换 Zone 时，API Token 需同时拥有新旧 Zone 的 DNS 编辑权限，待所有实例同步完成后再收回旧 Zone 权限。' }),
+      ),
+    )
+  }
+
+  private async saveDdns(): Promise<void> {
+    await this.runSave(
+      () => api.updateDdns({
+        zone_id: this.ddnsDraft.zoneId.trim(),
+        name: this.ddnsDraft.name.trim(),
+        ...(this.ddnsDraft.token.trim() ? { api_token: this.ddnsDraft.token.trim() } : {}),
+      }),
+      'DDNS 设置已保存',
+      '保存 DDNS 设置失败',
+    )
   }
 
   // -------------------------------------------------------------------------

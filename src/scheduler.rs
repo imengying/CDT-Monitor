@@ -40,8 +40,8 @@ use crate::db::Db;
 use crate::models::{
     AccountOverview, AccountRow, BarkConfig, DailyReportConfig, HistoryBucket, InstanceInfo,
     NotifyChannel, OverLimitAction, QuotaPool, SnapshotRow, SnapshotUpdate, TelegramConfig,
-    build_overview, bytes_to_gb, human_amount, local_date, local_day_start_ms,
-    local_minutes_of_day, now_ms, parse_hhmm, setting_key, threshold_reached, within_window,
+    build_overview, bytes_to_gb, daily_occurrence_within, human_amount, local_date,
+    local_day_start_ms, local_minutes_of_day, now_ms, parse_hhmm, setting_key, threshold_reached,
 };
 use crate::notify::{
     BarkChannel, Channels, Message, NotifyLevel, NotifyOutcome, TelegramChannel, dispatch,
@@ -164,7 +164,7 @@ pub struct Scheduler {
     crypto: Crypto,
     now: i64,
     timezone: String,
-    dns_alerts: RefCell<Vec<Message>>,
+    dns_alerts: RefCell<Vec<dns::PendingAlert>>,
 }
 
 impl Scheduler {
@@ -341,7 +341,11 @@ impl Scheduler {
                 self.db
                     .account_at_version(account.id, account.config_version)
                     .await?;
-                self.refresh_account_inner(account, true).await
+                let outcome = self.refresh_account_inner(account, true).await?;
+                if outcome.instances_fresh {
+                    self.dns_reconcile_snapshot(account).await;
+                }
+                Ok(outcome)
             })
             .await;
         let outcome = self.refresh_outcome(account, result).await;
@@ -375,20 +379,24 @@ impl Scheduler {
         }
     }
 
-    /// 页面补采只查询实例，不读取余额、流量，不执行自动化或写采样历史。
+    /// 页面补采查询实例并同步 DDNS，不读取余额、流量或执行启停自动化。
     pub async fn refresh_instance(&self, account: &AccountRow) -> worker::Result<()> {
-        self.db
+        let result = self
+            .db
             .with_account_lock(account.id, 20_000, async {
                 let current = self
                     .db
                     .account_at_version(account.id, account.config_version)
                     .await?;
                 if current.is_enabled() {
-                    self.refresh_instance_locked(&current).await?;
+                    let instance = self.refresh_instance_locked(&current).await?;
+                    self.dns_reconcile(&current, &instance).await;
                 }
                 Ok(())
             })
-            .await
+            .await;
+        self.flush_dns_alerts().await;
+        result
     }
 
     async fn refresh_instance_locked(&self, account: &AccountRow) -> worker::Result<InstanceInfo> {
@@ -582,7 +590,6 @@ impl Scheduler {
         });
         if can_release {
             self.db.clear_threshold(account.id).await?;
-            self.dns_release_threshold(account).await;
             self.db
                 .add_log(
                     Some(account.id),
@@ -612,13 +619,6 @@ impl Scheduler {
                 .await?;
         }
 
-        if instances_fresh && let Some(instance) = instances.first() {
-            let blocked = !can_release
-                && account.action() == OverLimitAction::StopAndNotify
-                && (already_triggered || threshold_fired);
-            self.dns_reconcile(account, instance, blocked).await;
-        }
-
         for warning in &sync.warnings {
             let _ = self
                 .db
@@ -643,21 +643,22 @@ impl Scheduler {
     // 日报
     // -----------------------------------------------------------------------
 
-    fn report_due(&self, config: &DailyReportConfig) -> bool {
-        let tz = if config.timezone.trim().is_empty() {
-            &self.timezone
-        } else {
-            &config.timezone
-        };
-        config.enabled
-            && config.last_sent_date.as_deref() != Some(local_date(self.now, tz).as_str())
-            && parse_hhmm(&config.time).is_some_and(|target| {
-                within_window(
-                    local_minutes_of_day(self.now, tz),
-                    target,
-                    REPORT_WINDOW_MINUTES,
-                )
-            })
+    fn report_due_at(&self, config: &DailyReportConfig) -> Option<i64> {
+        if !config.enabled {
+            return None;
+        }
+        let tz = config.timezone_or(&self.timezone);
+        let at = daily_occurrence_within(
+            self.now,
+            tz,
+            parse_hhmm(&config.time)?,
+            REPORT_WINDOW_MINUTES,
+        )?;
+        config
+            .last_sent_date
+            .as_ref()
+            .is_none_or(|date| date < &local_date(at, tz))
+            .then_some(at)
     }
 
     /// 仅当清理到期或日报命中发送窗口时，才需要维护消息。
@@ -666,21 +667,17 @@ impl Scheduler {
             return Ok(true);
         }
         let config = self.db.get_json_setting(setting_key::DAILY_REPORT).await?;
-        Ok(self.report_due(&config))
+        Ok(self.report_due_at(&config).is_some())
     }
 
     async fn maybe_daily_report(&self) -> worker::Result<()> {
         let config: DailyReportConfig = self.db.get_json_setting(setting_key::DAILY_REPORT).await?;
-        if !self.report_due(&config) {
+        let Some(at) = self.report_due_at(&config) else {
             return Ok(());
-        }
-        let tz = if config.timezone.trim().is_empty() {
-            &self.timezone
-        } else {
-            &config.timezone
         };
-        let today = local_date(self.now, tz);
-        let lock_name = format!("daily-report:{today}");
+        let tz = config.timezone_or(&self.timezone);
+        let date = local_date(at, tz);
+        let lock_name = format!("daily-report:{date}");
         let owner = random_hex(8)?;
         if !self
             .db
@@ -691,16 +688,16 @@ impl Scheduler {
         }
         let result = crate::runtime::timeout(85_000, async {
             // 等待锁期间另一条消息可能已送达，持锁后再次核实。
-            let mut current: DailyReportConfig =
+            let current: DailyReportConfig =
                 self.db.get_json_setting(setting_key::DAILY_REPORT).await?;
-            if !self.report_due(&current) {
+            if self.report_due_at(&current) != Some(at) {
                 return Ok(());
             }
             // 配置已变化时由下一轮按新配置派发，不用旧时区发送。
             if current.time != config.time || current.timezone != config.timezone {
                 return Ok(());
             }
-            let message = self.build_daily_report(tz).await?;
+            let message = self.build_daily_report(tz, at).await?;
             let outcome = self.notify(message).await;
             if !outcome.any_success() {
                 let reason = if outcome.results.is_empty() {
@@ -712,16 +709,13 @@ impl Scheduler {
                     "日报推送失败，稍后重试：{reason}"
                 )));
             }
-            current.last_sent_date = Some(today.clone());
-            self.db
-                .set_json_setting(setting_key::DAILY_REPORT, &current, now_ms())
-                .await?;
+            self.db.mark_daily_report_sent(&date, now_ms()).await?;
             self.db
                 .add_log(
                     None,
                     "daily_report",
                     None,
-                    &format!("日报已推送（{today}）"),
+                    &format!("日报已推送（{date}）"),
                     now_ms(),
                 )
                 .await?;
@@ -738,12 +732,9 @@ impl Scheduler {
     /// 手工触发一次日报（`POST /api/v1/reports/daily`）。
     pub async fn push_daily_report(&self) -> worker::Result<String> {
         let config: DailyReportConfig = self.db.get_json_setting(setting_key::DAILY_REPORT).await?;
-        let timezone = if config.timezone.trim().is_empty() {
-            &self.timezone
-        } else {
-            &config.timezone
-        };
-        let message = self.build_daily_report(timezone).await?;
+        let message = self
+            .build_daily_report(config.timezone_or(&self.timezone), self.now)
+            .await?;
         let preview = message.plain_text();
         let outcome = self.notify(message).await;
         let detail = if outcome.results.is_empty() {
@@ -761,7 +752,7 @@ impl Scheduler {
     }
 
     /// 组装日报消息。
-    async fn build_daily_report(&self, tz: &str) -> worker::Result<Message> {
+    async fn build_daily_report(&self, tz: &str, at: i64) -> worker::Result<Message> {
         let accounts = self.db.list_accounts(true).await?;
         let snapshots: HashMap<i64, SnapshotRow> = self
             .db
@@ -772,7 +763,8 @@ impl Scheduler {
             .collect();
 
         let mut details = Vec::new();
-        let mut used_total_gb = 0.0f64;
+        let month = crate::models::billing_month(at, &self.timezone);
+        let used_total_gb = crate::models::monthly_traffic_gb(&accounts, &snapshots, &month);
         let mut missing_traffic = 0usize;
         let mut collection_warnings = 0usize;
         let mut triggered = 0usize;
@@ -781,10 +773,8 @@ impl Scheduler {
 
         for account in &accounts {
             let snapshot = snapshots.get(&account.id);
-            let overview: AccountOverview = build_overview(account, snapshot, tz, self.now);
-            if overview.traffic_current {
-                used_total_gb += overview.traffic_used_gb;
-            } else {
+            let overview: AccountOverview = build_overview(account, snapshot, &month);
+            if !overview.traffic_current {
                 missing_traffic += 1;
             }
             if !overview.sync_errors.is_empty() {
@@ -848,7 +838,7 @@ impl Scheduler {
 
         let body = format!(
             "{} 概览：{} 个账号，已采集的本月合计流量 {:.2} GB，{} 个账号本月流量待采集，{} 个账号最近采集异常，实例运行 {} / 停止 {}，已熔断 {} 个。",
-            local_date(self.now, tz),
+            local_date(at, tz),
             accounts.len(),
             used_total_gb,
             missing_traffic,
@@ -925,13 +915,8 @@ impl Scheduler {
         let client = AliyunClient::from_account(account, self.account_secret(account)?);
         let region_id = &account.region_id;
         let instance = self.refresh_instance_locked(account).await?;
-        if start {
-            self.dns_resume(account).await;
-        }
-        if start && instance.is_running() {
-            self.dns_reconcile(account, &instance, false).await;
-        }
         if (start && instance.is_running()) || (!start && instance.is_stopped()) {
+            self.dns_reconcile(account, &instance).await;
             return Ok(if start {
                 "已核实实例正在运行，无需开机"
             } else {
@@ -945,10 +930,6 @@ impl Scheduler {
             ));
         }
 
-        if !start {
-            self.dns_before_stop(account, &instance, &format!("manual:{}", now_ms()), false)
-                .await;
-        }
         let result = if start {
             client.start_instance(instance_id, region_id).await
         } else {
@@ -998,14 +979,23 @@ impl Scheduler {
         // 动作后立即刷新，保证前端轮询结束时看到的是真实状态；
         // 若阿里云尚未落到终态（刚发出指令常如此），把快照置为过渡态，
         // 让前端显示「正在启动…」，并在每分钟轮询时补采核实终态。
-        if let Err(err) = crate::runtime::timeout(3_000, self.refresh_instance_locked(account))
+        let observed = match crate::runtime::timeout(3_000, self.refresh_instance_locked(account))
             .await
             .and_then(|r| r.map_err(|_| "动作后状态查询失败"))
         {
-            log_warn!("动作后刷新失败：{err}");
-        }
+            Ok(instance) => Some(instance),
+            Err(err) => {
+                log_warn!("动作后刷新失败：{err}");
+                None
+            }
+        };
         self.set_transitional_status(account_id, instance_id, start)
             .await?;
+        if let Some(instance) = observed
+            && ((start && instance.is_running()) || (!start && instance.is_stopped()))
+        {
+            self.dns_reconcile(account, &instance).await;
+        }
 
         Ok(detail)
     }
@@ -1217,6 +1207,7 @@ impl Scheduler {
                 .notes
                 .push(format!("{} 保活异常：{err}", account.name));
         }
+        self.dns_reconcile_snapshot(account).await;
         report
     }
 
@@ -1623,27 +1614,6 @@ mod tests {
         let summary = report.summary();
         assert!(summary.contains("账号 2/3"));
         assert!(summary.contains("失败 1"));
-    }
-
-    #[test]
-    fn dns_stop_time_handles_midnight_and_advanced_schedule() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-11-17T15:00:00Z")
-            .unwrap()
-            .timestamp_millis();
-        let mut account = account_with_schedule(None, Some("00:10"));
-        let expected = now + 70 * 60_000;
-        assert_eq!(
-            crate::dns::next_stop(&account, "UTC+8", now),
-            Some(expected)
-        );
-        account.schedule_mode = Some("advanced".into());
-        account.schedule_stop_cron = Some("10 0 * * *".into());
-        assert_eq!(
-            crate::dns::next_stop(&account, "UTC+8", now),
-            Some(expected)
-        );
-        account.schedule_stop_cron = None;
-        assert_eq!(crate::dns::next_stop(&account, "UTC+8", now), None);
     }
 
     #[test]

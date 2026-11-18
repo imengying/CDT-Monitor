@@ -1,67 +1,57 @@
 //! 定时开关机与抢占式保活。
 use super::*;
 
+struct ScheduleOccurrence {
+    key: String,
+    label: String,
+    date: String,
+}
+
 impl Scheduler {
-    // -----------------------------------------------------------------------
-    // 定时开关机
-    // -----------------------------------------------------------------------
-
-    /// 判断「定时关机」这次该不该执行。
-    ///
-    /// 返回 `(去重键, 时间描述)`；`None` 表示本轮不执行。
-    fn stop_due(&self, account: &AccountRow) -> Option<(String, String)> {
+    fn schedule_due(&self, account: &AccountRow, start: bool) -> Option<ScheduleOccurrence> {
         if account.schedule_is_advanced() {
-            let expr = account.stop_cron()?;
-            let window_ms = SCHEDULE_WINDOW_MINUTES as i64 * 60 * 1000;
-            let occurred =
-                crate::cron::last_occurrence_within(expr, &self.timezone, self.now, window_ms)?;
-            // 这次触发已经执行过（或执行时间更晚）就跳过
-            if account
-                .last_schedule_stop_at
-                .is_some_and(|prev| prev >= occurred)
-            {
+            let (expr, last) = if start {
+                (account.start_cron()?, account.last_schedule_start_at)
+            } else {
+                (account.stop_cron()?, account.last_schedule_stop_at)
+            };
+            let at = crate::cron::last_occurrence_within(
+                expr,
+                &self.timezone,
+                self.now,
+                i64::from(SCHEDULE_WINDOW_MINUTES) * 60_000,
+            )?;
+            if last.is_some_and(|prev| prev >= at) {
                 return None;
             }
-            Some((format!("cron:{occurred}"), crate::cron::describe(expr)))
+            Some(ScheduleOccurrence {
+                key: format!("cron:{at}"),
+                label: crate::cron::describe(expr),
+                date: local_date(at, &self.timezone),
+            })
         } else {
-            let target = account.schedule_stop_minutes()?;
-            let now_minutes = local_minutes_of_day(self.now, &self.timezone);
-            if !within_window(now_minutes, target, SCHEDULE_WINDOW_MINUTES) {
+            let (time, last) = if start {
+                (
+                    account.schedule_start_minutes()?,
+                    &account.last_schedule_start_date,
+                )
+            } else {
+                (
+                    account.schedule_stop_minutes()?,
+                    &account.last_schedule_stop_date,
+                )
+            };
+            let at =
+                daily_occurrence_within(self.now, &self.timezone, time, SCHEDULE_WINDOW_MINUTES)?;
+            let date = local_date(at, &self.timezone);
+            if last.as_ref().is_some_and(|prev| prev >= &date) {
                 return None;
             }
-            let today = local_date(self.now, &self.timezone);
-            if account.last_schedule_stop_date.as_deref() == Some(today.as_str()) {
-                return None;
-            }
-            Some((format!("daily:{today}"), today))
-        }
-    }
-
-    /// 判断「定时开机」这次该不该执行，语义同 [`Self::stop_due`]。
-    fn start_due(&self, account: &AccountRow) -> Option<(String, String)> {
-        if account.schedule_is_advanced() {
-            let expr = account.start_cron()?;
-            let window_ms = SCHEDULE_WINDOW_MINUTES as i64 * 60 * 1000;
-            let occurred =
-                crate::cron::last_occurrence_within(expr, &self.timezone, self.now, window_ms)?;
-            if account
-                .last_schedule_start_at
-                .is_some_and(|prev| prev >= occurred)
-            {
-                return None;
-            }
-            Some((format!("cron:{occurred}"), crate::cron::describe(expr)))
-        } else {
-            let target = account.schedule_start_minutes()?;
-            let now_minutes = local_minutes_of_day(self.now, &self.timezone);
-            if !within_window(now_minutes, target, SCHEDULE_WINDOW_MINUTES) {
-                return None;
-            }
-            let today = local_date(self.now, &self.timezone);
-            if account.last_schedule_start_date.as_deref() == Some(today.as_str()) {
-                return None;
-            }
-            Some((format!("daily:{today}"), today))
+            Some(ScheduleOccurrence {
+                key: format!("daily:{date}"),
+                label: date.clone(),
+                date,
+            })
         }
     }
 
@@ -76,12 +66,12 @@ impl Scheduler {
         account: &AccountRow,
         report: &mut CronReport,
     ) -> worker::Result<()> {
-        let Some((dedupe_key, label)) = self.stop_due(account) else {
+        let Some(ScheduleOccurrence { key, label, date }) = self.schedule_due(account, false)
+        else {
             return Ok(());
         };
-        let today = local_date(self.now, &self.timezone);
 
-        let lock_name = format!("schedule-stop:{}:{dedupe_key}", account.id);
+        let lock_name = format!("schedule-stop:{}:{key}", account.id);
         let owner = random_hex(8).map_err(|e| worker::Error::RustError(e.to_string()))?;
         if !self
             .db
@@ -107,8 +97,6 @@ impl Scheduler {
             let secret = self.account_secret(account)?;
             let client = AliyunClient::from_account(account, secret);
             for instance in &running {
-                self.dns_before_stop(account, instance, &format!("schedule:{dedupe_key}"), true)
-                    .await;
                 match client
                     .stop_instance(
                         &instance.instance_id,
@@ -156,7 +144,7 @@ impl Scheduler {
         // 过渡态、未知或缺少实例都不能证明关机目标已完成。
         if !unresolved && ok_count == running.len() {
             self.db
-                .mark_schedule_done(account.id, false, &today, now_ms())
+                .mark_schedule_done(account.id, false, &date, now_ms())
                 .await?;
         } else {
             report.retry_needed = true;
@@ -168,7 +156,7 @@ impl Scheduler {
             account.name,
             ok_count,
             running.len().saturating_sub(ok_count),
-            today
+            date
         ));
         Ok(())
     }
@@ -179,10 +167,9 @@ impl Scheduler {
         account: &AccountRow,
         report: &mut CronReport,
     ) -> worker::Result<()> {
-        let Some((dedupe_key, label)) = self.start_due(account) else {
+        let Some(ScheduleOccurrence { key, label, date }) = self.schedule_due(account, true) else {
             return Ok(());
         };
-        let today = local_date(self.now, &self.timezone);
         if account.schedule_is_advanced() && !automation_allowed(account, self.now, &self.timezone)
         {
             return Ok(());
@@ -191,11 +178,8 @@ impl Scheduler {
         // 也不能在下一条消息里补执行旧的开机计划，把刚停止的实例拉起。
         if !account.schedule_is_advanced()
             && account.schedule_stop_minutes().is_some_and(|stop| {
-                within_window(
-                    local_minutes_of_day(self.now, &self.timezone),
-                    stop,
-                    SCHEDULE_WINDOW_MINUTES,
-                )
+                daily_occurrence_within(self.now, &self.timezone, stop, SCHEDULE_WINDOW_MINUTES)
+                    .is_some()
             })
         {
             return Ok(());
@@ -205,7 +189,7 @@ impl Scheduler {
         if self.threshold_blocked(account).await? {
             // 标记当日已完成：本月不会再尝试拉起，无需在窗口内反复判定。
             self.db
-                .mark_schedule_done(account.id, true, &today, now_ms())
+                .mark_schedule_done(account.id, true, &date, now_ms())
                 .await?;
             report.notes.push(format!(
                 "{} 定时开机被跳过：本月已触发流量熔断",
@@ -223,7 +207,7 @@ impl Scheduler {
             return Ok(());
         }
 
-        let lock_name = format!("schedule-start:{}:{dedupe_key}", account.id);
+        let lock_name = format!("schedule-start:{}:{key}", account.id);
         let owner = random_hex(8).map_err(|e| worker::Error::RustError(e.to_string()))?;
         if !self
             .db
@@ -291,7 +275,7 @@ impl Scheduler {
 
         if !unresolved && ok_count == stopped.len() {
             self.db
-                .mark_schedule_done(account.id, true, &today, now_ms())
+                .mark_schedule_done(account.id, true, &date, now_ms())
                 .await?;
         } else {
             report.retry_needed = true;
@@ -303,7 +287,7 @@ impl Scheduler {
             account.name,
             ok_count,
             stopped.len().saturating_sub(ok_count),
-            today
+            date
         ));
         Ok(())
     }
