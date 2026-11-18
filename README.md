@@ -1,57 +1,47 @@
 # CDT Monitor (Worker)
 
-![Rust](https://img.shields.io/badge/Rust-2024_Edition-black?logo=rust)
-![WebAssembly](https://img.shields.io/badge/Target-wasm32-654FF0?logo=webassembly)
-![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers_%26_D1-F38020?logo=cloudflare)
-![TypeScript](https://img.shields.io/badge/Frontend-Vanilla_TS_%2B_ECharts-3178C6?logo=typescript)
+运行在 Cloudflare Workers 上的阿里云 CDT 流量监控与 ECS 控制面板。可以查看本月公网出流量、余额和实例状态，按用量停机，也可以让多台实例共用一个服务域名。项目参考了 [wang4386/CDT-Monitor](https://github.com/wang4386/CDT-Monitor)。
 
-阿里云 **CDT 流量监控** 与 **ECS 自动化控制**面板，运行在 Cloudflare Workers 上。  
-参考 [`wang4386/CDT-Monitor`](https://github.com/wang4386/CDT-Monitor) 的业务语义，实现为 **Rust/Wasm + D1 + Queues + Cron Triggers + Turnstile**，前端为无框架纯 TypeScript。
+## Cron + DDNS + 负载均衡
 
-```text
-┌───────────────────────────────────────────────────────────────────┐
-│  Cloudflare 边缘                                                  │
-│                                                                   │
-│  纯 TypeScript 前端 (DOM + ECharts)              ← ASSETS 绑定    │
-│         │ fetch /api/v1/*（同源 Cookie）                          │
-│         ▼                                                         │
-│  Worker (Rust → Wasm)                                             │
-│    ├─ fetch:      路由 + 登录 + Cookie 鉴权                       │
-│    ├─ scheduled:  */5 * * * * 巡检                                │
-│    └─ queue:      异步 Job（刷新 / 开关机 / 通知测试 / 日报）     │
-│         │                                                         │
-│         ├─ D1：accounts / snapshots / history / jobs / logs       │
-│         └─ fetch → 阿里云 RPC（CDT / ECS / BSS）                  │
-│                    Telegram · Bark                                │
-└───────────────────────────────────────────────────────────────────┘
-```
+假设两个阿里云账号各有一台 ECS，运行同一服务，公网 IPv4 各不相同。用户始终访问 `app.example.com`。Cron 每 5 分钟巡检一次，按各实例的计划开关机，并检查账号用量。DDNS 根据阿里云返回的运行状态更新域名的 A 记录。
 
-## 核心特性
+| 实例发生了什么 | `app.example.com` 的 A 记录 |
+| --- | --- |
+| A 在运行，B 尚未到开机时间 | 只有 A 的 IP |
+| B 按 `0 9 * * *` 每天 09:00 开机，巡检确认已运行 | A 和 B 的 IP，客户端可连接任一台 |
+| A 的账号达到流量阈值，巡检按「停机并通知」关机并确认已停止 | 移除 A 的 IP，B 继续提供服务 |
+| A 解除流量限制后再次开机，巡检确认已运行 | 自动补回 A 当前的 IP |
 
-- **流量采样与熔断**：每 5 分钟采集 CDT 公网流量与实例状态，余额每 30 分钟更新（手动刷新立即查询），按小时 / 天查看 ECharts 趋势，达到阈值自动告警或停机止损。
-- **实例自动化控制**：面板手动启停、每日定时开关机（或五字段 Cron）、抢占式实例自动保活拉起。
-- **公网地址**：卡片显示实例的公网 IPv4 / IPv6，点地址即复制。
-- **多渠道推送**：支持 Telegram 与 Bark，覆盖超限熔断、保活拉起与每日流量日报。
-- **纵深安全**：AK Secret 与推送凭据经 XChaCha20-Poly1305 加密落盘，配合 Turnstile、常量时间比对、设备会话管理与跨站请求拦截。
+这样可以用 Cron 安排不同账号的实例交替运行，也可以让它们同时分担流量。要在某台停机后继续提供服务，需提前安排另一台运行。记录使用 Cloudflare 的「仅 DNS」模式，TTL 为 300 秒，缓存到期前客户端仍可能拿到旧地址。[Cloudflare DNS 轮询说明](https://developers.cloudflare.com/dns/manage-dns-records/how-to/round-robin-dns/)
 
----
+**启用方法**
 
-## 一、准备阿里云子账号
+1. 在「控制台设置 → DDNS」填写 Cloudflare Zone ID、完整域名和 API Token。给 Token 授予该域名所在 Zone 的 DNS 编辑权限。
+2. 在「控制台设置 → 实例」添加或编辑每台 ECS，打开「启用该实例」和「停机模式」右侧的「负载均衡」。每台实例可单独选「每日时间」或填写「Cron 表达式」（分、时、日、月、周）。开关机时间按「系统」页设置的时区执行。
+3. 需要按流量停机时，将「告警阈值（GB）」设为正数，「超限动作」选「停机并通知」。阈值比较的是该阿里云账号在实例所属地域额度池的本月累计用量。同一主账号、同一额度池的实例共享这份用量。
 
-需要一对 AccessKey 才能读流量、查实例、按阈值停机。**不要用主账号的 AccessKey**。
+实例正在开关机或本轮状态查询失败时，DDNS 等待下次确认。关闭「负载均衡」后，已有记录会保留。旧版用户若曾在实例里配置 DNS 联动，请在「DDNS」重新填写配置，并核对旧域名的 A 记录。
 
-### 1. 创建 RAM 子账号
+## 部署到 Cloudflare
 
-1. 进入阿里云 RAM 用户控制台（[🇨🇳 国内站](https://ram.console.aliyun.com/users) | [🌍 国际站](https://ram.console.alibabacloud.com/users)），点 **创建用户**。
-2. 填写登录名称（例如 `cdt-monitor`），访问方式勾选 **「使用永久 AccessKey 访问」**。
-3. 创建完成后，把页面上生成的 **AccessKey ID** 和 **AccessKey Secret** 复制保存下来，后面填进 CDT-Monitor 就用这两个值。
+1. 将仓库 Fork 到自己的 GitHub。在 Cloudflare 的「Workers 和 Pages」中创建 Worker，连接该仓库，构建命令填 `bun run build`，部署命令填 `bun run deploy`。
+2. 构建变量 `BUN_VERSION` 填 `1.4.4`。Node 默认读取仓库指定的版本，若已设置 `NODE_VERSION`，请确保与 `.node-version` 一致。[package.json](package.json) · [.node-version](.node-version)
+3. 点击部署。脚本会创建 D1 数据库、任务队列和死信队列，应用数据库迁移并发布 Worker。自备构建 API Token 时，需授予 D1、Workers Scripts 和 Queues 编辑权限。
+4. 在已部署 Worker 的「设置 → 变量和密钥」中添加以下三项，类型均选 **Secret**。保存并部署后，打开 Worker 地址登录面板。
 
-### 2. 创建自定义权限策略
+| 运行时密钥 | 填写内容 |
+| --- | --- |
+| `MASTER_KEY` | 在本机运行 `openssl rand -hex 32`，填入输出的 64 个十六进制字符 |
+| `ADMIN_USERNAME` | 面板管理员用户名 |
+| `ADMIN_PASSWORD` | 面板管理员密码 |
 
-官方预置的系统策略权限过宽，这里写一份最小权限策略。
+请备份 `MASTER_KEY` 并在后续部署中沿用。面板用它解密已保存的云账号、DDNS、通知及人机校验凭据，也用它校验登录会话。
 
-1. 前往权限策略控制台（[🇨🇳 国内站](https://ram.console.aliyun.com/policies) | [🌍 国际站](https://ram.console.alibabacloud.com/policies)），点 **创建权限策略**。
-2. 切到 **脚本编辑** 标签页，清空默认内容，粘贴：
+## 授权并添加阿里云实例
+
+1. 在阿里云 RAM 中创建专用用户，启用 AccessKey 访问并保存生成的 AccessKey ID 和 AccessKey Secret。[国内站用户管理](https://ram.console.aliyun.com/users) · [国际站用户管理](https://ram.console.alibabacloud.com/users)
+2. 创建自定义权限策略，选择「脚本编辑」，粘贴下方 JSON。将最后一项中的 `<region>`、`<主账号 UID>` 和 `<实例 ID>` 换成实际值。管理多台 ECS 时，`Resource` 可填各实例资源标识组成的数组。[国内站权限策略](https://ram.console.aliyun.com/policies) · [国际站权限策略](https://ram.console.alibabacloud.com/policies)
 
 ```json
 {
@@ -59,548 +49,48 @@
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": "cdt:ListCdtInternetTraffic",
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "bssapi:QueryAccountBalance",
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "ecs:DescribeInstances",
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "ecs:DescribeNetworkInterfaces",
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
       "Action": [
-        "ecs:StartInstance",
-        "ecs:StopInstance"
+        "cdt:ListCdtInternetTraffic",
+        "bssapi:QueryAccountBalance",
+        "ecs:DescribeInstances",
+        "ecs:DescribeNetworkInterfaces"
       ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["ecs:StartInstance", "ecs:StopInstance"],
       "Resource": "acs:ecs:<region>:<主账号 UID>:instance/<实例 ID>"
     }
   ]
 }
 ```
 
-> [!NOTE]
-> - **`bssapi:QueryAccountBalance` 可能提示「无效授权」**：忽略即可（阿里云文档写的是 `bssapi:Query*`，两种写法实测都能查到余额）。不想让程序读财务数据时可以删掉这一段，余额一栏会显示 `—`（通知里显示「未知」），不影响其他功能。
-> - **`ecs:DescribeInstances` 不能省**：启停接口内部会先校验实例状态。若实例在 VPC 内且报权限错误，再补 `vpc:DescribeVpcs` 等基础网络查询权限。
-> - **`ecs:DescribeNetworkInterfaces` 用于补取 IPv6**：实例详情未返回 IPv6 时，程序会按实例 ID 查询已挂载的主、副网卡。沿用旧权限策略的用户需要补上这一项；缺少权限会在「采集告警」中显示具体错误，实例状态仍正常更新。
+3. 回到 RAM 用户列表，选择该用户，点击「新增授权」并绑定刚创建的策略。
+4. 登录面板，在「控制台设置 → 实例」点击「添加实例」，选择站点和地域，填写 RAM 用户的 AccessKey 和 ECS 实例 ID。保存后刷新，在实例卡片核对状态与公网地址。实例详情缺少 IPv6 时，面板会查询已挂载的主、副网卡，所需权限为 `ecs:DescribeNetworkInterfaces`。
 
-### 3. 替换成你的实例信息
+## 日常使用
 
-最后一段的 `acs:ecs:<region>:<主账号 UID>:instance/<实例 ID>` 用来限制子账号只能开关指定的机器，三个占位符都要换成实际值：
+- **采集与告警**　流量与实例状态每 5 分钟采集一次，余额每 30 分钟更新，手动刷新可立即查询。首页可按小时或天查看流量趋势。阈值填 `0` 可关闭流量告警，选择「仅通知」可在超限时继续运行。
+- **启停与保活**　设定的时间落在两轮巡检之间时，下一轮会检查并执行到期计划。开关机指令提交后，卡片显示「启动中」或「停止中」，页面在前台时每分钟刷新概览。抢占式实例可在允许运行的时段自动拉起，如需手动保持停机，先关闭保活。
+- **通知与日报**　在「Telegram」或「Bark」配置推送渠道，再到「日报」启用每日推送、选择时间，也可以点击「推送测试」查看效果。
+- **排查与登录管理**　采集失败时，面板保留上次成功的数据，可到「日志」查看原因。「人机校验」可启用 Turnstile。登录会话有效期为 7 天，可在「登录设备」中让指定设备退出。
 
-| 占位符 | 含义 | 去哪找 | 示例 |
-|---|---|---|---|
-| `<region>` | 地域 ID | 目标 ECS 所在的地域代号 | `cn-hongkong` |
-| `<主账号 UID>` | 阿里云账号 ID | 鼠标移到控制台右上角头像即可看到 | `1234567890123456` |
-| `<实例 ID>` | ECS 实例 ID | `instance` 后面**必须保留斜杠 `/`** | `i-bp1234567890abcdef` |
+## 本地运行
 
-一个账号对应一个地域和一台实例：
-
-```json
-"Resource": "acs:ecs:cn-hongkong:1234567890123456:instance/i-bp1234567890abcdef"
-```
-
-要用同一个子账号管理多台机器时，`Resource` 改成数组：
-
-```json
-"Resource": [
-  "acs:ecs:cn-hongkong:1234567890123456:instance/i-bp1111111111abcdef",
-  "acs:ecs:cn-hangzhou:1234567890123456:instance/i-bp2222222222abcdef"
-]
-```
-
-### 4. 绑定到子账号
-
-1. 回到 **RAM 用户列表**，找到刚才创建的账号，点右侧 **新增授权**。
-2. **授权范围** 保持默认的「账号级别」。
-3. 在 **权限策略** 里切到「自定义策略」，搜索并勾选刚建的策略，确认授权。
-
-完成后，保存好 AK/SK 和实例 ID，配置 CDT-Monitor 时会用到。
-
----
-
-## 二、部署到 Cloudflare
-
-### 1. 连接仓库
-
-**Workers 和 Pages** → **创建应用**（Create）→ **Workers** → **从 GitHub 导入**（Connect with GitHub），选中本仓库，填两项：
-
-| 项 | 值 |
-|---|---|
-| 构建命令（Build command） | `bun run build` |
-| 部署命令（Deploy command） | `bun run deploy` |
-
-部署脚本会创建 `cdt-monitor-tasks` 任务队列和 `cdt-monitor-tasks-dlq` 死信队列，并绑定生产者和消费者。自定义构建 API Token 需要 D1、Workers Scripts 和 Queues 的编辑权限。构建仅在 Build command 执行一次，部署上传已有产物；本地部署前也请先运行 `bun run build`。
-
-队列每条消息默认包含一次写入、读取和删除操作；每五分钟每账号巡检一次，约 864 次操作/账号/天，另有维护、手动任务和重试。请按账号规模核对 [Queues 当前额度](https://developers.cloudflare.com/queues/platform/pricing/)。
-
-维护消息仅在每日清理或日报到期时派发。正常无重试时，基础用量约为 `864 × 启用账号数 + 3～6 次/天`：常见的 1～3 个账号约 870～2,600 次/天。截至 2026-11-08，免费版包含 10,000 次操作/天；手动任务、页面补采和失败重试另计。
-
-### 2. 构建工具版本
-
-项目通过 `.node-version` 固定 Node **26.13.0 LTS**，根 `package.json` 固定 Bun **1.4.4**。Cloudflare 会读取这些文件选择版本；已有构建变量应与它们保持一致：
-
-| 变量名 | 变量值 |
-|---|---|
-| `BUN_VERSION` | `1.4.4` |
-| `NODE_VERSION` | `26.13.0`（可省略，由 `.node-version` 选择） |
-
-> [!IMPORTANT]
-> 如果控制台已有 `NODE_VERSION=24`，请改为 `26.13.0` 或删除该变量；构建脚本会检查实际 Node 版本。Bun 与 Node 的版本选择方式见 [Cloudflare 构建镜像文档](https://developers.cloudflare.com/workers/ci-cd/builds/build-image/)。
-
-点 **部署**（Deploy）。
-
-### 3. 配置运行时变量和密钥
-
-**第一次部署完成之后**再进行这一步。
-
-**设置**（Settings）→ **运行时变量和密钥**（Variables and Secrets），添加三项，类型都选 **密钥**（Secret）：
-
-| 名称 | 值 |
-|---|---|
-| `MASTER_KEY` | 见下方说明 |
-| `ADMIN_USERNAME` | 你自己定的管理员用户名 |
-| `ADMIN_PASSWORD` | 你自己定的管理员密码 |
-
-添加并保存后，Cloudflare 会自动重启 Worker，新值立即生效。
-
-#### `MASTER_KEY` 怎么填
-
-**它不是让你手写的一串固定值**，而是随机生成的一段密钥。在任意一台装有 OpenSSL 的电脑上执行：
+安装 Node、Bun 和 Rust（rustup），Node 和 Bun 版本同上。先安装依赖并复制本地配置。
 
 ```bash
-openssl rand -hex 32
-```
-
-会输出 64 个十六进制字符，例如：
-
-```text
-9f3c1a7e4b2d8f605a9e7c3b1d4f8a2e6c9b0d3f5a8e1c4b7d2f9a6e3c0b5d81
-```
-
-把这串完整复制，粘贴到 `MASTER_KEY` 的值里。**不要**把命令本身填进去。
-
-没有 OpenSSL 时，任意 32 字节的随机串也可以（64 位 Hex、44 位 Base64 均可）；随手编一串短字符串虽然能启动，但强度不够，不建议。
-
-> [!WARNING]
-> 改了 `MASTER_KEY` 会让已存的密文全部解不开，需要到设置页把每个实例的 AccessKey Secret 及通知密钥重填一遍。
-
----
-
-## 三、技术说明
-
-项目技术说明
-
-### 目录结构
-
-```text
-cdt-monitor/
-├── Cargo.toml                   # Rust 2024，cdylib → wasm32
-├── wrangler.toml                # D1 / Queues / Assets / Cron
-├── package.json                 # 根脚本（Bun）
-├── rust-toolchain.toml
-├── .dev.vars.example            # 本地开发变量模板
-├── scripts/
-│   ├── build-ci.sh              # 构建入口：校验配置 → 装工具链 → 构建
-│   ├── check-config.ts          # wrangler.toml 结构校验
-│   └── deploy.ts                # 部署入口：建库 → 迁移 → 发布
-├── migrations/
-│   ├── init_001.sql             # 9 张表 + 12 个索引
-│   ├── init_002_schedule_cron.sql  # 增量：定时模式与 Cron 字段
-│   └── init_003_reliability.sql  # 增量：分项采集状态、任务恢复、登录限流
-├── src/
-│   ├── lib.rs                   # fetch / scheduled 入口、路由、鉴权
-│   ├── jobs.rs                  # D1 任务执行器与批量进度
-│   ├── tasks.rs                 # 队列派发与单账号巡检
-│   ├── runtime.rs               # 并发请求、超时与取消
-│   ├── models.rs                # D1 实体行 + 前后端 DTO + 时区/单位换算
-│   ├── db.rs                    # D1 SQL 封装（含幂等锁）
-│   ├── crypto.rs                # XChaCha20-Poly1305、无状态 Token
-│   ├── logging.rs               # 分级日志（默认只输出 error）
-│   ├── cron.rs                  # Cron 表达式解析与触发窗口判定
-│   ├── aliyun.rs                # RPC V1 签名器 + CDT/ECS/BSS 客户端
-│   ├── notify.rs                # Telegram + Bark
-│   ├── scheduler.rs             # 采样 / 巡检 / 日报
-│   └── scheduler/              # 熔断、定时开关机与保活
-├── tests/worker.mjs             # 本地 Worker + D1 业务回归
-└── web/
-    ├── package.json
-    ├── tsconfig.json
-    ├── vite.config.ts
-    ├── index.html               # 以 render=explicit 引入 Turnstile
-    ├── public/
-    │   ├── favicon.svg
-    │   └── theme-init.js        # 首屏落地主题，避免深色下一帧白底
-    └── src/
-        ├── main.ts              # 入口
-        ├── App.ts               # 主控制台
-        ├── style.css            # 主题令牌与组件语义类（含深色主题）
-        ├── env.d.ts             # Turnstile 类型声明
-        ├── api/client.ts        # API 客户端 + 202 Job 轮询
-        ├── lib/
-        │   ├── dom.ts           # el() / iconSvg() 等 DOM 工具
-        │   ├── icons.ts         # 按需引入的 lucide 图标
-        │   ├── theme.ts         # 浅色 / 深色 / 跟随系统
-        │   ├── logs.ts          # 日志标签与行渲染（设置页共用）
-        │   ├── echarts.ts       # 按需注册的 ECharts 模块（动态 import）
-        │   ├── store.ts         # 状态容器 + toast
-        │   └── actions.ts       # API 调用与状态写入
-        └── components/
-            ├── LoginModal.ts    # 登录卡片 + Turnstile
-            ├── AccountCard.ts   # 账号卡片 + 实例控制 + 公网 IP
-            ├── HistoryModal.ts  # ECharts 历史流量弹窗
-            ├── SettingsModal.ts # 设置弹窗（7 个标签页）
-            ├── CronEditor.ts    # 五字段 Cron 输入 + 预览
-            └── ToastStack.ts    # 提示条容器
-```
-
-前端为纯 TypeScript 类组件，直接操作 DOM，不依赖任何框架。
-
----
-
-### 配置分布
-
-| 类别 | 存放位置 | 内容 |
-|---|---|---|
-| 运行时密钥 | 设置 → 运行时变量和密钥 | `MASTER_KEY`、`ADMIN_USERNAME`、`ADMIN_PASSWORD` |
-| 构建变量 | 设置 → 构建 → 高级设置 | `BUN_VERSION` |
-| 业务配置 | D1，设置页面 | 阿里云账号、Turnstile、Telegram、Bark、日报、时区、日志级别等 |
-
-`wrangler.toml` 不含 `[vars]` 段。业务配置改动即时生效，无需重新部署。
-
----
-
-### 日志与可观测性
-
-| 项目 | 默认 | 调整方式 |
-|---|---|---|
-| 应用日志 | 仅 `error` | 设置 → 系统 → 日志级别 |
-| Workers Logs | 开启应用日志，关闭逐请求调用日志 | `wrangler.toml` 的 `[observability.logs]` |
-
-```text
-error  解密失败、D1 不可用、任务失败
-warn   通知发送失败、动作后刷新失败
-info   Cron 汇总、任务完成、保活拉起实例
-debug  同 info
-```
-
-应用默认只输出错误，Workers Logs 保留这些日志；正常请求不生成调用日志。排障时可临时将应用日志级别改为 `warn` / `info`，日志在 Cloudflare 控制台 **Workers → 本应用 → Logs** 里查看。
-
-Cron 派发端检查启用账号的流量和实例最近成功采集时间，超过 15 分钟未更新时记录「采集停滞」并通过已配置的通知渠道告警；送达后抑制重复告警 1 小时，失败则下一轮重试。该检查不依赖队列消费，可发现队列积压，但无法在 Cron 本身停止触发时发送告警，这种情况需由外部监控检测。
-
-队列重试耗尽的消息进入 `cdt-monitor-tasks-dlq`，在 Cloudflare Queues 控制台检查积压和死信。死信仅用于排障，不自动重放启停；处理故障后应核实实例当前状态，再提交新的操作。死信仍受队列保留期限制，并非永久备份。参见 [Cloudflare 死信队列说明](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/) 与 [Workers Logs 配置](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)。
-
----
-
-### 安全模型
-
-#### 凭据加密
-
-```text
-明文  ──XChaCha20-Poly1305(随机 24B Nonce)──▶  Base64(Nonce ‖ 密文 ‖ 16B Tag)  ──▶  D1 TEXT
-```
-
-- 算法 `chacha20poly1305::XChaCha20Poly1305`，192 位 Nonce
-- 主密钥解析顺序：64 字符 Hex → Base64（三种变体）→ 恰 32 字节原文 → `blake3::derive_key`
-- 任一字节被篡改都会导致 AEAD 认证失败并返回明确错误
-
-#### 管理员认证
-
-| 环节 | 实现 |
-|---|---|
-| 人机校验 | Turnstile `siteverify`，携带 `CF-Connecting-IP` 作为 `remoteip`；前端 `appearance: 'interaction-only'`，无交互需求时不渲染可见元素 |
-| 开关 | 默认关闭；配置损坏，或启用后密钥不完整、无法解密，均返回 `turnstile_broken` 并拒绝登录 |
-| 凭证来源 | `ADMIN_USERNAME` / `ADMIN_PASSWORD`，唯一来源 |
-| 比较方式 | 用户名与密码均常量时间比较且不短路 |
-| 防枚举 | 用户名错与密码错返回同一提示，延迟一致 |
-| 登录限流 | 每个来源 IP 每 5 分钟最多 10 次尝试，D1 原子计数 |
-| 会话 | `v1.<payload>.<sig>`，`HMAC-SHA256(MASTER_KEY)` 签名，payload 含 `iat` / `exp` / `jti` |
-| 传输 | `HttpOnly; Secure; SameSite=Strict` Cookie |
-
-新登录的会话固定为 7 天，系统设置不再提供有效期选项；已有会话按签发时的到期时间结束。
-
-#### 纵深防御
-
-- 写接口校验 `Sec-Fetch-Site` / `Origin` / `Referer`，拒绝跨站请求
-- 所有文本经 `textContent` 写入，不拼接 `innerHTML`；仅静态 SVG 内联
-- 响应统一携带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Cache-Control: no-store`
-
----
-
-### 业务逻辑
-
-#### Cron（`*/5 * * * *`）
-
-```text
-0. Cron 按账号派发队列消息，每次消费一条；账号增多不会共用一次 D1 调用额度
-1. housekeeping（到期才派发维护消息，每日一次，锁保护）
-     清理过期锁 / 32 天前历史 / 32 天前日志 / 7 天前 Job
-2. 单账号：CDT 流量 + ECS 实例；余额距上次成功查询满 30 分钟才更新
-     一次 D1 batch 写快照和采样历史，同一小时 / 日期的相同流量值跳过更新
-3. 额度判定：任一池（内地 / 非内地）超出各自额度
-     首次超限 → 标记账期；每轮核实停机，失败重试；通知送达后去重
-4. 定时关机（10 分钟窗口；本轮实例查询失败不标记完成，保留重试）
-5. 定时开机（同窗口，受熔断闸门约束）
-6. 抢占式保活（见下方闸门）
-7. 每日日报（独立延迟消息，读取最近完成的快照；10 分钟窗口，当天仅一次）
-```
-
-窗口取 10 分钟（与上游一致）：巡检间隔 5 分钟，每个触发点有准点与 +5 分钟两次尝试机会。
-
-开关机指令成功提交后，快照立即显示 `Starting` / `Stopping`（定时、保活、熔断与手动操作一致）。页面每分钟读取概览，对过渡态实例按需入队补采，直到云端返回稳定状态；常规流量巡检仍为每 5 分钟一次。定时开机与保活同轮发生时，保活读取更新后的快照，避免重复下发开机指令。
-
-页面自动刷新实例状态，流量与余额仍按各自周期更新。停用账号后暂停自动巡检和启停；仍可手动刷新数据，但不会触发熔断停机。页面切到后台时暂停刷新，回到前台立即更新。
-
-#### 定时开关机的两种模式
-
-| 模式 | 配置 | 去重方式 |
-|---|---|---|
-| 简单 | 每日 `HH:MM` | 按本地日期，当天只执行一次 |
-| 进阶 | 五字段 Cron（分 时 日 月 周） | 按「上次执行的触发时刻」，同一触发只执行一次 |
-
-进阶模式用「触发时刻」而非日期去重，`*/30 * * * *` 这类高频表达式也能逐次生效。
-
-#### 抢占式保活
-
-阿里云不提供区分「系统回收」与「用户手动停机」的字段 —— 两者都是 `Status == Stopped`；`OperationLocks` 只在回收前 5 分钟标记，比巡检间隔还短、抓不住。因此靠四个前置条件收窄（与上游一致，任一不满足即跳过）：
-
-1. 该实例的「抢占式实例保活」开关已开启
-2. 当前处于「允许运行时段」（只配关机时间时，关机后即不再保活）
-3. 未触发流量熔断
-4. 简单模式避让刚执行的定时关机；Cron 模式按最近的开/关触发判断当前应运行状态（同刻关机优先）
-
-> [!WARNING]
-> 在允许运行时段内手动停止已开启保活的实例，必须先在面板关闭该实例的保活开关，否则下一次 Cron 巡检会将它重新拉起。
-
-#### 优先级
-
-```text
-流量熔断停机  >  抢占式保活  >  定时开机
-```
-
-当月已熔断且策略为 `stop_and_notify` 时，保活、定时开机、手动开机均不会拉起实例。`notify_only` 不停机，不参与闸门。
-
-#### 采集失败的处理
-
-- CDT 查询失败 → 沿用上次快照流量值及原账期，不用上月数据触发本月熔断
-- 余额查询失败 → 沿用上次快照
-- 实例查询失败 → 沿用该账号旧实例，卡片不会变空
-- 实例保活开关 → 跟随实例设置中的当前配置
-
-#### 异步 Job
-
-任务提交写入 D1 后发送到 Queues，队列投递失败由 Cron 补发。队列采用至少一次投递，任务使用原子领取去重，已完成或结果不确定的启停任务不会因重投而重新执行。
-
-账号巡检采用 120 秒执行租约及 90 秒处理预算，处理完成后写去重标记。云接口采集失败已在接口层耗尽快速重试时，记录异常并等待下一轮五分钟 Cron，避免队列重投再次采集已成功的数据。数据库或执行器异常、定时启停遇到过渡态或未知状态时仍允许消息重试；执行进程中断后可在租约过期时接管。重试前重新读取实例状态，并沿用启停动作各自的去重记录。超过 10 分钟的旧消息直接跳过，由新一轮巡检处理。
-
-概览的过渡态补采同样按账号入队，HTTP 直接返回已有快照。多页面请求在 45 秒内合并派发，后续轮询读取更新后的状态，避免多个账号的云请求和 D1 调用集中到一次 HTTP 请求中。
-
-日报只汇总有成功采集记录的当前账期流量，旧账期数值不计入合计；未采集账号及最近采集异常会在汇总和明细中说明。
-
-写接口返回 `202 Accepted + { job_id }`，前端轮询 `GET /api/v1/jobs/{job_id}`：
-
-```json
-{
-  "id": "uuid",
-  "job_type": "start_instance",
-  "status": "pending|running|success|failed",
-  "error_msg": null,
-  "result_msg": null,
-  "created_at": 1792948752627,
-  "finished_at": null
-}
-```
-
-刷新任务按范围、手动启停任务按实例以 D1 锁互斥（owner = `job_id`，收尾按 owner 释放），并发提交返回 `409 job_locked`。未完成批量任务的锁保留到任务完成或超时回收，分段等待期间也不会重复提交。
-
-任务参数与批量进度存入 D1。批量刷新每段处理一个账号，Cloudflare Queues 自动继续推进，关闭页面仍会执行；每段总预算 58 秒（含初始化与收尾），业务处理最多使用前 55 秒，账号刷新预算 50 秒；手动启停预算 45 秒，动作后的状态补采最多 3 秒。阿里云单次请求预算 4 秒（含响应体），每个接口最多尝试 3 次，空流量响应与网络、限流错误共用该上限，避免嵌套重试。`running` 超过 60 秒会标记失败并释放任务锁，不自动重放结果不确定的启停指令。成功结果通过 `result_msg` 返回，包含部分采集失败的说明。
-
-熔断后会持续核实实例状态，直到确认停止；通知失败也会重试。提高阈值或将其设为 0 后，需成功刷新流量且满足新阈值才解除熔断，界面会记录解除日志。各项最近成功采集时间保留在后端，用于避免旧数据参与自动化决策。
-
-登录接口每个来源 IP 在五分钟窗口内最多接受 10 次尝试（含并发请求），超出返回 `429` 和 `Retry-After`。已启用的人机校验在配置损坏或读取失败时拒绝登录。
-
-可靠性迁移 `init_003_reliability.sql` 会将旧执行器尚未完成的任务标记失败；分项成功时间在下次采集时补齐。本次新增 `init_004_account_identity.sql`，增加云账号身份、配置版本及锁 owner 索引，通过现有部署脚本先迁移再发布。升级前排队的手动启停消息没有配置版本，会失败并要求重新提交。部署迁移前应等待正在执行的旧版任务结束，避免新旧版本同时操作账号。
-
-新增账号及更换凭据时使用 STS [GetCallerIdentity](https://www.alibabacloud.com/help/en/ram/developer-reference/api-sts-2015-04-01-getcalleridentity) 核实所属主账号：同账号密钥轮换保留熔断和历史；更换主账号、站点或额度池时，配置更新与旧快照/流量历史清理原子提交。同一额度池内仅更换实例或地域时清空实例状态，保留账号级熔断。定时规则或资源变化会清除对应执行记录。
-
-存量账号在下次采集时补齐身份；若身份尚未记录且旧 AccessKey 已失效，替换为不同 AccessKey 时无法确认是否属于同一主账号，更新会被拒绝。此时可恢复旧密钥完成身份核实，或新增账号后迁移。使用相同 AccessKey ID 重新保存 Secret 可修复密文。
-
-账号编辑、删除、刷新、手动启停及自动化控制共用账号租约；忙碌时编辑返回 `409 account_busy`，需稍后重试。配置更新递增版本，旧版本排队的手动启停任务会失败，不会作用于新配置。手动启停先查询实时状态，达到目标时更新快照；查询失败、过渡态或未知状态不会直接报告成功。
-
-任务轮询只恢复所查询的任务，全局清理由 Cron 和任务提交时执行。会话的「最近活跃」每分钟最多写入一次，鉴权和吊销检查仍逐请求执行。
-
-`wrangler.toml` 保留 `no_nodejs_global_timers`，使 Rust SDK 的超时定时器使用数字 ID。配置自检会检查此项；删除后可能导致 Wasm 定时器运行异常。
-
----
-
-### API
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/api/v1/auth/session` | 会话探测（公开，返回 Turnstile site key，未启用时为空串） |
-| `POST` | `/api/v1/auth/login` | 登录（用户名 + 密码，可选 Turnstile） |
-| `POST` | `/api/v1/auth/logout` | 退出 |
-| `GET` | `/api/v1/overview[?refresh=transitional]` | 首页数据（读快照表；`transitional` 时补采一次） |
-| `GET` | `/api/v1/history?account_id` | 流量历史（小时 25 条 + 日 31 条一次返回） |
-| `GET` | `/api/v1/logs?account_id&action&q&limit` | 操作日志（类型前缀 + 关键字） |
-| `DELETE` | `/api/v1/logs?account_id&action&q` | 按同一套条件清空日志 |
-| `GET` | `/api/v1/jobs[/{id}]` | 任务状态 |
-| `POST` | `/api/v1/refresh` | 刷新全部 → 202 |
-| `POST` | `/api/v1/accounts` | 新增账号 |
-| `PUT/DELETE` | `/api/v1/accounts/{id}` | 修改 / 删除账号 |
-| `POST` | `/api/v1/accounts/{id}/refresh` | 刷新单账号 → 202 |
-| `POST` | `/api/v1/accounts/{id}/instances/{iid}/start` / `stop` | 开机 / 关机 → 202 |
-| `PUT` | `/api/v1/accounts/{id}/instances/{iid}/keep-alive` | 逐实例保活开关 |
-| `GET` | `/api/v1/settings` | 全部设置（脱敏） |
-| `PUT` | `/api/v1/settings/{module}` | 更新设置，`module` 为 `ddns` / `turnstile` / `telegram` / `bark` / `daily-report` / `timezone` / `advanced` |
-| `GET` | `/api/v1/sessions` | 登录设备 |
-| `DELETE` | `/api/v1/sessions[/{sid}]` | 踢下线（指定 / 其它全部） |
-| `POST` | `/api/v1/settings/notify-test` | 测试通知 → 202 |
-| `POST` | `/api/v1/reports/daily` | 立即推送日报 → 202 |
-| `POST` | `/api/v1/cron/preview` | 校验 Cron 表达式并预览未来几次触发 |
-
-错误体格式 `{ "error": "...", "code": "..." }`，`code` 取值：
-
-`unauthenticated` · `invalid_credentials` · `credentials_not_configured` · `turnstile_failed` · `turnstile_unavailable` · `turnstile_broken` · `cross_origin` · `job_locked` · `init_failed` · `internal_error`
-
----
-
-### 数据模型
-
-| 表 | 用途 |
-|---|---|
-| `settings` | KV 配置（时区、日报、TG/Bark 密文、Turnstile 密文） |
-| `accounts` | 阿里云账号（AK、加密 Secret、地域、实例 ID、告警阈值、策略、定时/ Cron、保活） |
-| `account_snapshots` | 每账号一行最新状态，首页只读此表 |
-| `traffic_hourly` / `traffic_daily` | 流量采样（账期累计值），索引 `(account_id, recorded_at)` |
-| `jobs` | 异步任务状态 |
-| `action_logs` | 自动化动作 / 告警 / 登录审计 |
-| `sessions` | 登录设备，用于踢下线 |
-| `locks` | 幂等锁，TTL 到期可抢占 |
-| `login_attempts` | 登录来源固定时间窗口计数，过期自动清理 |
-
-时间戳统一 Unix 毫秒 `INTEGER`；布尔存 `0/1`（Rust 侧以 `i64` 承载后转换，`serde-wasm-bindgen` 反序列化 `bool` 只接受 JS `true/false`）。
-
-`accounts.instance_id` 为 `NOT NULL`：一个账号固定作用于一个地域内的一台实例。留空会让熔断停机、定时开关机、保活作用到该地域下的所有实例，因此实例 ID 必填。
-
----
-
-### 阿里云接口
-
-| 用途 | Action | Version |
-|---|---|---|
-| CDT 流量 | `ListCdtInternetTraffic` | 2021-08-13 |
-| ECS 查询 | `DescribeInstances`（按实例 ID 精确查询） | 2014-05-26 |
-| IPv6 补充查询 | `DescribeNetworkInterfaces`（按实例 ID 查询主、副网卡） | 2014-05-26 |
-| ECS 控制 | `StartInstance` / `StopInstance`（含 `StoppedMode`） | 2014-05-26 |
-| 余额 | `QueryAccountBalance` | 2017-12-14 |
-
-中国站 ECS 沿用 `ecs.aliyuncs.com`；国际站 ECS 按实例地域使用 `ecs.{region_id}.aliyuncs.com`（例如香港为 `ecs.cn-hongkong.aliyuncs.com`），查询、网卡查询和启停共用该地域端点。CDT 流量两站均使用全局端点 `cdt.aliyuncs.com`，不随实例地域切换；`cdt.ap-southeast-1.aliyuncs.com` 无有效 DNS 解析，不可用。国际站余额服务使用 `business.ap-southeast-1.aliyuncs.com`。账号保存时通过 STS 核实凭据身份，实例是否存在由后续 ECS 查询核实；响应缺少有效的实例数组时单独报解析错误，不当作实例不存在。
-
-`ListCdtInternetTraffic` 返回的 `Traffic` 单位是 **Byte**（与计费项 Code `ECS_Out_Bytes` / `Eip_Out_Bytes` 的底层口径一致），控制台与账单才换算成 GB。`traffic_unit_is_bytes` 测试钉死这一点。
-
-#### DDNS
-
-在「控制台设置 → DDNS」统一填写 Cloudflare Zone ID、完整域名和 API Token，再打开实例「停机模式」旁的 **负载均衡** 开关。Token 需要对应 Zone 的 DNS 编辑权限，加密保存，留空可沿用已有 Token。
-
-升级前已在实例里配置过 DNS 联动的，请在 DDNS 页重新填写一次，并到 Cloudflare 核对旧域名或已释放 IP 的 A 记录。
-
-开启后，实例运行时自动创建或补回公网 IPv4 的 A 记录，确认停止后删除自己的记录。多台实例可共用同一域名，互不影响；达到流量阈值停机的节点退出解析，其余运行中的节点继续提供服务。每五分钟巡检核实解析，失败自动重试。关闭「负载均衡」后停止管理，已有记录保留。
-
-记录使用 DNS-only 模式，TTL 为 300 秒。DNS 缓存和已有连接不会立即切换；请避免多台实例共用同一个公网 IP。
-
-#### 免费额度与阈值
-
-CDT 公网流量的免费额度按地域分为**两个独立池**，不共享、不合并计算：
-
-| 池 | 判定规则（`region_id`） | 免费额度 |
-|---|---|---|
-| 中国内地 | `cn-` 开头且非 `cn-hongkong` | 20 GB / 月 |
-| 非中国内地（含中国香港） | 其余地域（含 `cn-hongkong`） | 200 GB / 月 |
-
-一个账号只落在一个池里，查询 CDT 用量时取对应那一类的累计值即可，不需要两池相加。
-
-额度是阿里云定的固定值，不算用户配置项。用户能设的是**告警阈值**（`traffic_threshold_gb`）：
-
-- `0` → 不限制也不告警
-- `> 0` → 累计流量达到该值即告警，并按策略停机（`stop_and_notify`）
-
-#### 签名与重试
-
-签名遵循 RPC V1（`HMAC-SHA1`），含针对官方样例的回归测试：
-
-```rust
-// src/aliyun.rs
-assert_eq!(sign("testsecret", &to_sign), "OLeaidS1JvxuMvnyHOwuJ+uX5qY=");
-```
-
-重试仅针对可恢复错误（网络连接失败、一般 HTTP 5xx、`Throttling*`、`ServiceUnavailable`、`InternalError`），最多 2 次退避（200ms → 600ms）；参数错误、鉴权失败、DNS 解析错误和 Cloudflare 530/1016 不快速重试，等待下一轮 Cron。最终错误记录服务、域名、Action、请求地域、总耗时、尝试次数及上游 RequestId；不记录签名 URL、AccessKey 或 Secret，非 JSON 错误正文不直接写日志。
-
----
-
-### 本地开发与校验
-
-#### 1. 安装工具链与依赖
-
-```bash
-rustup target add wasm32-unknown-unknown
-bash scripts/install-worker-build.sh
-bun install
+bun install --frozen-lockfile
 bun run install:web
-```
-
-#### 2. 初始化本地环境
-
-```bash
 cp .dev.vars.example .dev.vars
+```
+
+在 `.dev.vars` 填入上面的三项运行时密钥，然后初始化本地 D1 并启动服务。
+
+```bash
 bun run db:migrate:local
+bun run dev
 ```
 
-本地 D1 位于 `.wrangler/state/`，与线上隔离。
-
-#### 3. 启动开发服务
-
-```bash
-bun run dev                      # 构建前端与 Worker，启动 wrangler dev（:8787）
-```
-
-前端独立热更新（`/api` 代理到 8787，保持 Cookie 同源）：
-
-```bash
-bun run dev:web                  # :5173
-```
-
-本地手动触发 Cron：
-
-```bash
-curl http://localhost:8787/cdn-cgi/local/scheduled
-```
-
-Rust 版本由 `rust-toolchain.toml` 指定，构建工具由安装脚本自动准备。
-
-#### 4. 测试与构建校验
-
-`bun run build` 会在发布前执行 Rust 单元测试、Clippy、前端类型检查及 Worker 集成测试，任一失败即停止构建；集成测试直接使用本轮构建产物，Worker 只编译一次。
-
-`bun run dev` 只构建运行所需产物并启动本地服务，开发时按需执行下面的检查；完整构建仍执行全部验证。
-
-```bash
-cargo test --locked                                            # 单元测试
-cargo clippy --target wasm32-unknown-unknown -- -D warnings
-bun run typecheck:web
-bun run check:config
-bun run test:worker                                            # 构建并运行 Worker + D1 流程测试（云接口模拟）
-bun run test:worker:built                                      # 复用已有 Worker 产物运行集成测试
-bun run test                                                  # 单测、类型/配置检查、Clippy、Worker 集成测试
-bun run build
-```
+打开 `http://localhost:8787`。需要前端热更新时，另开终端运行 `bun run dev:web` 并访问 `http://localhost:5173`。发布前可运行 `bun run build` 完成构建和测试。
