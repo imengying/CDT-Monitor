@@ -1755,6 +1755,29 @@ h3 {
   font-size: 18px;
 }
 
+/* 不重复顶部标签页名称时只剩图标和英文副标题，收紧留白 */
+.section-title--compact {
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.section-title--compact > span {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+}
+
+/* 去掉重复标题后，标题下首段说明需要单独留出间距 */
+.section-title--compact + .field-hint {
+  margin-top: 4px;
+  margin-bottom: 16px;
+}
+
+.section-title--compact p {
+  margin: 0;
+  font-size: 10px;
+}
+
 .settings-form {
   margin-bottom: 24px;
 }
@@ -1849,38 +1872,6 @@ h3 {
 
 .account-fields .toggle-row {
   align-self: end;
-}
-
-.account-operation-row {
-  container-type: inline-size;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 12px;
-}
-
-.account-ddns .toggle-row {
-  min-height: 42px;
-  padding: 4px 10px;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-}
-
-.account-ddns .toggle-row > span {
-  display: none;
-}
-
-.account-ddns .toggle-row b {
-  white-space: nowrap;
-}
-
-@container (max-width: 16rem) {
-  .account-ddns .toggle-row {
-    grid-template-columns: auto;
-    justify-items: center;
-    gap: 2px;
-    padding: 2px 4px;
-  }
 }
 
 .account-fields__full {

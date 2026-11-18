@@ -673,11 +673,6 @@ export class SettingsModal {
     const heading = el(
       'div',
       { class: 'section-title-row' },
-      sectionTitle({
-        icon: icons.server,
-        title: '云端实例',
-        subtitle: 'ALIYUN ACCOUNTS',
-      }),
       addButton,
     )
 
@@ -876,27 +871,17 @@ export class SettingsModal {
           },
         ),
       ),
-      el('div', { class: 'account-fields__full account-operation-row' },
-        field(
-          '停机模式',
-          this.picker(
-            form.stopMode,
-            [
-              { value: 'StopCharging', label: '节省停机' },
-              { value: 'KeepCharging', label: '普通停机' },
-            ],
-            (value) => {
-              this.form.stopMode = value
-            },
-          ),
-        ),
-        el('div', { class: 'account-ddns' },
-          toggleRow({
-            title: '负载均衡',
-            icon: icons.cloud,
-            checked: form.dnsEnabled,
-            onChange: (checked) => { this.form.dnsEnabled = checked },
-          }),
+      field(
+        '停机模式',
+        this.picker(
+          form.stopMode,
+          [
+            { value: 'StopCharging', label: '节省停机' },
+            { value: 'KeepCharging', label: '普通停机' },
+          ],
+          (value) => {
+            this.form.stopMode = value
+          },
         ),
       ),
       form.dnsError ? el('p', { class: 'field-hint account-fields__full', text: `最近 DDNS 错误：${form.dnsError}` }) : null,
@@ -949,6 +934,14 @@ export class SettingsModal {
           checked: form.enabled,
           onChange: (checked) => {
             this.form.enabled = checked
+          },
+        }),
+        toggleRow({
+          title: '负载均衡',
+          icon: icons.cloud,
+          checked: form.dnsEnabled,
+          onChange: (checked) => {
+            this.form.dnsEnabled = checked
           },
         }),
       ),
@@ -1096,15 +1089,14 @@ export class SettingsModal {
     const config = this.settings?.ddns
     replaceChildren(this.content,
       el('section', { class: 'settings-section' },
-        sectionTitle({ icon: icons.cloud, title: 'DDNS', subtitle: 'DYNAMIC DNS' }),
+        sectionTitle({ icon: icons.cloud, subtitle: 'DYNAMIC DNS' }),
         el('p', { class: 'field-hint', text: '为启用负载均衡的实例使用同一域名：运行时添加公网 IPv4 的 A 记录，停止后删除该实例的记录。' }),
         el('div', { class: 'form-grid' },
           field('Cloudflare Zone ID', this.line(this.ddnsDraft.zoneId, value => { this.ddnsDraft.zoneId = value }, { placeholder: '域名概述中的 32 位 Zone ID' })),
           field('完整域名', this.line(this.ddnsDraft.name, value => { this.ddnsDraft.name = value }, { placeholder: 'app.example.com' })),
           field('Cloudflare API Token', this.line(this.ddnsDraft.token, value => { this.ddnsDraft.token = value }, { type: 'password', placeholder: config?.token_configured ? '已配置，留空保持不变' : '指定 Zone 的 DNS 编辑权限' })),
         ),
-        el('p', { class: 'field-hint', text: '保存后，在实例的「停机模式」旁开启「负载均衡」。解析每五分钟随巡检同步，失败后自动重试；DNS 缓存可能使变更延后生效。' }),
-        el('p', { class: 'field-hint', text: '更换 Zone 时，API Token 需同时拥有新旧 Zone 的 DNS 编辑权限，待所有实例同步完成后再收回旧 Zone 权限。' }),
+        el('p', { class: 'field-hint', text: '保存后，在实例编辑页开启「负载均衡」。解析每五分钟随巡检同步，失败后自动重试；DNS 缓存可能使变更延后生效。' }),
       ),
     )
   }
@@ -1136,7 +1128,6 @@ export class SettingsModal {
         { class: 'settings-section' },
         sectionTitle({
           icon: icons.shield,
-          title: '人机校验',
           subtitle: 'CLOUDFLARE TURNSTILE',
         }),
         el(
@@ -1209,7 +1200,6 @@ export class SettingsModal {
         { class: 'settings-section' },
         sectionTitle({
           icon: icons.send,
-          title: 'Telegram',
           subtitle: 'DELIVERY CHANNEL',
         }),
         el(
@@ -1298,7 +1288,7 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({ icon: icons.phone, title: 'Bark', subtitle: 'DELIVERY CHANNEL' }),
+        sectionTitle({ icon: icons.phone, subtitle: 'DELIVERY CHANNEL' }),
         el(
           'div',
           { class: 'form-grid settings-form' },
@@ -1383,7 +1373,7 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({ icon: icons.bell, title: '每日日报', subtitle: 'DAILY REPORT' }),
+        sectionTitle({ icon: icons.bell, subtitle: 'DAILY REPORT' }),
         el(
           'div',
           { class: 'form-grid settings-form' },
@@ -1584,7 +1574,7 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({ icon: icons.activity, title: '操作日志', subtitle: 'ACTION LOG' }),
+        sectionTitle({ icon: icons.activity, subtitle: 'ACTION LOG' }),
         el(
           'div',
           { class: 'log-toolbar' },
@@ -1643,7 +1633,7 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({ icon: icons.settings, title: '系统设置', subtitle: 'SYSTEM' }),
+        sectionTitle({ icon: icons.settings, subtitle: 'SYSTEM' }),
         el(
           'div',
           { class: 'form-grid settings-form' },

@@ -312,21 +312,21 @@ export function toggleRow(options: {
   )
 }
 
-/** 区块标题：图标方块 + 副标题 + 标题。 */
+/** 区块标题：图标方块 + 副标题 +（可选）标题。 */
 export function sectionTitle(options: {
   icon: IconNode
-  title: string
+  title?: string
   subtitle: string
 }): HTMLElement {
   return el(
     'div',
-    { class: 'section-title' },
+    { class: options.title ? 'section-title' : 'section-title section-title--compact' },
     el('span', {}, iconSvg(options.icon, 19)),
     el(
       'div',
       {},
       el('p', { text: options.subtitle }),
-      el('h3', { text: options.title }),
+      options.title ? el('h3', { text: options.title }) : null,
     ),
   )
 }
