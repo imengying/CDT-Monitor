@@ -653,10 +653,10 @@ export const api = {
     return request<SettingsResponse>('/api/v1/settings/bark', { method: 'PUT', body: input })
   },
 
-  updateDailyReport(enabled: boolean, time: string): Promise<SettingsResponse> {
+  updateDailyReport(enabled: boolean, time: string, timezone: string): Promise<SettingsResponse> {
     return request<SettingsResponse>('/api/v1/settings/daily-report', {
       method: 'PUT',
-      body: { enabled, time, timezone: '' },
+      body: { enabled, time, timezone },
     })
   },
 

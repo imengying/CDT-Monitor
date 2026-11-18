@@ -364,16 +364,6 @@ h3 {
 }
 
 /* 设置页内的分区与列表 */
-.settings-divider {
-  margin-top: 30px;
-  padding-top: 26px;
-  border-top: 1px solid var(--line);
-}
-
-.settings-divider .section-title {
-  margin-bottom: 20px;
-}
-
 .notification-action-row {
   display: flex;
   gap: 10px;
@@ -404,7 +394,10 @@ h3 {
 
 .device-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 20px;
 }
 
 .device-row {
@@ -445,11 +438,6 @@ h3 {
   grid-row: 1 / span 2;
   justify-self: end;
   align-self: center;
-}
-
-/* 设备列表底部要给固定的保存栏留出安全距离 */
-.settings-section .device-list {
-  padding-bottom: 8px;
 }
 
 /* 设置页内的通用输入 */
@@ -580,7 +568,8 @@ h3 {
   position: relative;
 }
 
-.field > label {
+.field > label,
+.field > .field-label {
   display: block;
   font-size: 10px;
   font-weight: 800;
@@ -1707,75 +1696,9 @@ h3 {
   margin: 0 auto;
 }
 
-.section-title,
-.section-title-row {
-  display: flex;
-  align-items: center;
-}
-
-/* 标题 + 右侧操作（添加按钮 / 刷新）分布在两端 */
-.section-title-row {
-  justify-content: space-between;
-  gap: 20px;
-}
-
-.section-title {
-  gap: 13px;
-  margin-bottom: 23px;
-}
-
-.section-title > span {
-  width: 42px;
-  height: 42px;
-  border-radius: 10px;
-  display: grid;
-  place-items: center;
-  color: var(--blue);
-  background: var(--surface-muted);
-  box-shadow:
-    inset 0 0 0 1px var(--surface-raised),
-    0 0 0 1px var(--line);
-}
-
-.section-title svg {
-  width: 19px;
-  height: 19px;
-}
-
-.section-title p {
-  margin: 0 0 3px;
-  font-size: 9px;
-  font-weight: 800;
-  letter-spacing: 0;
-  color: var(--muted-soft);
-}
-
-.section-title h3 {
-  margin: 0;
-  font-size: 18px;
-}
-
-/* 不重复顶部标签页名称时只剩图标和英文副标题，收紧留白 */
-.section-title--compact {
-  gap: 10px;
-  margin-bottom: 20px;
-}
-
-.section-title--compact > span {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-}
-
-/* 去掉重复标题后，标题下首段说明需要单独留出间距 */
-.section-title--compact + .field-hint {
-  margin-top: 4px;
+.settings-section > .field-hint:first-child {
+  margin-top: 0;
   margin-bottom: 16px;
-}
-
-.section-title--compact p {
-  margin: 0;
-  font-size: 10px;
 }
 
 .settings-form {
@@ -1786,6 +1709,10 @@ h3 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 13px;
+}
+
+.report-schedule {
+  column-gap: 13px;
 }
 
 .settings-footer {
@@ -1813,8 +1740,19 @@ h3 {
     0 1px 0 var(--highlight-strong) inset;
 }
 
+.account-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+}
+
+.account-settings > .button {
+  justify-self: end;
+}
+
 .account-settings-list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
 }
 
@@ -1876,6 +1814,19 @@ h3 {
 
 .account-fields__full {
   grid-column: 1 / -1;
+}
+
+.account-operation-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: inherit;
+  align-items: end;
+}
+
+.account-operation-row .toggle-row {
+  min-height: 52px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  border-radius: 12px;
 }
 
 .subtle-empty {
@@ -2175,6 +2126,48 @@ h3 {
     grid-template-columns: 1fr;
   }
 
+  form.account-editor {
+    padding-inline: 12px;
+  }
+
+  .account-operation-row {
+    column-gap: 12px;
+  }
+
+  .account-operation-row .native-select {
+    padding-inline: 9px 23px;
+    background-position: right 6px center;
+    background-size: 14px;
+  }
+
+  .account-operation-row .toggle-row {
+    padding-inline: 8px;
+    column-gap: 6px;
+  }
+
+  .report-schedule {
+    grid-template-columns: minmax(64px, 1fr) fit-content(100%);
+    column-gap: 8px;
+  }
+
+  .report-schedule .field > label {
+    white-space: nowrap;
+  }
+
+  .report-schedule .input-shell {
+    padding-inline: 9px;
+  }
+
+  .report-schedule .toggle-row {
+    padding-inline: 8px;
+    column-gap: 6px;
+  }
+
+  .report-schedule .toggle-row b {
+    text-wrap: balance;
+    line-height: 1.25;
+  }
+
   .field--wide {
     grid-column: auto;
   }
@@ -2310,13 +2303,6 @@ h3 {
     bottom: 18px;
   }
 
-  .section-title-row {
-    width: 100%;
-    align-items: flex-start;
-    flex-wrap: wrap;
-    gap: 12px;
-  }
-
   .chart-modal {
     width: 100%;
     height: calc(100dvh - 24px);
@@ -2342,6 +2328,7 @@ h3 {
 
   .log-toolbar .segmented {
     width: 100%;
+    flex-wrap: wrap;
   }
 
   .log-body {

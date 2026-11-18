@@ -462,7 +462,7 @@ Cron 派发端检查启用账号的流量和实例最近成功采集时间，超
 | `POST` | `/api/v1/accounts/{id}/instances/{iid}/start` / `stop` | 开机 / 关机 → 202 |
 | `PUT` | `/api/v1/accounts/{id}/instances/{iid}/keep-alive` | 逐实例保活开关 |
 | `GET` | `/api/v1/settings` | 全部设置（脱敏） |
-| `PUT` | `/api/v1/settings/{module}` | 更新设置，`module` 为 `turnstile` / `telegram` / `bark` / `daily-report` / `timezone` / `advanced` |
+| `PUT` | `/api/v1/settings/{module}` | 更新设置，`module` 为 `ddns` / `turnstile` / `telegram` / `bark` / `daily-report` / `timezone` / `advanced` |
 | `GET` | `/api/v1/sessions` | 登录设备 |
 | `DELETE` | `/api/v1/sessions[/{sid}]` | 踢下线（指定 / 其它全部） |
 | `POST` | `/api/v1/settings/notify-test` | 测试通知 → 202 |

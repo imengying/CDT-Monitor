@@ -10,7 +10,7 @@
  * * 写操作完成后自动刷新受影响的数据（概览 / 图表 / 设置）。
  */
 
-import { ApiError, api, type NotifyPreview } from '@/api/client'
+import { ApiError, api, type NotifyPreview, type SettingsResponse } from '@/api/client'
 import { store, toast } from '@/lib/store'
 
 /** 会话失效：清空数据并回到登录页。 */
@@ -72,8 +72,9 @@ export async function afterLogin(): Promise<void> {
 export async function logout(): Promise<void> {
   try {
     await api.logout()
-  } catch {
-    // 退出接口失败也要清本地状态
+  } catch (error) {
+    reportError(error, '退出登录失败，请重试')
+    return
   }
   handleUnauthorized(false)
   toast('已退出登录', 'ok')
@@ -143,7 +144,12 @@ export async function refreshAll(): Promise<void> {
 }
 
 /** 设置保存后的统一刷新。 */
-export async function afterSettingsChanged(): Promise<void> {
+export async function afterSettingsChanged(settings?: SettingsResponse): Promise<void> {
+  if (settings) {
+    store.patch({ settings })
+    await loadOverview()
+    return
+  }
   await Promise.all([loadSettings(), loadOverview()])
 }
 

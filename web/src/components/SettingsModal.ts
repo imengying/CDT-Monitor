@@ -8,7 +8,7 @@
  *   └ settings-panel
  *     ├ header         SYSTEM PREFERENCES / 控制台设置 / 关闭
  *     ├ settings-tabs  横排标签
- *     ├ settings-content 逐页内容（settings-section / section-title / form-grid）
+ *     ├ settings-content 逐页内容（settings-section / form-grid）
  *     └ settings-footer  保存变更
  *
  * 交互约定：
@@ -21,8 +21,6 @@
 import {
   api,
   ApiError,
-  formatTime,
-  relativeTime,
   type AccountDto,
   type ActionLog,
   type AccountInput,
@@ -30,7 +28,6 @@ import {
   type NotifyChannel,
   type OverLimitAction,
   type PushLevel,
-  type SessionDevice,
   type SettingsResponse,
   type ScheduleMode,
   type SiteType,
@@ -47,12 +44,13 @@ import {
   inputShell,
   onEscape,
   replaceChildren,
-  sectionTitle,
   segmented,
   subtleEmpty,
   textInput,
   toggleRow,
+  toggleSwitch,
 } from '@/lib/dom'
+import { SessionDevices } from '@/components/SessionDevices'
 import { cronInput } from '@/components/CronEditor'
 import { icons, type IconNode } from '@/lib/icons'
 import { LOG_FILTERS, logRow, maskInstanceId, type LogFilterKey } from '@/lib/logs'
@@ -60,7 +58,7 @@ import { currentMode, setThemeMode, type ThemeMode } from '@/lib/theme'
 import { afterSettingsChanged, pushDailyReport, testNotification } from '@/lib/actions'
 import { toast } from '@/lib/store'
 
-type Tab = 'accounts' | 'ddns' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'logs' | 'system'
+type Tab = 'accounts' | 'ddns' | 'turnstile' | 'telegram' | 'bark' | 'report' | 'logs' | 'devices' | 'system'
 
 /**
  * 可选地域。
@@ -169,38 +167,6 @@ function formFromAccount(account: AccountDto): AccountForm {
   }
 }
 
-/** 从 UA 提炼可读设备名（与后端 short_device 保持一致的粒度）。 */
-function deviceName(ua: string): string {
-  const lower = ua.toLowerCase()
-  const browser = lower.includes('edg/')
-    ? 'Edge'
-    : lower.includes('chrome/') && !lower.includes('chromium')
-      ? 'Chrome'
-      : lower.includes('firefox/')
-        ? 'Firefox'
-        : lower.includes('safari/')
-          ? 'Safari'
-          : lower.includes('curl/')
-            ? 'curl'
-            : lower.trim() === ''
-              ? '未知客户端'
-              : '其他'
-  const platform = lower.includes('iphone')
-    ? 'iPhone'
-    : lower.includes('ipad')
-      ? 'iPad'
-      : lower.includes('android')
-        ? 'Android'
-        : lower.includes('mac os x') || lower.includes('macintosh')
-          ? 'macOS'
-          : lower.includes('windows')
-            ? 'Windows'
-            : lower.includes('linux')
-              ? 'Linux'
-              : ''
-  return platform ? `${browser} · ${platform}` : browser
-}
-
 /** 选项卡定义。 */
 const TABS: { key: Tab; label: string; icon: IconNode }[] = [
   { key: 'accounts', label: '实例', icon: icons.server },
@@ -210,6 +176,7 @@ const TABS: { key: Tab; label: string; icon: IconNode }[] = [
   { key: 'bark', label: 'Bark', icon: icons.phone },
   { key: 'report', label: '日报', icon: icons.bell },
   { key: 'logs', label: '日志', icon: icons.activity },
+  { key: 'devices', label: '登录设备', icon: icons.devices },
   { key: 'system', label: '系统', icon: icons.settings },
 ]
 
@@ -232,6 +199,7 @@ export class SettingsModal {
   private confirmDeleteId: number | null = null
   private saving = false
   private testing: NotifyChannel | 'report' | null = null
+  private paintTestButton?: () => void
 
   private ddnsDraft = { zoneId: '', name: '', token: '' }
   private turnstileDraft = { enabled: false, siteKey: '', secretKey: '' }
@@ -248,10 +216,7 @@ export class SettingsModal {
   private themeDraft: ThemeMode = currentMode()
   private advancedDraft = { logLevel: 'error', jobLockMinutes: 10 }
 
-  private devices: SessionDevice[] = []
-  private devicesLoaded = false
-  private kicking: string | null = null
-  private deviceListHost: HTMLDivElement | null = null
+  private readonly devices = new SessionDevices()
 
   private removeEscListener: (() => void) | null = null
 
@@ -270,12 +235,13 @@ export class SettingsModal {
     }) as HTMLButtonElement
     this.footer = el('footer', { class: 'settings-footer' }, this.saveButton)
 
-    const nav = el('nav', { class: 'settings-tabs' })
+    const nav = el('nav', { class: 'settings-tabs', 'aria-label': '设置分类' })
     for (const tab of TABS) {
       const button = el('button', {
         type: 'button',
         on: {
           click: () => {
+            if (this.activeTab !== tab.key) this.content.scrollTop = 0
             this.activeTab = tab.key
             this.formOpen = false
             this.confirmDeleteId = null
@@ -336,9 +302,6 @@ export class SettingsModal {
       if (target) this.form = formFromAccount(target)
     }
     this.confirmDeleteId = null
-    this.devices = []
-    this.devicesLoaded = false
-    this.deviceListHost = null
     this.element.hidden = false
     document.body.style.overflow = 'hidden'
     this.renderNav()
@@ -365,41 +328,52 @@ export class SettingsModal {
   }
 
   /** DTO -> 本地草稿。 */
-  private syncDrafts(): void {
+  private syncDrafts(tab?: Tab): void {
     const settings = this.settings
     if (!settings) return
 
-    this.ddnsDraft = {
-      zoneId: settings.ddns.zone_id,
-      name: settings.ddns.name,
-      token: '',
+    if (!tab || tab === 'ddns') {
+      this.ddnsDraft = {
+        zoneId: settings.ddns.zone_id,
+        name: settings.ddns.name,
+        token: '',
+      }
     }
-    // 敏感字段一律不回填：留空即保持原值
-    this.turnstileDraft = {
-      enabled: settings.turnstile.enabled,
-      siteKey: '',
-      secretKey: '',
+    if (!tab || tab === 'turnstile') {
+      this.turnstileDraft = {
+        enabled: settings.turnstile.enabled,
+        siteKey: '',
+        secretKey: '',
+      }
     }
-    this.telegramDraft = {
-      enabled: settings.telegram.enabled,
-      chatId: '',
-      token: '',
+    if (!tab || tab === 'telegram') {
+      this.telegramDraft = {
+        enabled: settings.telegram.enabled,
+        chatId: '',
+        token: '',
+      }
     }
-    this.barkDraft = {
-      enabled: settings.bark.enabled,
-      serverUrl: settings.bark.server_url,
-      deviceKey: '',
-      normalLevel: settings.bark.normal_level,
-      alertLevel: settings.bark.alert_level,
+    if (!tab || tab === 'bark') {
+      this.barkDraft = {
+        enabled: settings.bark.enabled,
+        serverUrl: settings.bark.server_url,
+        deviceKey: '',
+        normalLevel: settings.bark.normal_level,
+        alertLevel: settings.bark.alert_level,
+      }
     }
-    this.reportDraft = {
-      enabled: settings.daily_report.enabled,
-      time: settings.daily_report.time,
+    if (!tab || tab === 'report') {
+      this.reportDraft = {
+        enabled: settings.daily_report.enabled,
+        time: settings.daily_report.time,
+      }
     }
-    this.timezoneDraft = settings.timezone
-    this.advancedDraft = {
-      logLevel: settings.advanced.log_level,
-      jobLockMinutes: Math.round(settings.advanced.job_lock_ttl_ms / 60_000),
+    if (!tab || tab === 'system') {
+      this.timezoneDraft = settings.timezone
+      this.advancedDraft = {
+        logLevel: settings.advanced.log_level,
+        jobLockMinutes: Math.round(settings.advanced.job_lock_ttl_ms / 60_000),
+      }
     }
   }
 
@@ -520,8 +494,9 @@ export class SettingsModal {
       type: 'button',
     }) as HTMLButtonElement
 
-    const paint = (busy: boolean): void => {
-      button.disabled = busy || this.testing !== null
+    const paint = (): void => {
+      const busy = this.testing === key
+      button.disabled = this.testing !== null
       replaceChildren(
         button,
         iconSvg(busy ? icons.spinner : icon, 18, busy ? 'spin' : ''),
@@ -529,16 +504,17 @@ export class SettingsModal {
       )
     }
 
-    paint(this.testing === key)
+    this.paintTestButton = paint
+    paint()
     button.addEventListener('click', async () => {
       if (this.testing !== null) return
       this.testing = key
-      paint(true)
+      paint()
       try {
         await action()
       } finally {
         this.testing = null
-        paint(false)
+        this.paintTestButton?.()
       }
     })
     return button
@@ -551,7 +527,12 @@ export class SettingsModal {
   private renderNav(): void {
     for (const [key, button] of this.tabButtons) {
       button.classList.toggle('active', key === this.activeTab)
-      button.setAttribute('aria-selected', String(key === this.activeTab))
+      if (key === this.activeTab) {
+        button.setAttribute('aria-current', 'page')
+        button.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+      } else {
+        button.removeAttribute('aria-current')
+      }
     }
     this.paintFooter()
   }
@@ -560,11 +541,10 @@ export class SettingsModal {
    * 底部悬浮栏。
    *
    * 实例页在编辑表单打开时显示「创建实例 / 保存修改」，
-   * 其余有配置项的标签页用「保存更改」；日志页只有即时操作，不显示浮动栏。
+   * 其余有配置项的标签页用「保存更改」；日志和登录设备只有即时操作，不显示浮动栏。
    */
   private paintFooter(): void {
-    // 日志页只有即时操作，没有需要提交的表单
-    if (this.activeTab === 'logs') {
+    if (this.activeTab === 'logs' || this.activeTab === 'devices') {
       this.footer.hidden = true
       return
     }
@@ -590,6 +570,7 @@ export class SettingsModal {
   }
 
   private renderContent(): void {
+    this.paintTestButton = undefined
     switch (this.activeTab) {
       case 'accounts':
         this.renderAccounts()
@@ -611,6 +592,10 @@ export class SettingsModal {
         break
       case 'logs':
         this.renderLogs()
+        break
+      case 'devices':
+        this.content.replaceChildren(this.devices.element)
+        this.devices.refresh()
         break
       case 'system':
         this.renderSystem()
@@ -642,6 +627,7 @@ export class SettingsModal {
         break
       case 'accounts':
       case 'logs':
+      case 'devices':
         break
     }
   }
@@ -670,14 +656,8 @@ export class SettingsModal {
       el('span', { text: '添加实例' }),
     )
 
-    const heading = el(
-      'div',
-      { class: 'section-title-row' },
-      addButton,
-    )
-
     const body = this.formOpen ? this.buildAccountForm() : this.buildAccountList(accounts)
-    replaceChildren(this.content, el('div', { class: 'settings-section' }, heading, body))
+    replaceChildren(this.content, el('div', { class: 'settings-section account-settings' }, addButton, body))
   }
 
   private buildAccountList(accounts: AccountDto[]): HTMLElement {
@@ -766,6 +746,11 @@ export class SettingsModal {
 
   private buildAccountForm(): HTMLElement {
     const form = this.form
+    const balanceStatus = el('b', { 'aria-hidden': 'true', text: form.dnsEnabled ? '开启' : '关闭' })
+    const balanceSwitch = toggleSwitch(form.dnsEnabled, (checked) => {
+      this.form.dnsEnabled = checked
+      balanceStatus.textContent = checked ? '开启' : '关闭'
+    })
 
     const scheduleStart = this.line(form.scheduleStart, (value) => {
       this.form.scheduleStart = value
@@ -871,17 +856,29 @@ export class SettingsModal {
           },
         ),
       ),
-      field(
-        '停机模式',
-        this.picker(
-          form.stopMode,
-          [
-            { value: 'StopCharging', label: '节省停机' },
-            { value: 'KeepCharging', label: '普通停机' },
-          ],
-          (value) => {
-            this.form.stopMode = value
-          },
+      el(
+        'div',
+        { class: 'account-fields__full account-operation-row' },
+        el(
+          'label',
+          { class: 'field' },
+          el('span', { class: 'field-label', text: '停机模式' }),
+          this.picker(
+            form.stopMode,
+            [
+              { value: 'StopCharging', label: '节省停机' },
+              { value: 'KeepCharging', label: '普通停机' },
+            ],
+            (value) => {
+              this.form.stopMode = value
+            },
+          ),
+        ),
+        el(
+          'label',
+          { class: 'field' },
+          el('span', { class: 'field-label', text: '负载均衡' }),
+          el('span', { class: 'toggle-row' }, balanceStatus, ...balanceSwitch),
         ),
       ),
       form.dnsError ? el('p', { class: 'field-hint account-fields__full', text: `最近 DDNS 错误：${form.dnsError}` }) : null,
@@ -934,14 +931,6 @@ export class SettingsModal {
           checked: form.enabled,
           onChange: (checked) => {
             this.form.enabled = checked
-          },
-        }),
-        toggleRow({
-          title: '负载均衡',
-          icon: icons.cloud,
-          checked: form.dnsEnabled,
-          onChange: (checked) => {
-            this.form.dnsEnabled = checked
           },
         }),
       ),
@@ -1044,10 +1033,11 @@ export class SettingsModal {
         await api.updateAccount(form.id, payload)
         toast('实例已更新', 'ok')
       }
-      this.formOpen = false
-      this.form = blankAccountForm()
+      if (this.form === form) {
+        this.formOpen = false
+        this.form = blankAccountForm()
+      }
       await afterSettingsChanged()
-      this.syncDrafts()
       changed = true
     } catch (error) {
       toast(error instanceof ApiError ? error.message : '保存失败', 'danger')
@@ -1069,7 +1059,6 @@ export class SettingsModal {
       this.confirmDeleteId = null
       toast('实例已删除', 'ok')
       await afterSettingsChanged()
-      this.syncDrafts()
       changed = true
     } catch (error) {
       toast(error instanceof ApiError ? error.message : '删除失败', 'danger')
@@ -1089,7 +1078,6 @@ export class SettingsModal {
     const config = this.settings?.ddns
     replaceChildren(this.content,
       el('section', { class: 'settings-section' },
-        sectionTitle({ icon: icons.cloud, subtitle: 'DYNAMIC DNS' }),
         el('p', { class: 'field-hint', text: '为启用负载均衡的实例使用同一域名：运行时添加公网 IPv4 的 A 记录，停止后删除该实例的记录。' }),
         el('div', { class: 'form-grid' },
           field('Cloudflare Zone ID', this.line(this.ddnsDraft.zoneId, value => { this.ddnsDraft.zoneId = value }, { placeholder: '域名概述中的 32 位 Zone ID' })),
@@ -1126,10 +1114,6 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({
-          icon: icons.shield,
-          subtitle: 'CLOUDFLARE TURNSTILE',
-        }),
         el(
           'div',
           { class: 'form-grid settings-form' },
@@ -1198,10 +1182,6 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({
-          icon: icons.send,
-          subtitle: 'DELIVERY CHANNEL',
-        }),
         el(
           'div',
           { class: 'form-grid settings-form' },
@@ -1288,7 +1268,6 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({ icon: icons.phone, subtitle: 'DELIVERY CHANNEL' }),
         el(
           'div',
           { class: 'form-grid settings-form' },
@@ -1373,20 +1352,15 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({ icon: icons.bell, subtitle: 'DAILY REPORT' }),
         el(
           'div',
-          { class: 'form-grid settings-form' },
+          { class: 'form-grid report-schedule' },
           field(
             `推送时间（${this.settings?.daily_report.timezone ?? this.settings?.timezone ?? 'UTC+8'}）`,
             this.line(this.reportDraft.time, (value) => {
               this.reportDraft.time = value
             }, { placeholder: '09:00' }),
           ),
-        ),
-        el(
-          'div',
-          { class: 'toggle-list' },
           toggleRow({
             title: '启用每日日报推送',
             icon: icons.bell,
@@ -1399,7 +1373,7 @@ export class SettingsModal {
         el(
           'div',
           { class: 'notification-action-row' },
-          this.asyncButton('立即推送一次', icons.bell, 'report', () => pushDailyReport()),
+          this.asyncButton('推送测试', icons.bell, 'report', () => pushDailyReport()),
         ),
       ),
     )
@@ -1411,8 +1385,13 @@ export class SettingsModal {
       toast('日报时间格式应为 HH:MM', 'warn')
       return
     }
+    const timezone = this.settings?.daily_report.timezone
     await this.runSave(
-      () => api.updateDailyReport(this.reportDraft.enabled, this.reportDraft.time.trim()),
+      () => api.updateDailyReport(
+        this.reportDraft.enabled,
+        this.reportDraft.time.trim(),
+        timezone && timezone !== this.settings?.timezone ? timezone : '',
+      ),
       '日报设置已保存',
       '保存日报设置失败',
     )
@@ -1574,7 +1553,6 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({ icon: icons.activity, subtitle: 'ACTION LOG' }),
         el(
           'div',
           { class: 'log-toolbar' },
@@ -1633,7 +1611,6 @@ export class SettingsModal {
       el(
         'div',
         { class: 'settings-section' },
-        sectionTitle({ icon: icons.settings, subtitle: 'SYSTEM' }),
         el(
           'div',
           { class: 'form-grid settings-form' },
@@ -1678,37 +1655,8 @@ export class SettingsModal {
             }, { min: '1', suffix: '分钟' }),
           ),
         ),
-
-        el(
-          'div',
-          { class: 'settings-divider' },
-          el(
-            'div',
-            { class: 'section-title-row' },
-            sectionTitle({ icon: icons.phone, title: '登录设备', subtitle: 'ACTIVE SESSIONS' }),
-            el(
-              'div',
-              { class: 'control-group' },
-              el('button', {
-                class: 'button button--secondary button--small',
-                type: 'button',
-                text: '退出其它设备',
-                on: { click: () => void this.kickOthers() },
-              }),
-              el('button', {
-                class: 'button button--secondary button--small',
-                type: 'button',
-                text: '刷新',
-                on: { click: () => void this.loadDevices(true) },
-              }),
-            ),
-          ),
-          this.buildDeviceList(),
-        ),
       ),
     )
-
-    void this.loadDevices(false)
   }
 
   private async saveSystem(): Promise<void> {
@@ -1716,7 +1664,7 @@ export class SettingsModal {
     await this.runSave(
       async () => {
         await api.updateTimezone(this.timezoneDraft.trim())
-        await api.updateAdvanced({
+        return api.updateAdvanced({
           log_level: this.advancedDraft.logLevel,
           job_lock_ttl_ms: Math.round(this.advancedDraft.jobLockMinutes * 60_000),
         })
@@ -1724,109 +1672,6 @@ export class SettingsModal {
       '系统设置已保存',
       '保存系统设置失败',
     )
-  }
-
-  /**
-   * 登录设备列表。
-   *
-   * 返回一个稳定的容器：数据变化时只替换内部节点，避免重建整个设置页
-   * 把正在展开的 `<select>` 一并销毁。
-   */
-  private buildDeviceList(): HTMLElement {
-    if (!this.deviceListHost) {
-      this.deviceListHost = el('div', { class: 'device-list' })
-    }
-    const wrapper = this.deviceListHost
-
-    if (!this.devicesLoaded) {
-      replaceChildren(wrapper, subtleEmpty('正在加载…', icons.spinner))
-      return wrapper
-    }
-    if (this.devices.length === 0) {
-      replaceChildren(wrapper, subtleEmpty('暂无登录设备', icons.phone))
-      return wrapper
-    }
-
-    const nodes: HTMLElement[] = []
-    for (const device of this.devices) {
-      nodes.push(this.buildDeviceRow(device))
-    }
-
-    replaceChildren(wrapper, ...nodes)
-    return wrapper
-  }
-
-  private buildDeviceRow(device: SessionDevice): HTMLElement {
-    const title = el('div', { class: 'device-row__title' })
-    title.append(el('b', { text: deviceName(device.ua) }))
-    if (device.current) title.append(el('span', { class: 'badge badge-ok', text: '本机' }))
-
-    return el(
-      'div',
-      { class: 'device-row' },
-      title,
-      el('span', {
-        text: `${device.ip || '未知来源'} · 登录于 ${formatTime(device.created_at)} · 最近活跃 ${relativeTime(device.last_seen_at)}`,
-      }),
-      ...(device.current
-        ? []
-        : [
-            el('button', {
-              class: 'button button--secondary button--small',
-              type: 'button',
-              text: this.kicking === device.sid ? '处理中…' : '下线',
-              on: { click: () => void this.kickOne(device.sid) },
-            }),
-          ]),
-    )
-  }
-
-  private refreshDeviceList(): void {
-    if (this.activeTab === 'system') this.buildDeviceList()
-  }
-
-  private async loadDevices(notify: boolean): Promise<void> {
-    try {
-      const data = await api.sessions()
-      this.devices = data.sessions
-      this.devicesLoaded = true
-      this.refreshDeviceList()
-      if (notify) toast('设备列表已刷新', 'ok')
-    } catch (error) {
-      this.devicesLoaded = true
-      this.refreshDeviceList()
-      toast(error instanceof ApiError ? error.message : '读取登录设备失败', 'danger')
-    }
-  }
-
-  private async kickOne(sid: string): Promise<void> {
-    if (this.kicking) return
-    this.kicking = sid
-    try {
-      const data = await api.revokeSession(sid)
-      this.devices = data.sessions
-      toast('该设备已下线', 'ok')
-    } catch (error) {
-      toast(error instanceof ApiError ? error.message : '下线失败', 'danger')
-    } finally {
-      this.kicking = null
-      this.refreshDeviceList()
-    }
-  }
-
-  private async kickOthers(): Promise<void> {
-    if (this.kicking) return
-    this.kicking = 'all'
-    try {
-      const data = await api.revokeOtherSessions()
-      this.devices = data.sessions
-      toast('其它设备已全部下线', 'ok')
-    } catch (error) {
-      toast(error instanceof ApiError ? error.message : '下线失败', 'danger')
-    } finally {
-      this.kicking = null
-      this.refreshDeviceList()
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -1840,19 +1685,20 @@ export class SettingsModal {
    * 避免「已保存的 Token 停留在输入框里」。
    */
   private async runSave(
-    action: () => Promise<unknown>,
+    action: () => Promise<SettingsResponse>,
     successMessage: string,
     failureMessage: string,
   ): Promise<void> {
     if (this.saving) return
     this.saving = true
     this.paintSaving(true)
+    const savedTab = this.activeTab
     let changed = false
     try {
-      await action()
+      const settings = await action()
       toast(successMessage, 'ok')
-      await afterSettingsChanged()
-      this.syncDrafts()
+      await afterSettingsChanged(settings)
+      this.syncDrafts(savedTab)
       changed = true
     } catch (error) {
       toast(error instanceof ApiError ? error.message : failureMessage, 'danger')
@@ -1861,8 +1707,8 @@ export class SettingsModal {
       // 必须先把 saving 置回 false 再重绘：renderContent 末尾会调
       // paintFooter()，而它按 this.saving 决定按钮是不是「保存中…」。
       // 顺序反了就会永远卡在转圈上。
-      if (changed) this.renderContent()
-      this.paintSaving(false)
+      if (changed && this.activeTab === savedTab) this.renderContent()
+      else this.paintFooter()
     }
   }
 

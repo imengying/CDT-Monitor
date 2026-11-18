@@ -177,9 +177,9 @@ const monitor = { name: 'monitor',
 }
 const mf = new Miniflare({ d1Persist: testDirectory, workers: [monitor] })
 let cookie = ''
-async function request(path, method = 'GET', body, ip = '192.0.2.1') {
+async function request(path, method = 'GET', body, ip = '192.0.2.1', sessionCookie = cookie) {
   return mf.dispatchFetch(`https://monitor.test/api/v1/${path}`, {
-    method, headers: { 'content-type': 'application/json', cookie, 'cf-connecting-ip': ip },
+    method, headers: { 'content-type': 'application/json', cookie: sessionCookie, 'cf-connecting-ip': ip },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
 }
@@ -267,6 +267,53 @@ try {
     assert.equal('session_ttl_ms' in stored, false)
   }
   console.log('✓ 新登录固定 7 天，旧会话有效期配置和旧客户端字段不再生效')
+  {
+    const credentials = { username: 'review', password: 'test-password-only' }
+    const login = async (previous = '') => {
+      const res = await request('auth/login', 'POST', credentials, undefined, previous)
+      assert.equal(res.status, 200)
+      return res.headers.get('set-cookie').split(';')[0]
+    }
+    const devices = async (sessionCookie) => {
+      const res = await request('sessions', 'GET', undefined, undefined, sessionCookie)
+      assert.equal(res.status, 200)
+      return (await res.json()).sessions
+    }
+    const active = async (sessionCookie) => (await (await request('auth/session', 'GET', undefined, undefined, sessionCookie)).json()).authenticated
+    const second = await login()
+    const third = await login()
+    const listed = await devices(cookie)
+    assert.equal(listed.length, 3, 'independent browsers can share the same UA and IP')
+    const current = listed.find(item => item.current)
+    assert.ok(current)
+    assert.equal((await request('sessions/' + current.sid, 'DELETE')).status, 400)
+    const thirdSid = (await devices(third)).find(item => item.current).sid
+    await api('sessions/' + thirdSid, 'DELETE')
+    assert.equal(await active(third), false)
+    assert.equal(await active(second), true)
+
+    await db.prepare("CREATE TRIGGER fixture_session_insert BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'fixture session insert failure'); END").run()
+    assert.equal((await request('auth/login', 'POST', credentials, undefined, second)).status, 500)
+    assert.equal(await active(second), true, 'failed rotation preserves the original session')
+    await db.prepare('DROP TRIGGER fixture_session_insert').run()
+    const rotated = await login(second)
+    assert.equal(await active(second), false)
+    assert.equal((await devices(rotated)).length, 2)
+    const fourth = await login()
+    const fourthSid = (await devices(fourth)).find(item => item.current).sid
+    assert.match(fourthSid, /^[0-9a-f]{32}$/)
+    await db.prepare(`CREATE TRIGGER fixture_session_delete BEFORE DELETE ON sessions WHEN OLD.sid = '${fourthSid}'
+      BEGIN SELECT RAISE(ABORT, 'fixture session deletion failure'); END`).run()
+    assert.equal((await request('sessions', 'DELETE')).status, 500)
+    assert.equal(await active(rotated), true, 'a failed bulk revocation does not partially sign out devices')
+    assert.equal((await request('auth/logout', 'POST', undefined, undefined, fourth)).status, 500)
+    assert.equal(await active(fourth), true)
+    await db.prepare('DROP TRIGGER fixture_session_delete').run()
+    assert.deepEqual((await api('sessions', 'DELETE')).sessions.map(item => item.sid), [current.sid])
+    assert.equal(await active(rotated), false)
+    assert.equal(await active(fourth), false)
+  }
+  console.log('✓ 同网络同浏览器的独立会话可分别管理，重新登录和批量下线支持原子回滚')
   const storedReport = async () => JSON.parse((await db.prepare("SELECT value FROM settings WHERE key = 'daily_report'").first()).value)
   await api('settings/daily-report', 'PUT', { enabled: false, time: '09:00' })
   assert.equal((await storedReport()).timezone, '', 'omitting report timezone keeps global inheritance')

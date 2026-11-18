@@ -549,21 +549,20 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
     let ua = client_ua(&req);
     let ip = client_ip(&req).unwrap_or_default();
 
-    // 同一设备（同 UA + 同 IP）重新登录时先顶掉旧会话，否则每登录一次
-    // 就多一条记录，「登录设备」会堆出一串重复条目。
-    if let Err(err) = app.db.delete_sessions_of_device(&ua, &ip).await {
-        log_error!("清理同设备旧会话失败：{err}");
-    }
+    let previous = app.session_claims(&req);
 
     app.db
-        .create_session(&crate::models::SessionRow {
-            sid: sid.clone(),
-            ua: ua.clone(),
-            ip: ip.clone(),
-            created_at: now,
-            last_seen_at: now,
-            expires_at: now.saturating_add(ttl),
-        })
+        .create_session(
+            &crate::models::SessionRow {
+                sid: sid.clone(),
+                ua: ua.clone(),
+                ip: ip.clone(),
+                created_at: now,
+                last_seen_at: now,
+                expires_at: now.saturating_add(ttl),
+            },
+            previous.as_ref().map(|claims| claims.sid.as_str()),
+        )
         .await?;
 
     let token = SessionToken::new(app.crypto.key())
@@ -591,7 +590,7 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
         &SessionResponse {
             authenticated: true,
             turnstile_site_key: app.turnstile_site_key().await,
-            expires_at: Some(now_ms() + ttl),
+            expires_at: Some(now + ttl),
         },
         200,
         Some(cookie),
@@ -601,10 +600,8 @@ async fn handle_login(app: &AppCtx, mut req: Request) -> worker::Result<Response
 /// `POST /api/v1/auth/logout`（公开：清 Cookie 即可）
 async fn handle_logout(app: &AppCtx, req: &Request) -> worker::Result<Response> {
     // 只删当前会话：退出一个设备不应影响其它已登录设备
-    if let Some(claims) = app.session_claims(req)
-        && let Err(err) = app.db.delete_session(&claims.sid).await
-    {
-        log_error!("删除会话失败：{err}");
+    if let Some(claims) = app.session_claims(req) {
+        app.db.delete_session(&claims.sid).await?;
     }
     json_response(
         &serde_json::json!({ "authenticated": false }),
@@ -657,16 +654,7 @@ async fn handle_delete_session(
 
 /// `DELETE /api/v1/sessions`：踢出除当前设备外的全部会话。
 async fn handle_delete_other_sessions(app: &AppCtx, current_sid: &str) -> worker::Result<Response> {
-    let rows = app.db.list_sessions(now_ms()).await?;
-    let mut removed = 0usize;
-    for row in rows {
-        if row.sid == current_sid {
-            continue;
-        }
-        if app.db.delete_session(&row.sid).await.unwrap_or(false) {
-            removed += 1;
-        }
-    }
+    let removed = app.db.delete_other_sessions(current_sid, now_ms()).await?;
     app.db
         .add_log(
             None,

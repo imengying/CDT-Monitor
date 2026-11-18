@@ -291,43 +291,28 @@ export function segmented<T extends string>(options: {
   )
 }
 
-/** 开关行：图标 + 标题 + 滑动开关。 */
+export function toggleSwitch(
+  checked: boolean,
+  onChange: (checked: boolean) => void,
+): [HTMLInputElement, HTMLElement] {
+  const input = el('input', { type: 'checkbox', checked })
+  input.addEventListener('change', () => onChange(input.checked))
+  return [input, el('i', { class: 'toggle', 'aria-hidden': 'true' }, el('em', {}))]
+}
+
+/** 带图标和标题的开关行。 */
 export function toggleRow(options: {
   title: string
   icon: IconNode
   checked: boolean
   onChange: (checked: boolean) => void
 }): HTMLElement {
-  const input = el('input', { type: 'checkbox' }) as HTMLInputElement
-  input.checked = options.checked
-  input.addEventListener('change', () => options.onChange(input.checked))
-
   return el(
     'label',
     { class: 'toggle-row' },
     el('span', {}, iconSvg(options.icon, 17)),
     el('b', { text: options.title }),
-    input,
-    el('i', { class: 'toggle' }, el('em', {})),
-  )
-}
-
-/** 区块标题：图标方块 + 副标题 +（可选）标题。 */
-export function sectionTitle(options: {
-  icon: IconNode
-  title?: string
-  subtitle: string
-}): HTMLElement {
-  return el(
-    'div',
-    { class: options.title ? 'section-title' : 'section-title section-title--compact' },
-    el('span', {}, iconSvg(options.icon, 19)),
-    el(
-      'div',
-      {},
-      el('p', { text: options.subtitle }),
-      options.title ? el('h3', { text: options.title }) : null,
-    ),
+    ...toggleSwitch(options.checked, options.onChange),
   )
 }
 

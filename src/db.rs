@@ -1209,21 +1209,30 @@ impl Db {
     // 登录设备（sessions）
     // =======================================================================
 
-    /// 新建会话。
-    pub async fn create_session(&self, row: &SessionRow) -> Result<()> {
-        self.exec(
-            "INSERT INTO sessions (sid, ua, ip, created_at, last_seen_at, expires_at)
+    /// 新会话与浏览器原有会话的替换一起提交。
+    pub async fn create_session(&self, row: &SessionRow, previous_sid: Option<&str>) -> Result<()> {
+        let mut statements = Vec::new();
+        if let Some(sid) = previous_sid {
+            statements.push(
+                self.stmt("DELETE FROM sessions WHERE sid = ?")?
+                    .bind(&[j_text(sid)])?,
+            );
+        }
+        statements.push(
+            self.stmt(
+                "INSERT INTO sessions (sid, ua, ip, created_at, last_seen_at, expires_at)
              VALUES (?, ?, ?, ?, ?, ?)",
-            &[
+            )?
+            .bind(&[
                 j_text(&row.sid),
                 j_text(&row.ua),
                 j_text(&row.ip),
                 j_i64(row.created_at),
                 j_i64(row.last_seen_at),
                 j_i64(row.expires_at),
-            ],
-        )
-        .await?;
+            ])?,
+        );
+        self.conn()?.batch(statements).await?;
         Ok(())
     }
 
@@ -1265,15 +1274,11 @@ impl Db {
         Ok(changed > 0)
     }
 
-    /// 删除同一设备的旧会话（同 UA + 同 IP），返回删除条数。
-    ///
-    /// 同一个浏览器反复登录会不断新建 `sid`，旧记录要等过期才被清理，
-    /// 「登录设备」里就会堆出一串一模一样的条目。登录前先清掉同设备旧会话，
-    /// 让列表始终「一台设备一条」。
-    pub async fn delete_sessions_of_device(&self, ua: &str, ip: &str) -> Result<usize> {
+    /// 一次撤销其余活跃会话，保留当前会话。
+    pub async fn delete_other_sessions(&self, current_sid: &str, now_ms: i64) -> Result<usize> {
         self.exec(
-            "DELETE FROM sessions WHERE ua = ? AND ip = ?",
-            &[j_text(ua), j_text(ip)],
+            "DELETE FROM sessions WHERE sid <> ? AND expires_at > ?",
+            &[j_text(current_sid), j_i64(now_ms)],
         )
         .await
     }

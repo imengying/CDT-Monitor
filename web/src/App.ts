@@ -434,6 +434,7 @@ export class App {
   private teardownShell(): void {
     this.historyModal?.dispose()
     this.historyModal = null
+    this.settingsModal?.close()
     this.settingsModal = null
     this.shell = null
     this.errorBanner = null
