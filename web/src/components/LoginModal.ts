@@ -5,12 +5,12 @@
  * 品牌锁定组 → 「ADMIN ACCESS / 欢迎回来 / 使用管理员凭据进入控制台」
  * → 字段 → 主按钮。
  *
- * Turnstile 使用 `appearance: 'interaction-only'`：静默验证通过时卡片上
- * 不出现任何人机校验痕迹，仅在 Cloudflare 判定可疑时原地展开复选框。
+ * Turnstile 与 NodeFlare 一致使用默认显示模式：登录页出现后立刻执行，
+ * 校验成功后收起组件；需要人工交互时可以直接看到复选框。
  *
  * 三个约束：
  *
- * 1. 脚本以 `render=explicit` 异步加载，需轮询等待 `window.turnstile` 就绪；
+ * 1. 应用启动即加载脚本，组件共享同一个加载 Promise，避免重复插入；
  * 2. token 一次性，提交失败后必须 `reset()`；
  * 3. 销毁时必须 `remove()`，否则反复进出登录页会泄漏 widget。
  *
@@ -33,6 +33,41 @@ import { afterLogin } from '@/lib/actions'
 import { store } from '@/lib/store'
 
 const TURNSTILE_SCRIPT_TIMEOUT_MS = 10_000
+const TURNSTILE_SCRIPT_URL = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
+
+let scriptPromise: Promise<void> | null = null
+
+/** 应用启动即加载；登录组件复用同一 Promise，不轮询、不重复插入脚本。 */
+export function preloadTurnstileScript(): Promise<void> {
+  if (window.turnstile) return Promise.resolve()
+  if (scriptPromise) return scriptPromise
+
+  scriptPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script')
+    const finish = (error?: Error): void => {
+      window.clearTimeout(timeout)
+      if (error) {
+        script.remove()
+        scriptPromise = null
+        reject(error)
+      } else {
+        resolve()
+      }
+    }
+    const timeout = window.setTimeout(
+      () => finish(new Error('Cloudflare Turnstile 加载超时')),
+      TURNSTILE_SCRIPT_TIMEOUT_MS,
+    )
+
+    script.src = TURNSTILE_SCRIPT_URL
+    script.async = true
+    script.defer = true
+    script.onload = () => finish()
+    script.onerror = () => finish(new Error('Cloudflare Turnstile 加载失败'))
+    document.head.appendChild(script)
+  })
+  return scriptPromise
+}
 
 /** 登录卡片组件。 */
 export class LoginModal {
@@ -43,15 +78,16 @@ export class LoginModal {
   private readonly passwordInput: HTMLInputElement
   private readonly submitButton: HTMLButtonElement
   private readonly widgetHost: HTMLDivElement
+  private readonly widgetSection: HTMLElement
   private readonly errorBox: HTMLDivElement
 
   private widgetId: string | null = null
   private token = ''
   private submitting = false
   private disposed = false
-  private pollTimer: number | null = null
+  private renderStarted = false
 
-  constructor(private readonly siteKey: string) {
+  constructor(private siteKey: string) {
     this.usernameInput = textInput({
       type: 'text',
       id: 'admin-username',
@@ -74,6 +110,7 @@ export class LoginModal {
     ) as HTMLButtonElement
 
     this.widgetHost = el('div', { class: 'cf-turnstile' })
+    this.widgetSection = this.buildTurnstileSection()
 
     this.errorBox = el('div', { class: 'inline-error', role: 'alert' })
     this.errorBox.hidden = true
@@ -96,7 +133,7 @@ export class LoginModal {
         { class: 'form-stack' },
         field('管理员用户名', inputShell({ icon: icons.cloud, input: this.usernameInput })),
         field('管理员密码', inputShell({ icon: icons.key, input: this.passwordInput })),
-        this.buildTurnstileSection(),
+        this.widgetSection,
       ),
       this.errorBox,
       this.submitButton,
@@ -117,53 +154,42 @@ export class LoginModal {
   }
 
   /**
-   * Turnstile 区域。
-   *
-   * 容器始终留在 DOM 中且不手动设置 `display`：`appearance: 'interaction-only'`
-   * 已保证无交互需求时不渲染可见内容。被 `display: none` 隐藏的容器内
-   * Turnstile 不会执行校验，token 无法获取。
+   * 组件立即渲染，校验通过后再隐藏，避免用户以为页面卡住。
+   * 未启用时保留一个隐藏节点，表单结构保持一致。
    */
   private buildTurnstileSection(): HTMLElement {
-    if (!this.siteKey.trim()) {
-      // 后台没启用 Turnstile（默认状态）：什么都不渲染，卡片保持干净。
-      return el('div', { hidden: true, dataset: { role: 'turnstile-off' } })
-    }
-    return el('div', { dataset: { role: 'turnstile-section' } }, this.widgetHost)
+    return el(
+      'div',
+      {
+        hidden: !this.siteKey.trim(),
+        dataset: { role: this.siteKey.trim() ? 'turnstile-section' : 'turnstile-off' },
+      },
+      this.widgetHost,
+    )
   }
 
-  /** 等待 Turnstile 脚本加载完成。 */
-  private waitForTurnstile(): Promise<boolean> {
-    if (window.turnstile) return Promise.resolve(true)
-
-    return new Promise((resolve) => {
-      const deadline = Date.now() + TURNSTILE_SCRIPT_TIMEOUT_MS
-      this.pollTimer = window.setInterval(() => {
-        if (window.turnstile) {
-          this.stopPolling()
-          resolve(true)
-          return
-        }
-        if (Date.now() > deadline || this.disposed) {
-          this.stopPolling()
-          resolve(false)
-        }
-      }, 120)
-    })
-  }
-
-  private stopPolling(): void {
-    if (this.pollTimer !== null) {
-      window.clearInterval(this.pollTimer)
-      this.pollTimer = null
-    }
+  /** 会话接口返回后启用组件，不重建表单，也不打断用户输入。 */
+  configure(siteKey: string): void {
+    if (this.disposed || this.siteKey.trim() || !siteKey.trim()) return
+    this.siteKey = siteKey
+    this.widgetSection.dataset.role = 'turnstile-section'
+    this.widgetSection.hidden = false
+    void this.renderWidget()
   }
 
   /** 渲染小组件。 */
   private async renderWidget(): Promise<void> {
-    const ready = await this.waitForTurnstile()
+    if (this.renderStarted || this.disposed || !this.siteKey.trim()) return
+    this.renderStarted = true
+    try {
+      await preloadTurnstileScript()
+    } catch {
+      if (!this.disposed) this.showError('人机校验组件加载失败，请刷新页面重试')
+      return
+    }
     if (this.disposed) return
 
-    if (!ready || !window.turnstile) {
+    if (!window.turnstile) {
       this.showError('人机校验组件加载失败，请刷新页面重试')
       return
     }
@@ -175,34 +201,40 @@ export class LoginModal {
       theme: 'light',
       size: 'flexible',
       language: 'zh-CN',
-      // 关键：默认不显示，仅在需要人工交互时才展开复选框
-      appearance: 'interaction-only',
+      // 与 NodeFlare 一致：默认显示并立即执行，通过后再收起。
+      appearance: 'always',
+      execution: 'render',
       // 校验通过后不再自动刷新过期令牌（登录是一次性动作）
       'refresh-expired': 'manual',
 
       callback: (token: string) => {
         this.token = token
-        this.hideError()
+        this.widgetSection.hidden = true
         this.syncSubmitState()
       },
 
       'expired-callback': () => {
         this.token = ''
+        this.widgetSection.hidden = false
         this.syncSubmitState()
       },
 
       'error-callback': () => {
         this.token = ''
+        this.widgetSection.hidden = false
         this.syncSubmitState()
         this.showError('人机校验出错，请重试')
       },
 
       'timeout-callback': () => {
         this.token = ''
+        this.widgetSection.hidden = false
         this.syncSubmitState()
       },
 
       'unsupported-callback': () => {
+        this.token = ''
+        this.widgetSection.hidden = false
         this.showError('当前浏览器不支持人机校验组件，请更换浏览器后重试')
       },
     })
@@ -211,6 +243,7 @@ export class LoginModal {
   /** 重置小组件（token 一次性，失败后必须重置）。 */
   private resetWidget(): void {
     this.token = ''
+    this.widgetSection.hidden = false
     if (this.widgetId !== null && window.turnstile) {
       window.turnstile.reset(this.widgetId)
     }
@@ -220,8 +253,8 @@ export class LoginModal {
   /**
    * 读取当前 token。
    *
-   * `interaction-only` 下静默校验通过时，`callback` 会带上 token；
-   * 极少数情况下内部状态已就绪而本地变量还是空，此时用 `getResponse()` 兜底。
+   * `callback` 会带上 token；极少数情况下内部状态已就绪而本地变量还是空，
+   * 此时用 `getResponse()` 兜底。
    */
   private currentToken(): string {
     if (this.token) return this.token
@@ -240,8 +273,8 @@ export class LoginModal {
   /**
    * 同步按钮可用性。
    *
-   * 不要求 token 非空：`interaction-only` 下的静默校验由 Cloudflare
-   * 异步完成，耗时不可预期，等待 token 会造成按钮长时间不可点。
+   * 不要求 token 非空：静默校验由 Cloudflare 异步完成，耗时不可预期，
+   * 等待 token 会造成按钮长时间不可点。
    */
   private syncSubmitState(): void {
     const ready = !this.submitting && this.passwordInput.value.length > 0
@@ -308,7 +341,6 @@ export class LoginModal {
   /** 卸载时移除 widget 与定时器。 */
   dispose(): void {
     this.disposed = true
-    this.stopPolling()
     if (this.widgetId !== null && window.turnstile) {
       window.turnstile.remove(this.widgetId)
       this.widgetId = null

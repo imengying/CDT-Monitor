@@ -122,7 +122,8 @@ impl std::error::Error for AliyunError {}
 
 impl From<AliyunError> for worker::Error {
     fn from(err: AliyunError) -> Self {
-        worker::Error::RustError(err.to_string())
+        // 完整诊断已在云接口调用处写入 Worker 控制台；任务与界面只保留根因。
+        worker::Error::RustError(err.short())
     }
 }
 
@@ -180,17 +181,14 @@ impl AliyunError {
         }
     }
 
-    /// 便于日志的短描述。
+    /// 面向用户的短描述；请求域名、耗时和重试次数只保留在诊断输出中。
     pub fn short(&self) -> String {
-        self.to_string()
+        self.root().to_string()
     }
 
     /// 采集查询超时无需提示核实操作结果；启停操作继续使用原始错误说明。
     pub(crate) fn query_failure(&self, query: &str) -> String {
-        match self {
-            Self::Request { context, source } => {
-                format!("{}（{context}）", source.query_failure(query))
-            }
+        match self.root() {
             Self::Network(message) if message == crate::runtime::TIMEOUT_MESSAGE => {
                 format!("{query}失败，网络连接超时，稍后重试")
             }
@@ -1782,17 +1780,18 @@ mod tests {
             source: Box::new(source),
         };
         let text = error.short();
-        for expected in [
-            "SignatureDoesNotMatch",
-            "HTTP 403",
-            "request-123",
+        for expected in ["SignatureDoesNotMatch", "HTTP 403", "request-123"] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        for diagnostic in [
             "cdt.aliyuncs.com",
             "ListCdtInternetTraffic",
             "cn-hongkong",
             "123ms",
             "尝试 1 次",
         ] {
-            assert!(text.contains(expected), "missing {expected}: {text}");
+            assert!(!text.contains(diagnostic));
+            assert!(error.to_string().contains(diagnostic));
         }
         for secret in [
             "fixture-key",
@@ -1818,10 +1817,12 @@ mod tests {
             },
             source: Box::new(AliyunError::Network(crate::runtime::TIMEOUT_MESSAGE.into())),
         };
-        let text = error.query_failure("实例查询");
-        assert!(text.contains("实例查询失败，网络连接超时"));
-        assert!(text.contains("ecs.cn-hongkong.aliyuncs.com"));
-        assert!(!text.contains("执行结果可能"));
+        assert_eq!(
+            error.query_failure("实例查询"),
+            "实例查询失败，网络连接超时，稍后重试"
+        );
+        assert!(error.to_string().contains("ecs.cn-hongkong.aliyuncs.com"));
+        assert!(!error.query_failure("实例查询").contains("执行结果可能"));
     }
 
     #[test]

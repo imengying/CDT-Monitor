@@ -1,6 +1,8 @@
 import { App } from '@/App'
 import { mustGetById } from '@/lib/dom'
 import { initTheme } from '@/lib/theme'
+import { preloadTurnstileScript } from '@/components/LoginModal'
+import { store } from '@/lib/store'
 import './style.css'
 
 /**
@@ -12,7 +14,15 @@ import './style.css'
  * 3. 拿到挂载点并启动外壳。
  */
 initTheme()
+// 与首屏会话探测并行建立 Cloudflare 连接、下载脚本。
+void preloadTurnstileScript().catch(() => {
+  // 登录组件复用此 Promise 并显示具体错误，这里避免未处理 rejection。
+})
 
 const root = mustGetById('app')
 const app = new App(root)
 app.start()
+// 首屏立即画登录表单；会话有效时 bootstrap 会直接切换到控制台。
+if (store.get().phase === 'booting') {
+  store.patch({ phase: 'unauthenticated' })
+}

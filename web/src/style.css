@@ -544,6 +544,17 @@ h3 {
   border-radius: 28px;
 }
 
+/* Turnstile 加载和执行期间保持占位，通过回调后收起。 */
+[data-role='turnstile-section'] {
+  width: 100%;
+  min-height: 65px;
+}
+
+.cf-turnstile {
+  width: 100%;
+  min-height: 65px;
+}
+
 /* ------------------------------------------------------------------------- */
 /* 表单                                                                       */
 /* ------------------------------------------------------------------------- */
@@ -1379,15 +1390,6 @@ h3 {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
-}
-
-.traffic-value span {
-  display: block;
-  color: var(--muted-soft);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0;
-  margin-bottom: 5px;
 }
 
 .traffic-value strong {

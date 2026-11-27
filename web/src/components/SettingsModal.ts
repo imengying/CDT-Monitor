@@ -1078,7 +1078,6 @@ export class SettingsModal {
     const config = this.settings?.ddns
     replaceChildren(this.content,
       el('section', { class: 'settings-section' },
-        el('p', { class: 'field-hint', text: '为启用负载均衡的实例使用同一域名：运行时添加公网 IPv4 的 A 记录，停止后删除该实例的记录。' }),
         el('div', { class: 'form-grid' },
           field('Cloudflare Zone ID', this.line(this.ddnsDraft.zoneId, value => { this.ddnsDraft.zoneId = value }, { placeholder: '域名概述中的 32 位 Zone ID' })),
           field('完整域名', this.line(this.ddnsDraft.name, value => { this.ddnsDraft.name = value }, { placeholder: 'app.example.com' })),

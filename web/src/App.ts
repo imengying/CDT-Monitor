@@ -131,6 +131,8 @@ export class App {
   // -------------------------------------------------------------------------
 
   private onStateChange(state: Readonly<AppState>): void {
+    // 会话可能在首屏表单之后才返回，此时阶段不变，也必须补上 Turnstile 配置。
+    this.loginModal?.configure(state.session?.turnstile_site_key ?? '')
     if (state.phase !== this.lastPhase) {
       this.lastPhase = state.phase
       this.switchPhase(state)
@@ -143,8 +145,10 @@ export class App {
   }
 
   private switchPhase(state: Readonly<AppState>): void {
-    this.loginModal?.dispose()
-    this.loginModal = null
+    if (state.phase !== 'unauthenticated') {
+      this.loginModal?.dispose()
+      this.loginModal = null
+    }
     this.teardownShell()
 
     if (state.phase === 'booting') {
@@ -152,7 +156,9 @@ export class App {
       return
     }
     if (state.phase === 'unauthenticated') {
-      this.renderLogin(state.session?.turnstile_site_key ?? '')
+      // 首屏表单保持同一个组件，会话返回后补挂验证，不清空用户已输入的内容。
+      const login = this.loginModal ?? this.renderLogin('')
+      login.configure(state.session?.turnstile_site_key ?? '')
       return
     }
     this.renderShell(state)
@@ -174,9 +180,10 @@ export class App {
     )
   }
 
-  private renderLogin(siteKey: string): void {
+  private renderLogin(siteKey: string): LoginModal {
     this.loginModal = new LoginModal(siteKey)
     replaceChildren(this.root, this.loginModal.element)
+    return this.loginModal
   }
 
   // -------------------------------------------------------------------------

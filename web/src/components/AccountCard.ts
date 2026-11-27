@@ -361,7 +361,6 @@ export class AccountCard {
         el(
           'div',
           {},
-          el('span', { text: account.traffic_current ? '本月 CDT 流量' : '本月 CDT 流量 · 等待采集' }),
           el('strong', { text: account.traffic_current ? account.traffic_used_gb.toFixed(2) : '—' }),
           el('small', { text: ` / ${account.quota_gb.toFixed(0)} GB` }),
         ),

@@ -433,8 +433,9 @@ try {
   state.trafficResponses = [{ status: 530, body: 'error code: 1016' }]
   const dnsErrorJob = await refresh('failed')
   assert.equal(state.trafficAttempts.length, 1, '1016 must not be retried immediately')
-  for (const value of ['1016', 'cdt.aliyuncs.com', 'ListCdtInternetTraffic', 'cn-hongkong', '尝试 1 次']) assert.ok(dnsErrorJob.error_msg.includes(value))
-  assert.match(dnsErrorJob.error_msg, /耗时 \d+ms/)
+  for (const value of ['1016', '阿里云错误']) assert.ok(dnsErrorJob.error_msg.includes(value))
+  for (const value of ['cdt.aliyuncs.com', 'ListCdtInternetTraffic', 'cn-hongkong', '尝试 1 次', '耗时']) assert.equal(dnsErrorJob.error_msg.includes(value), false)
+  assert.doesNotMatch(dnsErrorJob.error_msg, /耗时 \d+ms/)
   state.trafficResponses = [{ status: 403, body: JSON.stringify({ Code: 'Forbidden', Message: 'https://cdt.aliyuncs.com/?AccessKeyId=fixture-access-key&Signature=fixture-secret', RequestId: 'fixture-request-context' }) }]
   const safeErrorJob = await refresh('failed')
   assert.ok(safeErrorJob.error_msg.includes('fixture-request-context'))
@@ -1215,13 +1216,15 @@ try {
   state.stallTraffic = true
   let began = Date.now()
   const stalled = await refresh('failed')
-  assert.match(stalled.error_msg, /流量查询失败，网络连接超时，稍后重试.*cdt\.aliyuncs\.com/)
+  assert.match(stalled.error_msg, /^流量查询失败，网络连接超时，稍后重试$/)
+  assert.doesNotMatch(stalled.error_msg, /服务 .*域名|Action |耗时|尝试 \d+ 次/)
   assert.ok(Date.now() - began < 25_000, 'stalled headers must respect request budget')
   state.stallTraffic = false
   state.stallBody = true
   began = Date.now()
   const stalledBody = await refresh('failed')
-  assert.match(stalledBody.error_msg, /流量查询失败，网络连接超时，稍后重试.*cdt\.aliyuncs\.com/)
+  assert.match(stalledBody.error_msg, /^流量查询失败，网络连接超时，稍后重试$/)
+  assert.doesNotMatch(stalledBody.error_msg, /服务 .*域名|Action |耗时|尝试 \d+ 次/)
   assert.ok(Date.now() - began < 25_000, 'stalled response body must respect request budget')
   state.stallBody = false
   console.log('✓ 请求头和响应体卡住时均能超时收尾')

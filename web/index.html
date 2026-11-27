@@ -11,12 +11,9 @@
     <link rel="apple-touch-icon" href="/favicon.svg" />
     <!-- 首屏主题必须在样式表之前落地，否则深色用户会看到一帧白底 -->
     <script src="/theme-init.js"></script>
-    <!-- Turnstile：登录卡片内嵌小组件所需 -->
-    <script
-      src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
-      async
-      defer
-    ></script>
+    <!-- Turnstile 脚本由应用入口加载；预连接用于提前完成 DNS/TLS。 -->
+    <link rel="preconnect" href="https://challenges.cloudflare.com" crossorigin />
+    <link rel="dns-prefetch" href="https://challenges.cloudflare.com" />
   </head>
   <body>
     <div id="app"></div>
